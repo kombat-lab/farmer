@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from models import ButtonPosition
 from parser import normalize
 from telegram_buttons import get_button_texts
+
+
+HP_PATTERN = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,25 @@ def analyze_map_targets(
     return MapTargetAnalysis(selected_target, target_counts)
 
 
+def _extract_current_hp(button_text: str) -> Optional[int]:
+    match = HP_PATTERN.search(button_text)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _resolve_target_name(
+    button_text: str,
+    ordered_priorities: list[str],
+) -> str:
+    normalized_button = normalize(button_text)
+    for preferred in ordered_priorities:
+        if normalize(preferred) in normalized_button:
+            return preferred
+
+    return HP_PATTERN.sub("", button_text).strip()
+
+
 def select_combat_target(
     message,
     priorities: Iterable[str],
@@ -58,8 +81,16 @@ def select_combat_target(
     if not getattr(message, "buttons", None):
         return None, None
 
-    candidates: list[tuple[str, int, int]] = []
+    ordered_priorities = list(priorities)
+    if active_target and active_target not in ordered_priorities:
+        ordered_priorities.append(active_target)
+
+    priority_indexes = {
+        normalize(target): index
+        for index, target in enumerate(ordered_priorities)
+    }
     ignored = ("отмена", "к карте", "назад", "pvp:", "занят")
+    candidates: list[tuple[int, int, int, int, str]] = []
 
     for row_index, row in enumerate(message.buttons):
         for column_index, button in enumerate(row):
@@ -67,20 +98,33 @@ def select_combat_target(
             normalized = normalize(text)
             if not text or any(value in normalized for value in ignored):
                 continue
-            candidates.append((text, row_index, column_index))
+
+            current_hp = _extract_current_hp(text)
+            priority_index = len(ordered_priorities)
+            for target, index in priority_indexes.items():
+                if target in normalized:
+                    priority_index = index
+                    break
+
+            # Цели с распознанным HP всегда идут раньше кнопок без HP.
+            # Затем выбирается минимальное текущее HP, после чего сохраняется
+            # исходный приоритет мобов и порядок кнопок.
+            hp_missing = 1 if current_hp is None else 0
+            hp_sort_value = current_hp if current_hp is not None else 10**12
+            candidates.append(
+                (
+                    hp_missing,
+                    hp_sort_value,
+                    priority_index,
+                    row_index * 1000 + column_index,
+                    text,
+                )
+            )
 
     if not candidates:
         return None, None
 
-    ordered = list(priorities)
-    if active_target and active_target not in ordered:
-        ordered.append(active_target)
-
-    for preferred in ordered:
-        preferred_normalized = normalize(preferred)
-        for text, row, column in candidates:
-            if preferred_normalized in normalize(text):
-                return preferred, (row, column)
-
-    text, row, column = candidates[0]
-    return text, (row, column)
+    _, _, _, flat_position, button_text = min(candidates)
+    row_index, column_index = divmod(flat_position, 1000)
+    target_name = _resolve_target_name(button_text, ordered_priorities)
+    return target_name, (row_index, column_index)

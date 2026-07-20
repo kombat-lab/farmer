@@ -83,6 +83,12 @@ MAX_FAILED_MOVE_ATTEMPTS = 2
 EVENT_QUEUE_SIZE = 200
 PROCESSED_EVENT_CACHE_SIZE = 500
 
+BLESSING_REFRESH_INTERVAL = 29 * 60
+BLESSING_RETRY_INTERVAL = 5 * 60
+NON_COMBAT_SKILLS_BUTTON = "Небоевые навыки"
+BLESSING_BUTTON = "Благословение"
+BLESSING_STATUS_MARKER = "благословение: +5 ко всем характеристикам на 30 мин"
+
 
 class Farmer:
     def __init__(self, storage: Storage, notifier: Notifier, settings: SettingsService) -> None:
@@ -131,6 +137,10 @@ class Farmer:
         self.processed_event_order: deque[tuple] = deque(
             maxlen=PROCESSED_EVENT_CACHE_SIZE
         )
+
+        self.blessing_refreshed_at: float | None = None
+        self.blessing_next_attempt_at = 0.0
+        self.blessing_refresh_in_progress = False
 
     def log(self, text: str) -> None:
         logger.info("[%s] %s", self.state.name, text)
@@ -520,6 +530,80 @@ class Farmer:
         )
         await self.process_latest_state()
 
+    def blessing_refresh_due(self) -> bool:
+        now = time.monotonic()
+        if self.blessing_refresh_in_progress:
+            return False
+        if now < self.blessing_next_attempt_at:
+            return False
+        if self.blessing_refreshed_at is None:
+            return True
+        return now - self.blessing_refreshed_at >= BLESSING_REFRESH_INTERVAL
+
+    async def try_refresh_blessing_from_map(self, message) -> bool:
+        if not self.blessing_refresh_due():
+            return False
+
+        clicked = await self.click_button(
+            message,
+            contains=(NON_COMBAT_SKILLS_BUTTON,),
+            action_type=ActionType.OPEN_ATTACK,
+            description=NON_COMBAT_SKILLS_BUTTON,
+        )
+        if not clicked:
+            self.blessing_next_attempt_at = (
+                time.monotonic() + BLESSING_RETRY_INTERVAL
+            )
+            self.log(
+                "Не удалось открыть небоевые навыки. "
+                "Повторю попытку через 5 минут."
+            )
+            return False
+
+        self.blessing_refresh_in_progress = True
+        self.blessing_next_attempt_at = (
+            time.monotonic() + BLESSING_RETRY_INTERVAL
+        )
+        self.mark_progress("открыто меню небоевых навыков")
+        return True
+
+    async def handle_blessing_menu(self, message) -> bool:
+        if not self.blessing_refresh_in_progress:
+            return False
+
+        position = self.find_button(
+            message,
+            contains=(BLESSING_BUTTON,),
+        )
+        if position is None:
+            return False
+
+        clicked = await self.click_button(
+            message,
+            contains=(BLESSING_BUTTON,),
+            action_type=ActionType.USE_SKILL,
+            description=BLESSING_BUTTON,
+        )
+        if clicked:
+            self.mark_progress("использовано Благословение")
+        else:
+            self.blessing_refresh_in_progress = False
+        return True
+
+    def confirm_blessing_from_text(self, text: str) -> None:
+        if not self.blessing_refresh_in_progress:
+            return
+        if BLESSING_STATUS_MARKER not in normalize(text):
+            return
+
+        self.blessing_refreshed_at = time.monotonic()
+        self.blessing_next_attempt_at = (
+            self.blessing_refreshed_at + BLESSING_REFRESH_INTERVAL
+        )
+        self.blessing_refresh_in_progress = False
+        self.log("Благословение подтверждено. Следующее обновление через 29 минут.")
+        self.mark_progress("Благословение обновлено")
+
     async def handle_map(self, message, text: str) -> None:
         map_info = parse_map(
             text,
@@ -583,6 +667,9 @@ class Farmer:
                 self.settings.values.long_pause_max,
             )
             await asyncio.sleep(pause)
+
+        if await self.try_refresh_blessing_from_map(message):
+            return
 
         if map_info.found_target is not None:
             self.context.active_target = map_info.found_target
@@ -1163,6 +1250,10 @@ class Farmer:
 
         text = message.raw_text or ""
         self.update_hp(text)
+        self.confirm_blessing_from_text(text)
+
+        if await self.handle_blessing_menu(message):
+            return
 
         round_events = parse_combat_round_events(text)
         for defeated_enemy in round_events.defeated_enemies:

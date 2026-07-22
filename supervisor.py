@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from auto_buff import AutoBuff
 from farmer import Farmer
 from notifications import Notifier
 from settings_service import SettingsService
@@ -17,10 +18,12 @@ class FarmerSupervisor:
         storage: Storage,
         notifier: Notifier,
         settings: SettingsService,
+        auto_buff: AutoBuff | None = None,
     ) -> None:
         self.storage = storage
         self.notifier = notifier
         self.settings = settings
+        self.auto_buff = auto_buff
         self.farmer: Farmer | None = None
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
@@ -32,13 +35,12 @@ class FarmerSupervisor:
         async with self.lock:
             if self.is_running():
                 return False, "Фармер уже запущен."
+            if self.auto_buff is not None and self.auto_buff.is_running():
+                return False, "Сначала выключите автобаф: Telethon-сессия уже занята."
             if not self.settings.values.enabled_targets:
                 return False, "Нужно выбрать хотя бы одного моба."
-            self.farmer = Farmer(
-                self.storage,
-                self.notifier,
-                self.settings,
-            )
+
+            self.farmer = Farmer(self.storage, self.notifier, self.settings)
             self.task = asyncio.create_task(self._runner(), name="fog-farmer")
             return True, "Фармер запущен."
 
@@ -61,7 +63,7 @@ class FarmerSupervisor:
                 level="CRITICAL",
             )
             await self.notifier.send(
-                f"🚨 Фармер аварийно завершён\n{type(error).__name__}: {error}"
+                f"Фармер аварийно завершён\n{type(error).__name__}: {error}"
             )
         finally:
             completed_farmer = self.farmer
@@ -70,7 +72,6 @@ class FarmerSupervisor:
                 if completed_farmer is not None
                 else None
             ) or "сессия завершена"
-
             completed_cycles = (
                 completed_farmer.current_cycle
                 if completed_farmer is not None
@@ -82,8 +83,6 @@ class FarmerSupervisor:
                 else None
             )
 
-            # Сначала очищаем задачу, чтобы динамическая клавиатура
-            # уже показывала только кнопку «▶️ Запустить».
             self.task = None
             self.farmer = None
 
@@ -94,10 +93,7 @@ class FarmerSupervisor:
                         rows=[
                             ("Циклов выполнено", completed_cycles or "—"),
                             ("Перемещений", total_moves or 0),
-                            (
-                                "Причина",
-                                "все запланированные циклы завершены",
-                            ),
+                            ("Причина", "все запланированные циклы завершены"),
                         ],
                     )
                 else:
@@ -106,9 +102,7 @@ class FarmerSupervisor:
                         rows=[("Причина", reason)],
                     )
             except Exception:
-                logger.exception(
-                    "Не удалось обновить клавиатуру после остановки"
-                )
+                logger.exception("Не удалось обновить клавиатуру после остановки")
 
     async def pause(self):
         if not self.is_running() or self.farmer is None:
@@ -124,6 +118,7 @@ class FarmerSupervisor:
         async with self.lock:
             if not self.is_running() or self.farmer is None:
                 return False, "Фармер уже остановлен."
+
             await self.farmer.stop("остановлен через служебного бота")
             if self.task and not self.task.done():
                 try:
@@ -140,4 +135,7 @@ class FarmerSupervisor:
     async def status(self):
         state = await self.storage.get_state()
         state["task_running"] = self.is_running()
+        state["auto_buff_running"] = bool(
+            self.auto_buff is not None and self.auto_buff.is_running()
+        )
         return state

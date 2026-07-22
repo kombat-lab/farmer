@@ -7,6 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
+from auto_buff import AutoBuff
 from config import (
     ADMIN_TELEGRAM_ID,
     CONTROL_BOT_TOKEN,
@@ -47,8 +48,9 @@ async def main() -> None:
     )
 
     notifier = Notifier(bot, ADMIN_TELEGRAM_ID)
-    supervisor = FarmerSupervisor(storage, notifier, settings)
-    control_bot = ControlBot(bot, storage, supervisor, settings)
+    auto_buff = AutoBuff(storage, notifier)
+    supervisor = FarmerSupervisor(storage, notifier, settings, auto_buff)
+    control_bot = ControlBot(bot, storage, supervisor, settings, auto_buff)
     notifier.set_keyboard_provider(control_bot.current_keyboard)
 
     logger.info("Запуск панели управления FoG Farmer на aiogram")
@@ -56,13 +58,15 @@ async def main() -> None:
         "APPLICATION_STARTED",
         "Контейнерное приложение запущено на aiogram",
     )
-
     await control_bot.start()
+
     try:
         await asyncio.Event().wait()
     finally:
         if supervisor.is_running():
             await supervisor.stop()
+        if auto_buff.is_running():
+            await auto_buff.stop()
         await control_bot.stop()
         await bot.session.close()
 

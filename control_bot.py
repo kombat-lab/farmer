@@ -378,10 +378,21 @@ class ControlBot:
             await state.clear()
             await self._send_text(message, "✅ Параметр сохранён.", CHARACTER_ROWS)
 
-        @r.message(StateFilter(None), F.text == " Выбор мобов")
+        @r.message(
+            StateFilter(None),
+            F.text.func(
+                lambda text: bool(text)
+                and text.replace("\ufe0f", "").strip().endswith("Выбор мобов")
+            ),
+        )
+        
         @r.message(StateFilter(None), F.text == BACK_TO_LOCATIONS_BUTTON)
         async def locations_handler(message: Message) -> None:
-            await self._send_text(message, get_locations_text(self.settings), get_locations_keyboard())
+            await self._send_text(
+                message,
+                get_locations_text(self.settings),
+                get_locations_keyboard(),
+            )
 
         @r.message(StateFilter(None), F.text.in_({location_button(c) for c in TARGET_MONSTER_CATEGORIES}))
         async def location_targets_handler(message: Message) -> None:

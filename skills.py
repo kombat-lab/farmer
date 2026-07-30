@@ -21,6 +21,7 @@ CURRENT_MANA_RE = re.compile(
 # прямо на кнопке навыка.
 DEFAULT_MANA_COSTS: dict[str, int] = {
     "лечение": 4,
+    "обновление": 4,
     "святое свечение": 3,
     "атака аколита": 0,
 }
@@ -42,6 +43,7 @@ class SkillButton:
             return False
         if self.mana_cost <= 0:
             return True
+
         # Если количество маны не удалось распознать, платный навык не
         # нажимаем: это безопаснее, чем потерять ход.
         return current_mana is not None and current_mana >= self.mana_cost
@@ -55,10 +57,15 @@ def parse_current_mana(text: str) -> Optional[int]:
 def parse_skill_button(text: str) -> SkillButton:
     cooldown_match = CD_RE.search(text)
     cooldown = int(cooldown_match.group(1)) if cooldown_match else 0
-
     cleaned = CD_RE.sub("", text).strip()
     normalized = normalize(cleaned)
-    known = ("лечение", "святое свечение", "атака аколита")
+
+    known = (
+        "лечение",
+        "обновление",
+        "святое свечение",
+        "атака аколита",
+    )
     name = next((value for value in known if value in normalized), cleaned)
 
     mana_match = MANA_COST_RE.search(cleaned)
@@ -83,8 +90,10 @@ def available_skills(message) -> dict[str, SkillButton]:
     for text in get_button_texts(message):
         skill = parse_skill_button(text)
         normalized_name = normalize(skill.name)
+
         if normalized_name not in DEFAULT_MANA_COSTS:
             continue
+
         if skill.can_cast(current_mana):
             result[normalized_name] = skill
 
@@ -118,15 +127,22 @@ def choose_skill(
 ) -> Optional[str]:
     available = available_skill_names(message)
 
-    if (
-        "лечение" in available
-        and should_use_healing(
-            current_hp=current_hp,
-            max_hp=max_hp,
-            heal_amount=heal_amount,
-        )
-    ):
+    healing_needed = should_use_healing(
+        current_hp=current_hp,
+        max_hp=max_hp,
+        heal_amount=heal_amount,
+    )
+
+    # Основное мгновенное лечение всегда имеет первый приоритет.
+    if "лечение" in available and healing_needed:
         return "лечение"
+
+    # «Обновление» — резервное лечение. Оно используется при том же
+    # критическом дефиците HP, но только когда обычное «Лечение» недоступно:
+    # находится на перезарядке, отсутствует среди кнопок или не хватает маны.
+    # После применения навык восстанавливает здоровье следующие три хода.
+    if "обновление" in available and healing_needed:
+        return "обновление"
 
     if "святое свечение" in available:
         return "святое свечение"

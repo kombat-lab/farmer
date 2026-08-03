@@ -10,14 +10,24 @@ POSITION_RE = re.compile(
     r"Позиция:\s*\((\d+)\s*,\s*(\d+)\)",
     re.IGNORECASE,
 )
-
 MONSTERS_RE = re.compile(
     r"Монстры на клетке:\s*(\d+)(?:\s*\((.*?)\))?",
     re.IGNORECASE,
 )
-
 HEART_HP_RE = re.compile(
     r"❤️\s*(\d+)\s*/\s*(\d+)"
+)
+LOCATION_RE = re.compile(
+    r"🗺️\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+MAP_SIZE_RE = re.compile(
+    r"Размер:\s*(\d+)\s*[xх×]\s*(\d+)",
+    re.IGNORECASE,
+)
+STATUS_RE = re.compile(
+    r"Статус:\s*([^\n\r]+)",
+    re.IGNORECASE,
 )
 
 
@@ -25,10 +35,11 @@ def normalize(value: str) -> str:
     return " ".join(value.casefold().strip().split())
 
 
-def parse_monsters(raw_monsters: Optional[str]) -> tuple[str, ...]:
+def parse_monsters(
+    raw_monsters: Optional[str],
+) -> tuple[str, ...]:
     if not raw_monsters:
         return ()
-
     return tuple(
         monster.strip()
         for monster in raw_monsters.split(",")
@@ -44,11 +55,9 @@ def find_configured_target(
         normalize(name): name
         for name in names
     }
-
     for configured_target in configured_targets:
         if normalize(configured_target) in normalized_names:
             return configured_target
-
     return None
 
 
@@ -57,26 +66,28 @@ def extract_player_hp(
     character_name: str,
 ) -> Optional[tuple[int, int]]:
     escaped_name = re.escape(character_name)
-
     map_match = re.search(
         rf"{escaped_name}\s*\((\d+)\s*/\s*(\d+)\)",
         text,
         re.IGNORECASE,
     )
     if map_match:
-        return int(map_match.group(1)), int(map_match.group(2))
+        return (
+            int(map_match.group(1)),
+            int(map_match.group(2)),
+        )
 
     lines = [line.strip() for line in text.splitlines()]
-
     for index, line in enumerate(lines):
         if character_name.casefold() not in line.casefold():
             continue
-
         for nearby_line in lines[index + 1:index + 4]:
             hp_match = HEART_HP_RE.search(nearby_line)
             if hp_match:
-                return int(hp_match.group(1)), int(hp_match.group(2))
-
+                return (
+                    int(hp_match.group(1)),
+                    int(hp_match.group(2)),
+                )
     return None
 
 
@@ -101,10 +112,8 @@ def extract_combat_target(text: str) -> Optional[str]:
         match = pattern.search(text)
         if not match:
             continue
-
         target = match.group(1).strip().splitlines()[0].strip()
         return target or None
-
     return None
 
 
@@ -119,14 +128,41 @@ def parse_map(
     if not position_match or not monsters_match:
         return None
 
+    position = (
+        int(position_match.group(1)),
+        int(position_match.group(2)),
+    )
     monsters = parse_monsters(monsters_match.group(2))
     hp = extract_player_hp(text, character_name)
+    location_match = LOCATION_RE.search(text)
+    size_match = MAP_SIZE_RE.search(text)
+    status_match = STATUS_RE.search(text)
+
+    location_name = (
+        location_match.group(1).strip()
+        if location_match
+        else None
+    )
+    status = (
+        status_match.group(1).strip()
+        if status_match
+        else None
+    )
+
+    # Ленивый импорт исключает циклическую зависимость:
+    # navigator -> locations -> config/models.
+    from navigator import (
+        activate_location,
+        report_blocked_transition,
+    )
+
+    activate_location(location_name)
+
+    if status and "туда пройти нельзя" in status.casefold():
+        report_blocked_transition(position)
 
     return MapInfo(
-        position=(
-            int(position_match.group(1)),
-            int(position_match.group(2)),
-        ),
+        position=position,
         monster_count=int(monsters_match.group(1)),
         monsters=monsters,
         found_target=find_configured_target(
@@ -138,6 +174,16 @@ def parse_map(
         movement_finished=(
             "Переход между клетками завершён" in text
         ),
+        location_name=location_name,
+        map_size=(
+            (
+                int(size_match.group(1)),
+                int(size_match.group(2)),
+            )
+            if size_match
+            else None
+        ),
+        status=status,
     )
 
 
@@ -146,7 +192,11 @@ def classify_message(
     configured_targets: Iterable[str],
     character_name: str,
 ) -> MessageKind:
-    if parse_map(text, configured_targets, character_name) is not None:
+    if parse_map(
+        text,
+        configured_targets,
+        character_name,
+    ) is not None:
         return MessageKind.MAP
 
     if "Шаг начат" in text:
@@ -155,7 +205,10 @@ def classify_message(
     if "Выбери цель для нападения" in text:
         return MessageKind.TARGET_SELECTION
 
-    if "Выберите цель для" in text or "Выбери цель для" in text:
+    if (
+        "Выберите цель для" in text
+        or "Выбери цель для" in text
+    ):
         return MessageKind.COMBAT_TARGET_SELECTION
 
     if (
@@ -172,12 +225,12 @@ def classify_message(
         return MessageKind.BATTLE_FINISHED
 
     normalized = normalize(text)
-
     if (
         "монстр не найден в текущей клетке" in normalized
         or "монстр не найден на текущей клетке" in normalized
     ):
         return MessageKind.TARGET_GONE
+
     if "приглаш" in normalized and "бой" in normalized:
         return MessageKind.BATTLE_INVITE
 

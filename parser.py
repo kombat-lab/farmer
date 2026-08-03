@@ -32,7 +32,20 @@ STATUS_RE = re.compile(
 
 
 def normalize(value: str) -> str:
-    return " ".join(value.casefold().strip().split())
+    """
+    Нормализует текст для сравнений.
+
+    Служебные эмодзи и значки в начале названия не учитываются:
+    «💎 Туманный Жгун» и «Туманный Жгун» считаются одним именем.
+    """
+    normalized = " ".join(value.casefold().strip().split())
+    normalized = re.sub(
+        r"^[^\wа-яё]+",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized.strip()
 
 
 def parse_monsters(

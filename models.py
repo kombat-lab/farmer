@@ -55,6 +55,9 @@ class MapInfo:
     current_hp: Optional[int]
     max_hp: Optional[int]
     movement_finished: bool
+    location_name: Optional[str] = None
+    map_size: Optional[tuple[int, int]] = None
+    status: Optional[str] = None
 
     @property
     def displayed_monster_count(self) -> int:
@@ -63,6 +66,13 @@ class MapInfo:
     @property
     def has_hidden_monsters(self) -> bool:
         return self.monster_count > self.displayed_monster_count
+
+    @property
+    def movement_blocked(self) -> bool:
+        return bool(
+            self.status
+            and "туда пройти нельзя" in self.status.casefold()
+        )
 
 
 @dataclass(frozen=True)
@@ -79,17 +89,14 @@ class RuntimeContext:
     current_position: Optional[Position] = None
     current_hp: Optional[int] = None
     max_hp: Optional[int] = None
-
     active_target: Optional[str] = None
     battle_target: Optional[str] = None
     combat_enemies: list[str] = None  # type: ignore[assignment]
     pending_skill: Optional[str] = None
     checked_empty_position: Optional[Position] = None
     checking_hidden_monsters: bool = False
-
     pending_move: Optional[MovePlan] = None
     failed_move_attempts: int = 0
-
     move_count: int = 0
     kill_count: int = 0
 
@@ -108,11 +115,19 @@ class RuntimeContext:
     def remove_combat_enemy(self, name: str) -> None:
         normalized = " ".join(name.casefold().split())
         self.combat_enemies = [
-            enemy for enemy in self.combat_enemies
+            enemy
+            for enemy in self.combat_enemies
             if " ".join(enemy.casefold().split()) != normalized
         ]
-        if self.active_target and " ".join(self.active_target.casefold().split()) == normalized:
-            self.active_target = self.combat_enemies[0] if self.combat_enemies else None
+        if (
+            self.active_target
+            and " ".join(self.active_target.casefold().split()) == normalized
+        ):
+            self.active_target = (
+                self.combat_enemies[0]
+                if self.combat_enemies
+                else None
+            )
 
     def clear_combat(self) -> None:
         self.active_target = None

@@ -179,10 +179,9 @@ def settings_rich(settings) -> str:
         [
             ("Количество циклов", s.cycles_count),
             ("Ходов в цикле", s.moves_per_cycle),
-            ("Максимум HP", s.max_hp),
+            ("Порог лечения", s.heal_threshold),
             ("Максимум маны", s.max_mana),
             ("Сила лечения", s.heal_amount),
-            ("Порог лечения", max(1, s.max_hp - s.heal_amount)),
         ]
     )
     body += f"<details open><summary>🎯 Активные цели</summary>{targets}</details>"

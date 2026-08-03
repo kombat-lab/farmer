@@ -9,7 +9,7 @@ from config import (
     DEFAULT_CYCLE_REST_MAX,
     DEFAULT_CYCLE_REST_MIN,
     DEFAULT_LONG_PAUSE_CHANCE,
-    DEFAULT_MAX_HP,
+    DEFAULT_HEAL_THRESHOLD,
     DEFAULT_MAX_MANA,
     DEFAULT_HEAL_AMOUNT,
     DEFAULT_LONG_PAUSE_MAX,
@@ -34,7 +34,7 @@ class FarmerSettings:
 
     enabled_targets: list[str] | None = None
 
-    max_hp: int = DEFAULT_MAX_HP
+    heal_threshold: int = DEFAULT_HEAL_THRESHOLD
     max_mana: int = DEFAULT_MAX_MANA
     heal_amount: int = DEFAULT_HEAL_AMOUNT
 
@@ -69,6 +69,19 @@ class SettingsService:
 
     async def load(self) -> None:
         stored = await self.storage.get_settings()
+
+        # Preserve the old effective behaviour during an upgrade. Previously
+        # healing started at max_hp - heal_amount; the user can then adjust the
+        # resulting explicit threshold directly in the control bot.
+        if "heal_threshold" not in stored and "max_hp" in stored:
+            try:
+                stored["heal_threshold"] = max(
+                    1,
+                    int(stored["max_hp"])
+                    - int(stored.get("heal_amount", DEFAULT_HEAL_AMOUNT)),
+                )
+            except (TypeError, ValueError):
+                stored["heal_threshold"] = DEFAULT_HEAL_THRESHOLD
 
         for key, value in stored.items():
             if hasattr(self.values, key):
@@ -221,17 +234,13 @@ class SettingsService:
 
 
     def _normalize_character(self) -> None:
-        for key in ("max_hp", "max_mana", "heal_amount"):
+        for key in ("heal_threshold", "max_mana", "heal_amount"):
             value = getattr(self.values, key)
             try:
                 value = int(value)
             except (TypeError, ValueError):
                 value = 1
             setattr(self.values, key, max(1, value))
-
-    @property
-    def heal_threshold(self) -> int:
-        return max(1, self.values.max_hp - self.values.heal_amount)
 
     @staticmethod
     def validate_character_value(value: int) -> None:

@@ -107,30 +107,26 @@ def available_skill_names(message) -> set[str]:
 def should_use_healing(
     *,
     current_hp: Optional[int],
-    max_hp: Optional[int],
-    heal_amount: int,
+    heal_threshold: int,
 ) -> bool:
-    """Возвращает True, когда лечение не будет потрачено впустую."""
-    if current_hp is None or max_hp is None or heal_amount <= 0:
+    """Возвращает True, когда HP достиг заданного порога лечения."""
+    if current_hp is None or heal_threshold <= 0:
         return False
 
-    missing_hp = max_hp - current_hp
-    return missing_hp >= heal_amount
+    return current_hp <= heal_threshold
 
 
 def choose_skill(
     message,
     *,
     current_hp: Optional[int],
-    max_hp: Optional[int],
-    heal_amount: int,
+    heal_threshold: int,
 ) -> Optional[str]:
     available = available_skill_names(message)
 
     healing_needed = should_use_healing(
         current_hp=current_hp,
-        max_hp=max_hp,
-        heal_amount=heal_amount,
+        heal_threshold=heal_threshold,
     )
 
     # Основное мгновенное лечение всегда имеет первый приоритет.

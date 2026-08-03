@@ -915,8 +915,7 @@ class Farmer:
         return choose_skill(
             message,
             current_hp=self.context.current_hp,
-            max_hp=(self.context.max_hp or self.settings.values.max_hp),
-            heal_amount=self.settings.values.heal_amount,
+            heal_threshold=self.settings.values.heal_threshold,
         ) == normalize(skill_name)
 
     async def handle_combat_turn(self, message) -> None:
@@ -932,8 +931,7 @@ class Farmer:
         skill_name = choose_skill(
             message,
             current_hp=self.context.current_hp,
-            max_hp=(self.context.max_hp or self.settings.values.max_hp),
-            heal_amount=self.settings.values.heal_amount,
+            heal_threshold=self.settings.values.heal_threshold,
         )
         if skill_name is None:
             await self.recover_latest_state("не найден доступный навык")

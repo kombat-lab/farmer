@@ -39,7 +39,7 @@ SETTINGS_ROWS = [
     ["↩️ Главное меню"],
 ]
 CHARACTER_ROWS = [
-    ["❤️ Максимум HP", "Максимум маны"],
+    ["❤️ Порог лечения", "Максимум маны"],
     ["Сила лечения"],
     ["↩️ Настройки"],
 ]
@@ -418,15 +418,14 @@ class ControlBot:
             await self._send_text(
                 message,
                 "❤️ Параметры персонажа\n\n"
-                f"Максимум HP: {values.max_hp}\n"
+                f"Порог лечения: {values.heal_threshold} HP и ниже\n"
                 f"Максимум маны: {values.max_mana}\n"
-                f"Лечение: +{values.heal_amount} HP\n"
-                f"Порог лечения: {self.settings.heal_threshold} HP и ниже",
+                f"Лечение: +{values.heal_amount} HP",
                 CHARACTER_ROWS,
             )
 
         character_fields = {
-            normalize_button_text("❤️ Максимум HP"): ("max_hp", "максимальный HP"),
+            normalize_button_text("❤️ Порог лечения"): ("heal_threshold", "порог лечения"),
             normalize_button_text("Максимум маны"): ("max_mana", "максимальную ману"),
             normalize_button_text("Сила лечения"): ("heal_amount", "силу лечения"),
         }

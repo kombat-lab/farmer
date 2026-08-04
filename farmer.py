@@ -8,7 +8,7 @@ from collections import Counter, deque
 from typing import Optional
 
 from telethon import TelegramClient, events
-from telethon.errors import RPCError
+from telethon.errors import FloodWaitError, RPCError
 
 from config import (
     API_HASH,
@@ -82,6 +82,8 @@ MAP_COMMAND = "Карта"
 MAX_FAILED_MOVE_ATTEMPTS = 2
 EVENT_QUEUE_SIZE = 200
 PROCESSED_EVENT_CACHE_SIZE = 500
+LATEST_MESSAGE_CACHE_SIZE = 200
+MAX_CALLBACK_TIMEOUTS = 2
 
 BLESSING_REFRESH_INTERVAL = 29 * 60
 BLESSING_RETRY_INTERVAL = 5 * 60
@@ -102,6 +104,9 @@ class Farmer:
             SESSION_NAME,
             API_ID,
             API_HASH,
+            # Even a short FLOOD_WAIT must be visible to the farmer. Silently
+            # sleeping and retrying would hide the first server-side warning.
+            flood_sleep_threshold=0,
         )
 
         self.game_bot = None
@@ -135,6 +140,13 @@ class Farmer:
 
         self.processed_event_keys: set[tuple] = set()
         self.processed_event_order: deque[tuple] = deque(
+            maxlen=PROCESSED_EVENT_CACHE_SIZE
+        )
+        self.latest_messages: dict[int, object] = {}
+        self.latest_received_message = None
+        self.callback_timeout_count = 0
+        self.attempted_action_keys: set[tuple] = set()
+        self.attempted_action_order: deque[tuple] = deque(
             maxlen=PROCESSED_EVENT_CACHE_SIZE
         )
 
@@ -202,17 +214,51 @@ class Farmer:
         if self.settings.values.heal_amount <= 0:
             raise ValueError("heal_amount должен быть больше нуля.")
 
-    def remember_event(self, message) -> bool:
+    @staticmethod
+    def event_key(message) -> tuple:
         edit_timestamp = (
             message.edit_date.timestamp()
             if message.edit_date
             else None
         )
-        key = (
+        return (
             message.id,
             edit_timestamp,
             message.raw_text or "",
+            tuple(get_button_texts(message)),
         )
+
+    def cache_latest_message(self, message) -> bool:
+        """Stores an inbound update and rejects older revisions of the same message."""
+        previous = self.latest_messages.get(message.id)
+        if previous is not None:
+            previous_edit = (
+                previous.edit_date.timestamp()
+                if previous.edit_date
+                else 0.0
+            )
+            current_edit = (
+                message.edit_date.timestamp()
+                if message.edit_date
+                else 0.0
+            )
+            if current_edit < previous_edit:
+                return False
+
+        if previous is None and len(self.latest_messages) >= LATEST_MESSAGE_CACHE_SIZE:
+            oldest_id = next(iter(self.latest_messages))
+            self.latest_messages.pop(oldest_id, None)
+
+        self.latest_messages[message.id] = message
+        self.latest_received_message = message
+        return True
+
+    def is_latest_message(self, message) -> bool:
+        latest = self.latest_messages.get(message.id)
+        return latest is not None and self.event_key(latest) == self.event_key(message)
+
+    def remember_event(self, message) -> bool:
+        key = self.event_key(message)
 
         if key in self.processed_event_keys:
             return False
@@ -232,6 +278,10 @@ class Farmer:
         force: bool = False,
     ) -> None:
         if not self.running:
+            return
+
+        is_latest = self.cache_latest_message(message)
+        if not force and not is_latest:
             return
 
         # Live-события Telethon защищаем от дублей. Но сообщения,
@@ -254,6 +304,11 @@ class Farmer:
             message = await self.event_queue.get()
 
             try:
+                # While an older revision was waiting in the queue, Telethon
+                # may already have delivered a newer edit. Only the newest
+                # revision is allowed to make a decision or press a button.
+                if not self.is_latest_message(message):
+                    continue
                 await self.handle_message(message)
             except asyncio.CancelledError:
                 raise
@@ -295,12 +350,92 @@ class Farmer:
         minimum, maximum = ranges[action_type]
         return random.uniform(minimum, maximum)
 
-    async def get_fresh_message(self, message_id: int):
-        fresh = await self.client.get_messages(
-            self.game_bot,
-            ids=message_id,
+    async def stop_for_flood_wait(self, error: FloodWaitError, action: str) -> None:
+        seconds = max(1, int(error.seconds))
+        reason = f"Telegram FLOOD_WAIT на {seconds} сек. при действии: {action}"
+        await self.storage.add_event(
+            "TELEGRAM_FLOOD_WAIT",
+            reason,
+            level="CRITICAL",
+            payload={"seconds": seconds, "action": action},
         )
-        return fresh if fresh and fresh.id else None
+        await self.notifier.send(
+            "⛔️ <b>Telegram ограничил действия</b>\n"
+            f"Ожидание: {seconds} сек.\n"
+            f"Действие: {action}\n"
+            "Фармер остановлен, автоповторов не будет."
+        )
+        await self.stop(reason)
+
+    async def press_button(
+        self,
+        message,
+        row: int,
+        column: int,
+        description: str,
+    ) -> bool:
+        action_key = (*self.event_key(message), description)
+        if action_key in self.attempted_action_keys:
+            reason = (
+                "игра не обновила состояние после inline-действия; "
+                f"повтор «{description}» заблокирован"
+            )
+            await self.storage.add_event(
+                "REPEATED_TELEGRAM_ACTION_BLOCKED",
+                reason,
+                level="CRITICAL",
+            )
+            await self.notifier.send(
+                "⛔️ <b>Повтор inline-действия заблокирован</b>\n"
+                "После предыдущего нажатия игра не прислала "
+                "новое состояние. Фармер остановлен вместо повторного запроса."
+            )
+            await self.stop(reason)
+            return False
+
+        if len(self.attempted_action_order) == self.attempted_action_order.maxlen:
+            oldest = self.attempted_action_order.popleft()
+            self.attempted_action_keys.discard(oldest)
+        self.attempted_action_order.append(action_key)
+        self.attempted_action_keys.add(action_key)
+
+        try:
+            await message.click(row, column)
+            self.callback_timeout_count = 0
+            return True
+        except FloodWaitError as error:
+            await self.stop_for_flood_wait(error, description)
+            return False
+        except RPCError as error:
+            if getattr(error, "message", "") != "BOT_RESPONSE_TIMEOUT":
+                self.log(
+                    f"Telegram не выполнил нажатие «{description}»: "
+                    f"{type(error).__name__}: {error}"
+                )
+                return False
+
+            self.callback_timeout_count += 1
+            self.log(
+                f"Telegram не получил ответ на inline-кнопку "
+                f"«{description}» ({self.callback_timeout_count}/{MAX_CALLBACK_TIMEOUTS}): {error}"
+            )
+            if self.callback_timeout_count >= MAX_CALLBACK_TIMEOUTS:
+                reason = (
+                    "повторный BOT_RESPONSE_TIMEOUT; "
+                    "возможно ограничение inline-кнопок"
+                )
+                await self.storage.add_event(
+                    "TELEGRAM_CALLBACK_TIMEOUT",
+                    reason,
+                    level="CRITICAL",
+                )
+                await self.notifier.send(
+                    "⛔️ <b>Не работают inline-кнопки</b>\n"
+                    "Telegram дважды подряд не получил ответ "
+                    "от игрового бота. Фармер остановлен без повторов."
+                )
+                await self.stop(reason)
+            return False
 
     async def click_button(
         self,
@@ -323,12 +458,14 @@ class Farmer:
         if not self.running:
             return False
 
-        fresh_message = await self.get_fresh_message(message.id)
-        if fresh_message is None:
+        if not self.is_latest_message(message):
+            self.log(
+                f"Отменено устаревшее действие: {description}"
+            )
             return False
 
         position = self.find_button(
-            fresh_message,
+            message,
             exact=exact,
             contains=contains,
             exclude=exclude,
@@ -336,22 +473,14 @@ class Farmer:
         if position is None:
             self.log(
                 f"Кнопка «{description}» больше недоступна. "
-                f"Текущие кнопки: {self.get_button_texts(fresh_message)}"
+                f"Текущие кнопки: {self.get_button_texts(message)}"
             )
             return False
 
         row, column = position
 
-        try:
-            self.log(f"Нажимаю: {description}")
-            await fresh_message.click(row, column)
-            return True
-        except Exception as error:
-            self.log(
-                f"Ошибка нажатия «{description}»: "
-                f"{type(error).__name__}: {error}"
-            )
-            return False
+        self.log(f"Нажимаю: {description}")
+        return await self.press_button(message, row, column, description)
 
     def update_hp(self, text: str) -> None:
         hp = extract_player_hp(text, CHARACTER_NAME)
@@ -874,39 +1003,23 @@ class Farmer:
         if not self.running:
             return
 
-        fresh_message = await self.get_fresh_message(message.id)
-        if fresh_message is None:
-            await self.recover_latest_state(
-                "сообщение выбора боевой цели исчезло"
-            )
+        if not self.is_latest_message(message):
+            self.log("Отменён устаревший выбор боевой цели")
             return
 
-        fresh_target_name, fresh_position = (
-            self.analyze_combat_target_buttons(fresh_message)
+        row, column = position
+        self.log(f"Выбираю боевую цель: {target_name}")
+        clicked = await self.press_button(
+            message,
+            row,
+            column,
+            f"боевая цель {target_name}",
         )
-
-        if fresh_position is None:
-            self.mark_progress(
-                "выбор цели навыка больше не требуется"
-            )
-            return
-
-        row, column = fresh_position
-
-        try:
-            self.log(
-                "Выбираю боевую цель: "
-                f"{fresh_target_name or target_name}"
-            )
-            await fresh_message.click(row, column)
+        if clicked:
             self.mark_progress(
                 "цель атакующего навыка выбрана"
             )
-        except Exception as error:
-            self.log(
-                "Ошибка выбора боевой цели: "
-                f"{type(error).__name__}: {error}"
-            )
+        elif self.running:
             await self.recover_latest_state(
                 "не удалось выбрать цель навыка"
             )
@@ -1101,12 +1214,11 @@ class Farmer:
         await self.request_map_refresh()
 
     async def request_map_refresh(self) -> None:
-        messages = await self.client.get_messages(
-            self.game_bot,
-            limit=20,
-        )
-
-        for message in messages:
+        # The latest inbound message is already in memory. Reading 20 history
+        # items before every refresh used two or three RPC calls for an action
+        # that only needs one.
+        message = self.latest_received_message
+        if message is not None and self.is_latest_message(message):
             if self.find_button(
                 message,
                 exact=LOOK_BUTTON,
@@ -1119,10 +1231,42 @@ class Farmer:
                 )
                 return
 
-        await self.client.send_message(
-            self.game_bot,
-            MAP_COMMAND,
+        try:
+            await self.client.send_message(
+                self.game_bot,
+                MAP_COMMAND,
+            )
+        except FloodWaitError as error:
+            await self.stop_for_flood_wait(error, MAP_COMMAND)
+
+    async def restore_from_message(self, message) -> bool:
+        """Restores state from an already available message without an RPC read."""
+        kind = classify_message(
+            message.raw_text or "",
+            self.settings.values.enabled_targets,
+            CHARACTER_NAME,
         )
+
+        recoverable = {
+            MessageKind.TARGET_GONE,
+            MessageKind.PLAYER_TURN,
+            MessageKind.COMBAT_TARGET_SELECTION,
+            MessageKind.COMBAT_STARTED,
+            MessageKind.TARGET_SELECTION,
+            MessageKind.MAP,
+            MessageKind.BATTLE_FINISHED,
+        }
+        if kind in recoverable:
+            self.statistics.record_successful_recovery()
+            await self.enqueue_message(message, force=True)
+            return True
+
+        if kind is MessageKind.MOVE_STARTED:
+            self.statistics.record_successful_recovery()
+            await self.request_map_refresh()
+            return True
+
+        return False
 
     async def recover_latest_state(
         self,
@@ -1142,56 +1286,23 @@ class Farmer:
             )
             return
 
-        messages = await self.client.get_messages(
-            self.game_bot,
-            limit=STATE_HISTORY_LIMIT,
-        )
+        # Normally the current game state is the last update Telethon delivered.
+        # Reuse it before asking Telegram for up to 100 history messages.
+        cached = self.latest_received_message
+        if cached is not None and await self.restore_from_message(cached):
+            return
+
+        try:
+            messages = await self.client.get_messages(
+                self.game_bot,
+                limit=STATE_HISTORY_LIMIT,
+            )
+        except FloodWaitError as error:
+            await self.stop_for_flood_wait(error, "восстановление истории")
+            return
 
         for message in messages:
-            kind = classify_message(
-                message.raw_text or "",
-                self.settings.values.enabled_targets,
-                CHARACTER_NAME,
-            )
-
-            if kind is MessageKind.TARGET_GONE:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.PLAYER_TURN:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.COMBAT_TARGET_SELECTION:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.COMBAT_STARTED:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.TARGET_SELECTION:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.MAP:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.BATTLE_FINISHED:
-                self.statistics.record_successful_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.MOVE_STARTED:
-                self.statistics.record_successful_recovery()
-                await self.request_map_refresh()
+            if await self.restore_from_message(message):
                 return
 
         await self.request_map_refresh()

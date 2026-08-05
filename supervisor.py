@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from auto_buff import AutoBuff
+from config import SESSION_NAME
 from farmer import Farmer
 from notifications import Notifier
 from settings_service import SettingsService
 from storage import Storage
+from session_lock import SessionLease
 
 logger = logging.getLogger("fog_farmer")
 
@@ -27,6 +30,7 @@ class FarmerSupervisor:
         self.farmer: Farmer | None = None
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
+        self.session_lease = SessionLease(Path(f"{SESSION_NAME}.lock"))
 
     def is_running(self) -> bool:
         return self.task is not None and not self.task.done()
@@ -40,8 +44,19 @@ class FarmerSupervisor:
             if not self.settings.values.enabled_targets:
                 return False, "Нужно выбрать хотя бы одного моба."
 
-            self.farmer = Farmer(self.storage, self.notifier, self.settings)
-            self.task = asyncio.create_task(self._runner(), name="fog-farmer")
+            if not self.session_lease.acquire():
+                return False, (
+                    "Telethon-сессия уже используется другим "
+                    "экземпляром. Сначала нажмите «Стоп»."
+                )
+
+            try:
+                await self.storage.set_setting("farmer_stop_requested", False)
+                self.farmer = Farmer(self.storage, self.notifier, self.settings)
+                self.task = asyncio.create_task(self._runner(), name="fog-farmer")
+            except Exception:
+                self.session_lease.release()
+                raise
             return True, "Фармер запущен."
 
     async def _runner(self):
@@ -85,6 +100,7 @@ class FarmerSupervisor:
 
             self.task = None
             self.farmer = None
+            self.session_lease.release()
 
             try:
                 if reason.startswith("завершены все циклы"):
@@ -117,7 +133,11 @@ class FarmerSupervisor:
     async def stop(self):
         async with self.lock:
             if not self.is_running() or self.farmer is None:
-                return False, "Фармер уже остановлен."
+                await self.storage.set_setting("farmer_stop_requested", True)
+                return True, (
+                    "Команда остановки передана другому "
+                    "экземпляру фармера."
+                )
 
             await self.farmer.stop("остановлен через служебного бота")
             if self.task and not self.task.done():

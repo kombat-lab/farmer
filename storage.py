@@ -280,6 +280,19 @@ class Storage:
                     pass
             return result
 
+    async def get_setting(self, key: str, default=None):
+        async with self.lock:
+            row = self.connection.execute(
+                "SELECT value_json FROM settings WHERE key=?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return default
+            try:
+                return json.loads(row["value_json"])
+            except json.JSONDecodeError:
+                return default
+
     async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
         async with self.lock:
             cur = self.connection.execute("""

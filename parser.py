@@ -17,6 +17,10 @@ MONSTERS_RE = re.compile(
 HEART_HP_RE = re.compile(
     r"❤️\s*(\d+)\s*/\s*(\d+)"
 )
+HEALTH_RESTORED_RE = re.compile(
+    r"Ваше здоровье восстановилось до\s*(\d+)\s*/\s*(\d+)",
+    re.IGNORECASE,
+)
 LOCATION_RE = re.compile(
     r"🗺️\s*([^\n\r]+)",
     re.IGNORECASE,
@@ -78,6 +82,13 @@ def extract_player_hp(
     text: str,
     character_name: str,
 ) -> Optional[tuple[int, int]]:
+    restored_match = HEALTH_RESTORED_RE.search(text)
+    if restored_match:
+        return (
+            int(restored_match.group(1)),
+            int(restored_match.group(2)),
+        )
+
     escaped_name = re.escape(character_name)
     map_match = re.search(
         rf"{escaped_name}\s*\((\d+)\s*/\s*(\d+)\)",

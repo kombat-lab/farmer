@@ -32,6 +32,7 @@ from config import (
     MAP_MIN_Y,
         MAX_RECOVERY_ATTEMPTS,
     MIN_HP_AFTER_DEATH,
+    MIN_HP_PERCENT_TO_START_BATTLE,
         MOVE_PROGRESS_TIMEOUT,
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
@@ -482,21 +483,74 @@ class Farmer:
         self.log(f"Нажимаю: {description}")
         return await self.press_button(message, row, column, description)
 
-    def update_hp(self, text: str) -> None:
+    def update_hp(self, text: str) -> bool:
         hp = extract_player_hp(text, CHARACTER_NAME)
         if hp is None:
-            return
+            return False
 
         current_hp, max_hp = hp
-        if (
+        changed = (
             current_hp != self.context.current_hp
             or max_hp != self.context.max_hp
+        )
+        if (
+            changed
         ):
             self.context.current_hp = current_hp
             self.context.max_hp = max_hp
             self.log(
                 f"Здоровье обновлено: {current_hp}/{max_hp}"
             )
+        return changed
+
+    def has_battle_health(self) -> bool:
+        current_hp = self.context.current_hp
+        max_hp = self.context.max_hp
+        if current_hp is None or max_hp is None or max_hp <= 0:
+            return False
+        return current_hp * 100 >= max_hp * MIN_HP_PERCENT_TO_START_BATTLE
+
+    def battle_health_is_low(self) -> bool:
+        return (
+            self.context.current_hp is not None
+            and self.context.max_hp is not None
+            and self.context.max_hp > 0
+            and not self.has_battle_health()
+        )
+
+    async def wait_for_battle_health(self) -> None:
+        if self.state is BotState.WAITING_FOR_HEALTH:
+            return
+        self.state = BotState.WAITING_FOR_HEALTH
+        current_hp = self.context.current_hp or 0
+        max_hp = self.context.max_hp or 0
+        threshold = (max_hp * MIN_HP_PERCENT_TO_START_BATTLE + 99) // 100
+        self.mark_progress("ожидание восстановления HP перед боем")
+        await self.storage.add_event(
+            "LOW_HP_WAIT_STARTED",
+            f"HP {current_hp}/{max_hp}; новые бои разрешены от {threshold}",
+            level="INFO",
+        )
+        await self.notifier.send(
+            "❤️ <b>Низкий запас HP</b>\n"
+            f"Сейчас: {current_hp}/{max_hp}\n"
+            f"Новые бои начнутся при HP не ниже {threshold}."
+        )
+
+    async def finish_battle_health_wait(self) -> None:
+        self.state = BotState.MAP
+        current_hp = self.context.current_hp or 0
+        max_hp = self.context.max_hp or 0
+        self.mark_progress("HP восстановлено для новых боёв")
+        await self.storage.add_event(
+            "LOW_HP_WAIT_FINISHED",
+            f"HP восстановлено до {current_hp}/{max_hp}",
+        )
+        await self.notifier.send(
+            "❤️ <b>Здоровье восстановлено</b>\n"
+            f"HP: {current_hp}/{max_hp}\n"
+            "Фармер продолжает работу."
+        )
 
     def confirm_pending_move(
         self,
@@ -787,6 +841,10 @@ class Farmer:
             f"показано: {list(map_info.monsters) or 'нет'}"
         )
 
+        if self.battle_health_is_low():
+            await self.wait_for_battle_health()
+            return
+
         if (
             map_info.movement_finished
             and random.random() < self.settings.values.long_pause_chance
@@ -871,6 +929,21 @@ class Farmer:
     ) -> None:
         self.state = BotState.TARGET_SELECTION
         self.mark_progress("список целей получен")
+
+        if self.battle_health_is_low():
+            clicked = await self.click_button(
+                message,
+                exact=BACK_TO_MAP_BUTTON,
+                action_type=ActionType.SELECT_TARGET,
+                description=BACK_TO_MAP_BUTTON,
+            )
+            if clicked:
+                await self.wait_for_battle_health()
+            elif self.running:
+                await self.recover_latest_state(
+                    "низкий HP: не удалось вернуться на карту"
+                )
+            return
 
         if self.pause_requested:
             clicked = await self.click_button(
@@ -1311,7 +1384,16 @@ class Farmer:
         while self.running:
             await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
 
-            if self.state in {BotState.PAUSED, BotState.RESTING}:
+            if await self.storage.get_setting("farmer_stop_requested", False):
+                await self.storage.set_setting("farmer_stop_requested", False)
+                await self.stop("остановлен командой из другого процесса")
+                return
+
+            if self.state in {
+                BotState.PAUSED,
+                BotState.RESTING,
+                BotState.WAITING_FOR_HEALTH,
+            }:
                 continue
 
             should_recover = self.watchdog.should_recover(
@@ -1361,6 +1443,28 @@ class Farmer:
         self.update_hp(text)
         self.confirm_blessing_from_text(text)
 
+        kind = classify_message(
+            text,
+            self.settings.values.enabled_targets,
+            CHARACTER_NAME,
+        )
+
+        if self.state is BotState.WAITING_FOR_HEALTH:
+            active_battle_kinds = {
+                MessageKind.TARGET_SELECTION,
+                MessageKind.COMBAT_TARGET_SELECTION,
+                MessageKind.COMBAT_STARTED,
+                MessageKind.PLAYER_TURN,
+                MessageKind.BATTLE_FINISHED,
+            }
+            if kind not in active_battle_kinds:
+                if not self.has_battle_health():
+                    return
+                await self.finish_battle_health_wait()
+                if kind is not MessageKind.MAP:
+                    await self.request_map_refresh()
+                    return
+
         if await self.handle_blessing_menu(message):
             return
 
@@ -1368,12 +1472,6 @@ class Farmer:
         for defeated_enemy in round_events.defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")
-
-        kind = classify_message(
-            text,
-            self.settings.values.enabled_targets,
-            CHARACTER_NAME,
-        )
 
         if kind is MessageKind.MAP:
             await self.handle_map(message, text)

@@ -25,6 +25,7 @@ DEFAULT_MANA_COSTS: dict[str, int] = {
     "святое свечение": 3,
     "атака аколита": 0,
 }
+HEALING_MANA_RESERVE = 4
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,7 @@ def choose_skill(
     current_hp: Optional[int],
     heal_threshold: int,
 ) -> Optional[str]:
-    available = available_skill_names(message)
+    available = available_skills(message)
 
     healing_needed = should_use_healing(
         current_hp=current_hp,
@@ -140,7 +141,13 @@ def choose_skill(
     if "обновление" in available and healing_needed:
         return "обновление"
 
-    if "святое свечение" in available:
+    holy_light = available.get("святое свечение")
+    current_mana = parse_current_mana(getattr(message, "raw_text", "") or "")
+    if (
+        holy_light is not None
+        and current_mana is not None
+        and current_mana - holy_light.mana_cost >= HEALING_MANA_RESERVE
+    ):
         return "святое свечение"
 
     if "атака аколита" in available:

@@ -18,6 +18,7 @@ class BotState(Enum):
     RECOVERY = auto()
     PAUSED = auto()
     RESTING = auto()
+    WAITING_FOR_HEALTH = auto()
     STOPPED = auto()
 
 

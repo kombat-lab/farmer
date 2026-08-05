@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
+from pathlib import Path
 from typing import Iterable
 
 from telethon import TelegramClient, events
@@ -12,6 +13,7 @@ from telethon.errors import RPCError
 from config import API_HASH, API_ID, GAME_BOT, SESSION_NAME
 from notifications import Notifier
 from storage import Storage
+from session_lock import SessionLease
 
 logger = logging.getLogger("fog_farmer")
 
@@ -47,6 +49,7 @@ class AutoBuff:
         self.last_player: str | None = None
         self.success_count = 0
         self.error_count = 0
+        self.session_lease = SessionLease(Path(f"{SESSION_NAME}.lock"))
 
     def is_running(self) -> bool:
         return self.task is not None and not self.task.done() and self.enabled
@@ -55,6 +58,9 @@ class AutoBuff:
         async with self.lock:
             if self.is_running():
                 return False, "Автобаф уже включён."
+
+            if not self.session_lease.acquire():
+                return False, "Telethon-сессия занята другим экземпляром."
 
             self.enabled = True
             self.task = asyncio.create_task(self._run(), name="auto-buff")
@@ -144,6 +150,7 @@ class AutoBuff:
             if client.is_connected():
                 await client.disconnect()
             self.enabled = False
+            self.session_lease.release()
 
     async def _on_game_message(self, event) -> None:
         if not self.enabled:

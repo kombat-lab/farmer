@@ -87,10 +87,13 @@ LOCATIONS = {
 
 
 def get_location(name: str) -> Location:
-    try:
-        return LOCATIONS[name]
-    except KeyError as exc:
-        raise ValueError(f"Неизвестная локация: {name}") from exc
+    location = LOCATIONS.get(name)
+    if location is None:
+        # New game locations must not crash navigation. Until explicit
+        # geometry is configured, use the safe default rectangular map.
+        location = _build_location(name, [])
+        LOCATIONS[name] = location
+    return location
 
 
 def location_for_monster(monster: str) -> Location | None:

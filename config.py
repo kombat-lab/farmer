@@ -91,6 +91,7 @@ TARGET_MONSTER_CATEGORIES: dict[str, list[str]] = {
 AGGRESSIVE_MONSTERS: frozenset[str] = frozenset(
     {
         "Лиса-сорванец",
+        "Богомол-пескожвал",
     }
 )
 

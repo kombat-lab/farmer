@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-
 DUST_RE = re.compile(
     r"•\s*\+\s*(\d+)\s*ед\."
     r"(?:\s*\([^)]*\))?\s*"

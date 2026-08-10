@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
-
 
 Position = tuple[int, int]
 ButtonPosition = tuple[int, int]
@@ -52,13 +50,13 @@ class MapInfo:
     position: Position
     monster_count: int
     monsters: tuple[str, ...]
-    found_target: Optional[str]
-    current_hp: Optional[int]
-    max_hp: Optional[int]
+    found_target: str | None
+    current_hp: int | None
+    max_hp: int | None
     movement_finished: bool
-    location_name: Optional[str] = None
-    map_size: Optional[tuple[int, int]] = None
-    status: Optional[str] = None
+    location_name: str | None = None
+    map_size: tuple[int, int] | None = None
+    status: str | None = None
 
     @property
     def displayed_monster_count(self) -> int:
@@ -70,10 +68,7 @@ class MapInfo:
 
     @property
     def movement_blocked(self) -> bool:
-        return bool(
-            self.status
-            and "туда пройти нельзя" in self.status.casefold()
-        )
+        return bool(self.status and "туда пройти нельзя" in self.status.casefold())
 
 
 @dataclass(frozen=True)
@@ -87,23 +82,19 @@ class MovePlan:
 
 @dataclass
 class RuntimeContext:
-    current_position: Optional[Position] = None
-    current_hp: Optional[int] = None
-    max_hp: Optional[int] = None
-    active_target: Optional[str] = None
-    battle_target: Optional[str] = None
-    combat_enemies: list[str] = None  # type: ignore[assignment]
-    pending_skill: Optional[str] = None
-    checked_empty_position: Optional[Position] = None
+    current_position: Position | None = None
+    current_hp: int | None = None
+    max_hp: int | None = None
+    active_target: str | None = None
+    battle_target: str | None = None
+    combat_enemies: list[str] = field(default_factory=list)
+    pending_skill: str | None = None
+    checked_empty_position: Position | None = None
     checking_hidden_monsters: bool = False
-    pending_move: Optional[MovePlan] = None
+    pending_move: MovePlan | None = None
     failed_move_attempts: int = 0
     move_count: int = 0
     kill_count: int = 0
-
-    def __post_init__(self) -> None:
-        if self.combat_enemies is None:
-            self.combat_enemies = []
 
     def add_combat_enemy(self, name: str) -> None:
         if not name:
@@ -120,15 +111,8 @@ class RuntimeContext:
             for enemy in self.combat_enemies
             if " ".join(enemy.casefold().split()) != normalized
         ]
-        if (
-            self.active_target
-            and " ".join(self.active_target.casefold().split()) == normalized
-        ):
-            self.active_target = (
-                self.combat_enemies[0]
-                if self.combat_enemies
-                else None
-            )
+        if self.active_target and " ".join(self.active_target.casefold().split()) == normalized:
+            self.active_target = self.combat_enemies[0] if self.combat_enemies else None
 
     def clear_combat(self) -> None:
         self.active_target = None

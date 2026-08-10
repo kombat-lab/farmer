@@ -96,9 +96,7 @@ AGGRESSIVE_MONSTERS: frozenset[str] = frozenset(
 )
 
 DEFAULT_TARGET_MONSTERS: list[str] = [
-    monster
-    for monsters in TARGET_MONSTER_CATEGORIES.values()
-    for monster in monsters
+    monster for monsters in TARGET_MONSTER_CATEGORIES.values() for monster in monsters
 ]
 
 MAP_MIN_X = 0

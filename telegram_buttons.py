@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional, Protocol, Sequence
+from collections.abc import Sequence
+from typing import Protocol
 
 from models import ButtonPosition
 from parser import normalize
@@ -27,10 +28,10 @@ def get_button_texts(message) -> list[str]:
 def find_button(
     message,
     *,
-    exact: Optional[str] = None,
+    exact: str | None = None,
     contains: tuple[str, ...] = (),
     exclude: tuple[str, ...] = (),
-) -> Optional[ButtonPosition]:
+) -> ButtonPosition | None:
     if not getattr(message, "buttons", None):
         return None
 
@@ -44,9 +45,7 @@ def find_button(
                 return row_index, column_index
 
             normalized_text = normalize(button_text)
-            if normalized_exclude and any(
-                value in normalized_text for value in normalized_exclude
-            ):
+            if normalized_exclude and any(value in normalized_text for value in normalized_exclude):
                 continue
             if normalized_contains and all(
                 value in normalized_text for value in normalized_contains

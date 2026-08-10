@@ -3,17 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Iterable
 from contextlib import suppress
 from pathlib import Path
-from typing import Iterable
+from typing import Any
 
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
 
 from config import API_HASH, API_ID, GAME_BOT, SESSION_NAME
 from notifications import Notifier
-from storage import Storage
 from session_lock import SessionLease
+from storage import Storage
 
 logger = logging.getLogger("fog_farmer")
 
@@ -40,7 +41,7 @@ class AutoBuff:
         self.storage = storage
         self.notifier = notifier
         self.client: TelegramClient | None = None
-        self.game_bot = None
+        self.game_bot: Any | None = None
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
         self.processing_lock = asyncio.Lock()
@@ -142,9 +143,7 @@ class AutoBuff:
                 f"{type(error).__name__}: {error}",
                 level="CRITICAL",
             )
-            await self.notifier.send(
-                f"Автобаф аварийно завершён\n{type(error).__name__}: {error}"
-            )
+            await self.notifier.send(f"Автобаф аварийно завершён\n{type(error).__name__}: {error}")
             raise
         finally:
             if client.is_connected():
@@ -213,9 +212,7 @@ class AutoBuff:
                     f"Игрок {player} получил Благословение; группа покинута",
                 )
                 await self.notifier.send(
-                    "✨ Автобаф выполнен\n"
-                    f"Игрок: {player}\n"
-                    f"Всего успешно: {self.success_count}"
+                    f"✨ Автобаф выполнен\nИгрок: {player}\nВсего успешно: {self.success_count}"
                 )
             except asyncio.CancelledError:
                 raise
@@ -252,7 +249,6 @@ class AutoBuff:
             min_id=before_skills_id + 1,
         )
 
-
     async def _click_blessing_button(self, message) -> None:
         """Нажимает Благословение тем же способом, что и основной фармер."""
         fresh = await self._fresh(message)
@@ -281,7 +277,10 @@ class AutoBuff:
                 row, column = position
                 logger.info(
                     "Автобаф: нажимаю Благословение, сообщение=%s, row=%s, column=%s, попытка=%s",
-                    fresh.id, row, column, attempt,
+                    fresh.id,
+                    row,
+                    column,
+                    attempt,
                 )
                 await fresh.click(row, column)
                 return
@@ -289,7 +288,9 @@ class AutoBuff:
                 last_error = error
                 logger.warning(
                     "Автобаф: не удалось нажать Благословение, попытка %s/3: %s: %s",
-                    attempt, type(error).__name__, error,
+                    attempt,
+                    type(error).__name__,
+                    error,
                 )
                 if attempt < 3:
                     await asyncio.sleep(1.0)
@@ -328,9 +329,7 @@ class AutoBuff:
                 if message.id not in snapshot or snapshot[message.id] != current_text:
                     return message
             await asyncio.sleep(0.35)
-        raise TimeoutError(
-            "после нажатия «Благословение» не получено подтверждение бафа"
-        )
+        raise TimeoutError("после нажатия «Благословение» не получено подтверждение бафа")
 
     async def _wait_for_message(
         self,

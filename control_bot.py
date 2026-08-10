@@ -41,6 +41,7 @@ SETTINGS_ROWS = [
 CHARACTER_ROWS = [
     ["❤️ Порог лечения", "Максимум маны"],
     ["Сила лечения"],
+    ["✨ Благословение"],
     ["↩️ Настройки"],
 ]
 DELAYS_ROWS = [
@@ -309,7 +310,8 @@ class ControlBot:
             if self.supervisor.is_running():
                 await self._send_text(
                     message,
-                    "Сначала остановите фармера: одна Telethon-сессия не может использоваться одновременно.",
+                    "Сначала остановите фармера: одна Telethon-сессия "
+                    "не может использоваться одновременно.",
                     [["✨ Авто баф"], [AUTO_BUFF_BACK]],
                 )
                 return
@@ -344,11 +346,15 @@ class ControlBot:
         @r.message(StateFilter(None), text_is("⚠️ События"))
         async def events_handler(message: Message) -> None:
             events_list = await self.storage.get_events(15)
-            await self._send_rich(message, events_rich(events_list), "⚠️ Последние события загружены.")
+            await self._send_rich(
+                message, events_rich(events_list), "⚠️ Последние события загружены."
+            )
 
         @r.message(StateFilter(None), text_is("⚙️ Настройки"))
         async def settings_handler(message: Message) -> None:
-            await self._send_rich(message, settings_rich(self.settings), "⚙️ Настройки", SETTINGS_ROWS)
+            await self._send_rich(
+                message, settings_rich(self.settings), "⚙️ Настройки", SETTINGS_ROWS
+            )
 
         @r.message(StateFilter(None), text_is("↩️ Главное меню"))
         async def main_menu_handler(message: Message, state: FSMContext) -> None:
@@ -358,7 +364,9 @@ class ControlBot:
         @r.message(StateFilter(None), text_is("↩️ Настройки"))
         async def settings_back_handler(message: Message, state: FSMContext) -> None:
             await state.clear()
-            await self._send_rich(message, settings_rich(self.settings), "⚙️ Настройки", SETTINGS_ROWS)
+            await self._send_rich(
+                message, settings_rich(self.settings), "⚙️ Настройки", SETTINGS_ROWS
+            )
 
         @r.message(StateFilter(None), text_is("Количество циклов"))
         async def cycles_prompt(message: Message, state: FSMContext) -> None:
@@ -380,7 +388,9 @@ class ControlBot:
                 if value < 1:
                     raise ValueError
             except ValueError:
-                await self._send_text(message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]])
+                await self._send_text(
+                    message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]]
+                )
                 return
             await self.settings.set_value("cycles_count", value)
             await state.clear()
@@ -406,7 +416,9 @@ class ControlBot:
                 if value < 1:
                     raise ValueError
             except ValueError:
-                await self._send_text(message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]])
+                await self._send_text(
+                    message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]]
+                )
                 return
             await self.settings.set_value("moves_per_cycle", value)
             await state.clear()
@@ -420,7 +432,20 @@ class ControlBot:
                 "❤️ Параметры персонажа\n\n"
                 f"Порог лечения: {values.heal_threshold} HP и ниже\n"
                 f"Максимум маны: {values.max_mana}\n"
-                f"Лечение: +{values.heal_amount} HP",
+                f"Лечение: +{values.heal_amount} HP\n"
+                f"Благословение: {'включено' if values.blessing_enabled else 'выключено'}",
+                CHARACTER_ROWS,
+            )
+
+        @r.message(StateFilter(None), text_is("✨ Благословение"))
+        async def blessing_toggle_handler(message: Message) -> None:
+            enabled = await self.settings.toggle_blessing()
+            state_text = "включено" if enabled else "выключено"
+            await self._send_text(
+                message,
+                f"✨ Благословение {state_text}.\n\n"
+                "При выключении фармер не проверяет баф, не открывает "
+                "небоевые навыки и не применяет Благословение.",
                 CHARACTER_ROWS,
             )
 
@@ -450,7 +475,9 @@ class ControlBot:
                 value = int(message.text or "")
                 self.settings.validate_character_value(value)
             except ValueError:
-                await self._send_text(message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]])
+                await self._send_text(
+                    message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]]
+                )
                 return
             data = await state.get_data()
             await self.settings.set_value(str(data["character_key"]), value)
@@ -586,7 +613,9 @@ class ControlBot:
                 minimum, maximum = map(float, values)
                 self.settings.validate_range(minimum, maximum)
             except ValueError:
-                await self._send_text(message, "Введите два числа: минимум и максимум.", [[CANCEL_BUTTON]])
+                await self._send_text(
+                    message, "Введите два числа: минимум и максимум.", [[CANCEL_BUTTON]]
+                )
                 return
             data = await state.get_data()
             key = str(data["delay_key"])

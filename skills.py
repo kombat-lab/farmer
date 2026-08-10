@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 from parser import normalize
 from telegram_buttons import get_button_texts
@@ -39,7 +38,7 @@ class SkillButton:
     def available(self) -> bool:
         return self.cooldown == 0
 
-    def can_cast(self, current_mana: Optional[int]) -> bool:
+    def can_cast(self, current_mana: int | None) -> bool:
         if not self.available:
             return False
         if self.mana_cost <= 0:
@@ -50,7 +49,7 @@ class SkillButton:
         return current_mana is not None and current_mana >= self.mana_cost
 
 
-def parse_current_mana(text: str) -> Optional[int]:
+def parse_current_mana(text: str) -> int | None:
     match = CURRENT_MANA_RE.search(text or "")
     return int(match.group(1)) if match else None
 
@@ -71,9 +70,7 @@ def parse_skill_button(text: str) -> SkillButton:
 
     mana_match = MANA_COST_RE.search(cleaned)
     mana_cost = (
-        int(mana_match.group(1))
-        if mana_match
-        else DEFAULT_MANA_COSTS.get(normalize(name), 0)
+        int(mana_match.group(1)) if mana_match else DEFAULT_MANA_COSTS.get(normalize(name), 0)
     )
 
     return SkillButton(
@@ -107,7 +104,7 @@ def available_skill_names(message) -> set[str]:
 
 def should_use_healing(
     *,
-    current_hp: Optional[int],
+    current_hp: int | None,
     heal_threshold: int,
 ) -> bool:
     """Возвращает True, когда HP достиг заданного порога лечения."""
@@ -120,9 +117,9 @@ def should_use_healing(
 def choose_skill(
     message,
     *,
-    current_hp: Optional[int],
+    current_hp: int | None,
     heal_threshold: int,
-) -> Optional[str]:
+) -> str | None:
     available = available_skills(message)
 
     healing_needed = should_use_healing(

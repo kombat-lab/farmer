@@ -11,11 +11,7 @@ class ProcessedEventCache:
         self._order: deque[tuple] = deque(maxlen=max_size)
 
     def remember(self, message) -> bool:
-        edit_timestamp = (
-            message.edit_date.timestamp()
-            if message.edit_date
-            else None
-        )
+        edit_timestamp = message.edit_date.timestamp() if message.edit_date else None
         key = (
             message.id,
             edit_timestamp,

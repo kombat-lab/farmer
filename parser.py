@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 from models import MapInfo, MessageKind
-
 
 POSITION_RE = re.compile(
     r"Позиция:\s*\((\d+)\s*,\s*(\d+)\)",
@@ -14,9 +13,7 @@ MONSTERS_RE = re.compile(
     r"Монстры на клетке:\s*(\d+)(?:\s*\((.*?)\))?",
     re.IGNORECASE,
 )
-HEART_HP_RE = re.compile(
-    r"❤️\s*(\d+)\s*/\s*(\d+)"
-)
+HEART_HP_RE = re.compile(r"❤️\s*(\d+)\s*/\s*(\d+)")
 HEALTH_RESTORED_RE = re.compile(
     r"Ваше здоровье восстановилось до\s*(\d+)\s*/\s*(\d+)",
     re.IGNORECASE,
@@ -53,25 +50,18 @@ def normalize(value: str) -> str:
 
 
 def parse_monsters(
-    raw_monsters: Optional[str],
+    raw_monsters: str | None,
 ) -> tuple[str, ...]:
     if not raw_monsters:
         return ()
-    return tuple(
-        monster.strip()
-        for monster in raw_monsters.split(",")
-        if monster.strip()
-    )
+    return tuple(monster.strip() for monster in raw_monsters.split(",") if monster.strip())
 
 
 def find_configured_target(
     names: Iterable[str],
     configured_targets: Iterable[str],
-) -> Optional[str]:
-    normalized_names = {
-        normalize(name): name
-        for name in names
-    }
+) -> str | None:
+    normalized_names = {normalize(name): name for name in names}
     for configured_target in configured_targets:
         if normalize(configured_target) in normalized_names:
             return configured_target
@@ -81,7 +71,7 @@ def find_configured_target(
 def extract_player_hp(
     text: str,
     character_name: str,
-) -> Optional[tuple[int, int]]:
+) -> tuple[int, int] | None:
     restored_match = HEALTH_RESTORED_RE.search(text)
     if restored_match:
         return (
@@ -105,7 +95,7 @@ def extract_player_hp(
     for index, line in enumerate(lines):
         if character_name.casefold() not in line.casefold():
             continue
-        for nearby_line in lines[index + 1:index + 4]:
+        for nearby_line in lines[index + 1 : index + 4]:
             hp_match = HEART_HP_RE.search(nearby_line)
             if hp_match:
                 return (
@@ -131,7 +121,7 @@ COMBAT_TARGET_PATTERNS = (
 )
 
 
-def extract_combat_target(text: str) -> Optional[str]:
+def extract_combat_target(text: str) -> str | None:
     for pattern in COMBAT_TARGET_PATTERNS:
         match = pattern.search(text)
         if not match:
@@ -145,7 +135,7 @@ def parse_map(
     text: str,
     configured_targets: Iterable[str],
     character_name: str,
-) -> Optional[MapInfo]:
+) -> MapInfo | None:
     position_match = POSITION_RE.search(text)
     monsters_match = MONSTERS_RE.search(text)
 
@@ -162,28 +152,8 @@ def parse_map(
     size_match = MAP_SIZE_RE.search(text)
     status_match = STATUS_RE.search(text)
 
-    location_name = (
-        location_match.group(1).strip()
-        if location_match
-        else None
-    )
-    status = (
-        status_match.group(1).strip()
-        if status_match
-        else None
-    )
-
-    # Ленивый импорт исключает циклическую зависимость:
-    # navigator -> locations -> config/models.
-    from navigator import (
-        activate_location,
-        report_blocked_transition,
-    )
-
-    activate_location(location_name)
-
-    if status and "туда пройти нельзя" in status.casefold():
-        report_blocked_transition(position)
+    location_name = location_match.group(1).strip() if location_match else None
+    status = status_match.group(1).strip() if status_match else None
 
     return MapInfo(
         position=position,
@@ -195,9 +165,7 @@ def parse_map(
         ),
         current_hp=hp[0] if hp else None,
         max_hp=hp[1] if hp else None,
-        movement_finished=(
-            "Переход между клетками завершён" in text
-        ),
+        movement_finished=("Переход между клетками завершён" in text),
         location_name=location_name,
         map_size=(
             (
@@ -216,11 +184,14 @@ def classify_message(
     configured_targets: Iterable[str],
     character_name: str,
 ) -> MessageKind:
-    if parse_map(
-        text,
-        configured_targets,
-        character_name,
-    ) is not None:
+    if (
+        parse_map(
+            text,
+            configured_targets,
+            character_name,
+        )
+        is not None
+    ):
         return MessageKind.MAP
 
     if "Шаг начат" in text:
@@ -229,17 +200,10 @@ def classify_message(
     if "Выбери цель для нападения" in text:
         return MessageKind.TARGET_SELECTION
 
-    if (
-        "Выберите цель для" in text
-        or "Выбери цель для" in text
-    ):
+    if "Выберите цель для" in text or "Выбери цель для" in text:
         return MessageKind.COMBAT_TARGET_SELECTION
 
-    if (
-        "Вы напали:" in text
-        or "На вас напали:" in text
-        or "На помощь врагу присоединился" in text
-    ):
+    if "Вы напали:" in text or "На вас напали:" in text or "На помощь врагу присоединился" in text:
         return MessageKind.COMBAT_STARTED
 
     if "Выберите навык:" in text:

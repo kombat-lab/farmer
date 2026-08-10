@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from settings_service import SettingsService
+
+from collections.abc import Iterable
 from html import escape
-from typing import Iterable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -26,8 +30,7 @@ def rich_table(
 ) -> str:
     caption_html = f"<caption>{_e(caption)}</caption>" if caption else ""
     body = "".join(
-        f"<tr><td>{_e(left)}</td><td align=\"right\">{_e(right)}</td></tr>"
-        for left, right in rows
+        f'<tr><td>{_e(left)}</td><td align="right">{_e(right)}</td></tr>' for left, right in rows
     )
     return (
         "<table bordered striped>"
@@ -52,7 +55,15 @@ def status_rich(state: dict) -> str:
         "STOPPED": "Остановлен",
         "ERROR": "Ошибка",
     }
-    icon = "🟡" if game_state == "PAUSED" else "😴" if game_state == "RESTING" else "🟢" if running else "🔴"
+    icon = (
+        "🟡"
+        if game_state == "PAUSED"
+        else "😴"
+        if game_state == "RESTING"
+        else "🟢"
+        if running
+        else "🔴"
+    )
     position = (
         f"({state.get('position_x')}, {state.get('position_y')})"
         if state.get("position_x") is not None
@@ -102,7 +113,7 @@ def stats_rich(data: dict) -> str:
         ("🎁 Предметов", drops.get("items", 0)),
         ("🃏 Карт", drops.get("cards", 0)),
         ("👣 Перемещений", state.get("moves", 0)),
-        ("🔄 Цикл", f"{state.get('current_cycle',1)}/{state.get('cycles_count',1)}"),
+        ("🔄 Цикл", f"{state.get('current_cycle', 1)}/{state.get('cycles_count', 1)}"),
     ]
     target_rows = [
         (row["target_name"], f"{row['wins']} побед · {row['xp']} XP · {row['dust']} пыли")
@@ -110,8 +121,13 @@ def stats_rich(data: dict) -> str:
     ]
     body = rich_table(rows)
     if target_rows:
-        body += f"<details open><summary>🎯 По мобам</summary>{rich_table(target_rows, headers=('Моб','Результат'))}</details>"
+        targets_table = rich_table(
+            target_rows,
+            headers=("Моб", "Результат"),
+        )
+        body += f"<details open><summary>🎯 По мобам</summary>{targets_table}</details>"
     return rich_document("📈 Статистика сессии", body)
+
 
 def drops_rich(drops: list[dict]) -> str:
     if not drops:
@@ -158,11 +174,9 @@ def events_rich(events: list[dict]) -> str:
     )
 
 
-def settings_rich(settings) -> str:
+def settings_rich(settings: SettingsService) -> str:
     s = settings.values
-    targets = "<ul>" + "".join(
-        f"<li>{_e(target)}</li>" for target in s.enabled_targets
-    ) + "</ul>"
+    targets = "<ul>" + "".join(f"<li>{_e(target)}</li>" for target in s.enabled_targets) + "</ul>"
     delays = rich_table(
         [
             ("Перемещение", f"{s.move_delay_min:g}–{s.move_delay_max:g} сек."),
@@ -182,6 +196,7 @@ def settings_rich(settings) -> str:
             ("Порог лечения", s.heal_threshold),
             ("Максимум маны", s.max_mana),
             ("Сила лечения", s.heal_amount),
+            ("Благословение", "включено" if s.blessing_enabled else "выключено"),
         ]
     )
     body += f"<details open><summary>🎯 Активные цели</summary>{targets}</details>"
@@ -189,7 +204,9 @@ def settings_rich(settings) -> str:
     return rich_document("⚙️ Настройки", body)
 
 
-def notification_rich(title: str, rows: list[tuple[object, object]] | None = None, text: str | None = None) -> str:
+def notification_rich(
+    title: str, rows: list[tuple[object, object]] | None = None, text: str | None = None
+) -> str:
     body = ""
     if text:
         body += f"<p>{_e(text)}</p>"

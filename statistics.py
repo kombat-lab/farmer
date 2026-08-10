@@ -24,6 +24,7 @@ class FarmStatistics:
     Оперативные счётчики для консольного отчёта.
     Постоянное хранение выполняет storage.py в SQLite.
     """
+
     def __init__(self) -> None:
         self.started_at = time.monotonic()
         self.runtime_finalized = False
@@ -73,16 +74,29 @@ class FarmStatistics:
         self.session_targets.setdefault(target_name, Counter())["defeated"] += 1
         return True
 
-    def record_watchdog_trigger(self): self.session_technical["watchdog_triggers"] += 1
-    def record_recovery_attempt(self): self.session_technical["recovery_attempts"] += 1
-    def record_successful_recovery(self): self.session_technical["successful_recoveries"] += 1
-    def record_startup_state_recovery(self): self.session_technical["startup_state_recoveries"] += 1
-    def finalize_runtime(self): self.runtime_finalized = True
+    def record_watchdog_trigger(self):
+        self.session_technical["watchdog_triggers"] += 1
+
+    def record_recovery_attempt(self):
+        self.session_technical["recovery_attempts"] += 1
+
+    def record_successful_recovery(self):
+        self.session_technical["successful_recoveries"] += 1
+
+    def record_startup_state_recovery(self):
+        self.session_technical["startup_state_recoveries"] += 1
+
+    def finalize_runtime(self):
+        self.runtime_finalized = True
 
     def session_report(self):
         return SessionReport(
-            self.elapsed_seconds(), self.session_wins, self.session_defeats,
-            self.session_xp, self.session_dust, dict(self.session_drops),
+            self.elapsed_seconds(),
+            self.session_wins,
+            self.session_defeats,
+            self.session_xp,
+            self.session_dust,
+            dict(self.session_drops),
             {k: dict(v) for k, v in self.session_targets.items()},
             dict(self.session_technical),
         )
@@ -99,7 +113,8 @@ def format_duration(seconds: int) -> str:
 
 def format_report(title: str, report: SessionReport) -> str:
     lines = [
-        "=" * 72, title,
+        "=" * 72,
+        title,
         f"Затрачено времени: {format_duration(report.elapsed_seconds)}",
         f"Побед: {report.wins}",
         f"Поражений: {report.defeats}",

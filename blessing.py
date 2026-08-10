@@ -6,7 +6,6 @@ from collections.abc import Awaitable, Callable
 from models import ActionType
 from parser import normalize
 
-
 BLESSING_REFRESH_INTERVAL = 29 * 60
 BLESSING_RETRY_INTERVAL = 5 * 60
 NON_COMBAT_SKILLS_BUTTON = "Небоевые навыки"
@@ -55,10 +54,7 @@ class BlessingManager:
         )
         if not clicked:
             self.next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
-            log(
-                "Не удалось открыть небоевые навыки. "
-                "Повторю попытку через 5 минут."
-            )
+            log("Не удалось открыть небоевые навыки. Повторю попытку через 5 минут.")
             return False
 
         self.refresh_in_progress = True

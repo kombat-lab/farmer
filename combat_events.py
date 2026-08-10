@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-DEFEATED_RE = re.compile(r"💀\s*(.+?)\s+повержен(?:а|о|ы)?(?:\s*$|\n)", re.IGNORECASE | re.MULTILINE)
+DEFEATED_RE = re.compile(
+    r"💀\s*(.+?)\s+повержен(?:а|о|ы)?(?:\s*$|\n)", re.IGNORECASE | re.MULTILINE
+)
 NEAR_DEATH_RE = re.compile(r"💀\s*(.+?)\s+на грани смерти", re.IGNORECASE)
 
 

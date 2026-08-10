@@ -4,13 +4,12 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass(frozen=True)
@@ -129,10 +128,9 @@ class Storage:
             self._add_column("farmer_state", definition)
         self.connection.commit()
 
-
     async def cleanup_old_data(self, retention_days: int = 7) -> dict[str, int]:
         """Удаляет диагностические и статистические записи старше retention_days."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=max(1, retention_days))).isoformat()
         async with self.lock:
             # Сначала удаляем ошибочные старые агрегаты с неизвестной целью.
             unknown_battles = self.connection.execute(
@@ -177,8 +175,14 @@ class Storage:
                 """DELETE FROM sessions
                    WHERE status != 'RUNNING'
                      AND COALESCE(ended_at, started_at) < ?
-                     AND id NOT IN (SELECT DISTINCT session_id FROM battles WHERE session_id IS NOT NULL)
-                     AND id NOT IN (SELECT session_id FROM farmer_state WHERE session_id IS NOT NULL)""",
+                     AND id NOT IN (
+                         SELECT DISTINCT session_id FROM battles
+                         WHERE session_id IS NOT NULL
+                     )
+                     AND id NOT IN (
+                         SELECT session_id FROM farmer_state
+                         WHERE session_id IS NOT NULL
+                     )""",
                 (cutoff,),
             ).rowcount
             self.connection.commit()
@@ -202,8 +206,11 @@ class Storage:
                 "INSERT INTO sessions(started_at,status) VALUES (?, 'RUNNING')",
                 (utc_now(),),
             )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite не вернул ID новой сессии")
             sid = int(cursor.lastrowid)
-            self.connection.execute("""
+            self.connection.execute(
+                """
                 UPDATE farmer_state SET
                     process_status='RUNNING', game_state='STARTING',
                     moves=0, current_cycle=1, cycles_count=?,
@@ -211,32 +218,54 @@ class Storage:
                     rest_until=NULL, pause_requested=0,
                     last_error=NULL, session_id=?, last_progress_at=?
                 WHERE singleton=1
-            """, (cycles_count, moves_per_cycle, sid, utc_now()))
+            """,
+                (cycles_count, moves_per_cycle, sid, utc_now()),
+            )
             self.connection.commit()
             return sid
 
     async def finish_session(self, session_id, reason, runtime_seconds) -> None:
         async with self.lock:
             if session_id is not None:
-                self.connection.execute("""
+                self.connection.execute(
+                    """
                     UPDATE sessions SET ended_at=?, status='STOPPED',
                     stop_reason=?, runtime_seconds=? WHERE id=?
-                """, (utc_now(), reason, runtime_seconds, session_id))
-            self.connection.execute("""
+                """,
+                    (utc_now(), reason, runtime_seconds, session_id),
+                )
+            self.connection.execute(
+                """
                 UPDATE farmer_state SET process_status='STOPPED',
                 game_state='STOPPED', active_target=NULL,
                 last_action=?, last_progress_at=?, pause_requested=0,
                 rest_until=NULL WHERE singleton=1
-            """, (reason, utc_now()))
+            """,
+                (reason, utc_now()),
+            )
             self.connection.commit()
 
     async def update_state(self, **fields) -> None:
         allowed = {
-            "process_status","game_state","position_x","position_y",
-            "current_hp","max_hp","active_target","moves","max_moves",
-            "last_action","last_progress_at","last_error","session_id",
-            "current_cycle","cycles_count","moves_in_cycle",
-            "moves_per_cycle","rest_until","pause_requested",
+            "process_status",
+            "game_state",
+            "position_x",
+            "position_y",
+            "current_hp",
+            "max_hp",
+            "active_target",
+            "moves",
+            "max_moves",
+            "last_action",
+            "last_progress_at",
+            "last_error",
+            "session_id",
+            "current_cycle",
+            "cycles_count",
+            "moves_in_cycle",
+            "moves_per_cycle",
+            "rest_until",
+            "pause_requested",
         }
         clean = {k: v for k, v in fields.items() if k in allowed}
         if not clean:
@@ -251,27 +280,26 @@ class Storage:
 
     async def get_state(self) -> dict:
         async with self.lock:
-            row = self.connection.execute(
-                "SELECT * FROM farmer_state WHERE singleton=1"
-            ).fetchone()
+            row = self.connection.execute("SELECT * FROM farmer_state WHERE singleton=1").fetchone()
             return dict(row) if row else {}
 
     async def set_setting(self, key: str, value) -> None:
         async with self.lock:
-            self.connection.execute("""
+            self.connection.execute(
+                """
                 INSERT INTO settings(key,value_json,updated_at)
                 VALUES (?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
                     value_json=excluded.value_json,
                     updated_at=excluded.updated_at
-            """, (key, json.dumps(value, ensure_ascii=False), utc_now()))
+            """,
+                (key, json.dumps(value, ensure_ascii=False), utc_now()),
+            )
             self.connection.commit()
 
     async def get_settings(self) -> dict:
         async with self.lock:
-            rows = self.connection.execute(
-                "SELECT key,value_json FROM settings"
-            ).fetchall()
+            rows = self.connection.execute("SELECT key,value_json FROM settings").fetchall()
             result = {}
             for row in rows:
                 try:
@@ -295,21 +323,37 @@ class Storage:
 
     async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
         async with self.lock:
-            cur = self.connection.execute("""
+            cur = self.connection.execute(
+                """
                 INSERT INTO events(created_at,level,event_type,message,payload_json)
                 VALUES (?,?,?,?,?)
-            """, (
-                utc_now(), level, event_type, message,
-                json.dumps(payload, ensure_ascii=False) if payload else None,
-            ))
+            """,
+                (
+                    utc_now(),
+                    level,
+                    event_type,
+                    message,
+                    json.dumps(payload, ensure_ascii=False) if payload else None,
+                ),
+            )
             self.connection.commit()
+            if cur.lastrowid is None:
+                raise RuntimeError("SQLite не вернул ID нового события")
             return int(cur.lastrowid)
 
     async def record_battle(
-        self, *, telegram_message_id, session_id, target_name, result,
-        xp=0, dust=0, items=(), position=None,
-    ):
-        cards = []
+        self,
+        *,
+        telegram_message_id,
+        session_id,
+        target_name,
+        result,
+        xp=0,
+        dust=0,
+        items=(),
+        position=None,
+    ) -> tuple[bool, list[str]]:
+        cards: list[str] = []
         async with self.lock:
             if self.connection.execute(
                 "SELECT 1 FROM battles WHERE telegram_message_id=?",
@@ -317,19 +361,33 @@ class Storage:
             ).fetchone():
                 return False, cards
             px, py = position if position else (None, None)
-            cur = self.connection.execute("""
+            cur = self.connection.execute(
+                """
                 INSERT INTO battles(
                     telegram_message_id,session_id,happened_at,target_name,
                     result,xp,dust,position_x,position_y
                 ) VALUES (?,?,?,?,?,?,?,?,?)
-            """, (
-                telegram_message_id, session_id, utc_now(), target_name,
-                result, xp, dust, px, py,
-            ))
+            """,
+                (
+                    telegram_message_id,
+                    session_id,
+                    utc_now(),
+                    target_name,
+                    result,
+                    xp,
+                    dust,
+                    px,
+                    py,
+                ),
+            )
+            if cur.lastrowid is None:
+                raise RuntimeError("SQLite не вернул ID нового боя")
             battle_id = int(cur.lastrowid)
             for item in items:
                 n = item.casefold().strip()
-                is_card = int(n.startswith("карта ") or n.startswith("🃏карта ") or n.startswith("🃏 карта "))
+                is_card = int(
+                    n.startswith("карта ") or n.startswith("🃏карта ") or n.startswith("🃏 карта ")
+                )
                 if is_card:
                     cards.append(item)
                 self.connection.execute(
@@ -337,13 +395,19 @@ class Storage:
                     (battle_id, item, is_card),
                 )
             if session_id is not None:
-                self.connection.execute("""
+                self.connection.execute(
+                    """
                     UPDATE sessions SET wins=wins+?, defeats=defeats+?,
                     xp=xp+?, dust=dust+? WHERE id=?
-                """, (
-                    int(result == "VICTORY"), int(result == "DEFEAT"),
-                    xp, dust, session_id,
-                ))
+                """,
+                    (
+                        int(result == "VICTORY"),
+                        int(result == "DEFEAT"),
+                        xp,
+                        dust,
+                        session_id,
+                    ),
+                )
             self.connection.commit()
             return True, cards
 
@@ -354,10 +418,16 @@ class Storage:
                 ON f.session_id=s.id WHERE f.singleton=1
             """).fetchone()
             if not row:
-                return SessionSummary(None,None,None,"STOPPED",0,0,0,0,0)
+                return SessionSummary(None, None, None, "STOPPED", 0, 0, 0, 0, 0)
             return SessionSummary(
-                row["id"],row["started_at"],row["ended_at"],row["status"],
-                row["wins"],row["defeats"],row["xp"],row["dust"],
+                row["id"],
+                row["started_at"],
+                row["ended_at"],
+                row["status"],
+                row["wins"],
+                row["defeats"],
+                row["xp"],
+                row["dust"],
                 row["runtime_seconds"],
             )
 
@@ -366,7 +436,7 @@ class Storage:
             SELECT d.item_name,SUM(d.quantity) quantity,MAX(d.is_card) is_card
             FROM drops d JOIN battles b ON b.id=d.battle_id
         """
-        params = ()
+        params: tuple[object, ...] = ()
         if session_id is not None:
             query += " WHERE b.session_id=?"
             params = (session_id,)
@@ -376,10 +446,13 @@ class Storage:
 
     async def get_events(self, limit=20) -> list[dict]:
         async with self.lock:
-            rows = self.connection.execute("""
+            rows = self.connection.execute(
+                """
                 SELECT created_at,level,event_type,message FROM events
                 ORDER BY id DESC LIMIT ?
-            """, (limit,)).fetchall()
+            """,
+                (limit,),
+            ).fetchall()
             return [dict(r) for r in rows]
 
     async def get_statistics_dashboard(self) -> dict:
@@ -395,46 +468,69 @@ class Storage:
                     """SELECT COUNT(*) battles,
                     SUM(result='VICTORY') wins, SUM(result='DEFEAT') defeats,
                     COALESCE(SUM(xp),0) xp, COALESCE(SUM(dust),0) dust
-                    FROM battles WHERE session_id=?""", (sid,)
+                    FROM battles WHERE session_id=?""",
+                    (sid,),
                 ).fetchone()
                 battle = dict(row)
                 row = self.connection.execute(
                     """SELECT COALESCE(SUM(d.quantity),0) items,
                     COALESCE(SUM(CASE WHEN d.is_card=1 THEN d.quantity ELSE 0 END),0) cards
-                    FROM drops d JOIN battles b ON b.id=d.battle_id WHERE b.session_id=?""", (sid,)
+                    FROM drops d JOIN battles b ON b.id=d.battle_id WHERE b.session_id=?""",
+                    (sid,),
                 ).fetchone()
                 drops = dict(row)
-                targets = [dict(r) for r in self.connection.execute(
-                    """SELECT target_name, COUNT(*) battles,
+                targets = [
+                    dict(r)
+                    for r in self.connection.execute(
+                        """SELECT target_name, COUNT(*) battles,
                     SUM(result='VICTORY') wins, COALESCE(SUM(xp),0) xp,
                     COALESCE(SUM(dust),0) dust FROM battles
                     WHERE session_id=? GROUP BY target_name
-                    ORDER BY wins DESC, battles DESC, target_name""", (sid,)
-                ).fetchall()]
+                    ORDER BY wins DESC, battles DESC, target_name""",
+                        (sid,),
+                    ).fetchall()
+                ]
             state = self.connection.execute(
-                "SELECT moves,current_cycle,cycles_count,moves_in_cycle,moves_per_cycle FROM farmer_state WHERE singleton=1"
+                "SELECT moves,current_cycle,cycles_count,moves_in_cycle,"
+                "moves_per_cycle FROM farmer_state WHERE singleton=1"
             ).fetchone()
         runtime = session.runtime_seconds
         if session.started_at and session.status == "RUNNING":
             try:
-                runtime = max(0, int((datetime.now(timezone.utc)-datetime.fromisoformat(session.started_at)).total_seconds()))
+                runtime = max(
+                    0,
+                    int(
+                        (
+                            datetime.now(UTC) - datetime.fromisoformat(session.started_at)
+                        ).total_seconds()
+                    ),
+                )
             except ValueError:
                 pass
-        return {"session": session, "battle": battle, "drops": drops, "targets": targets, "state": dict(state or {}), "runtime_seconds": runtime}
+        return {
+            "session": session,
+            "battle": battle,
+            "drops": drops,
+            "targets": targets,
+            "state": dict(state or {}),
+            "runtime_seconds": runtime,
+        }
 
     @staticmethod
     def format_statistics_text(data: dict) -> str:
         b, d, st = data["battle"], data["drops"], data["state"]
-        seconds = int(data.get("runtime_seconds", 0)); h, rem = divmod(seconds, 3600); m, sec = divmod(rem, 60)
+        seconds = int(data.get("runtime_seconds", 0))
+        h, rem = divmod(seconds, 3600)
+        m, sec = divmod(rem, 60)
         return (
             "📈 Статистика текущей сессии\n\n"
             f"⏱ Время: {h:02d}:{m:02d}:{sec:02d}\n"
-            f"⚔️ Боев: {b.get('battles',0)}\n"
-            f"🏆 Побед: {b.get('wins',0)}\n"
-            f"☠️ Поражений: {b.get('defeats',0)}\n"
-            f"✨ XP: {b.get('xp',0)}\n"
-            f"💠 Пыль: {b.get('dust',0)}\n"
-            f"🎁 Предметов: {d.get('items',0)}\n"
-            f"🃏 Карт: {d.get('cards',0)}\n"
-            f"👣 Ходов: {st.get('moves',0)}"
+            f"⚔️ Боев: {b.get('battles', 0)}\n"
+            f"🏆 Побед: {b.get('wins', 0)}\n"
+            f"☠️ Поражений: {b.get('defeats', 0)}\n"
+            f"✨ XP: {b.get('xp', 0)}\n"
+            f"💠 Пыль: {b.get('dust', 0)}\n"
+            f"🎁 Предметов: {d.get('items', 0)}\n"
+            f"🃏 Карт: {d.get('cards', 0)}\n"
+            f"👣 Ходов: {st.get('moves', 0)}"
         )

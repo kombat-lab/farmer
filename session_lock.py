@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 
 class SessionLease:
@@ -29,8 +30,7 @@ class SessionLease:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
-                import fcntl
-
+                fcntl: Any = importlib.import_module("fcntl")
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, BlockingIOError):
             handle.close()
@@ -51,8 +51,7 @@ class SessionLease:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                import fcntl
-
+                fcntl: Any = importlib.import_module("fcntl")
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()

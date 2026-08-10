@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from html import escape
-from typing import Optional
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
@@ -19,7 +17,7 @@ class Notifier:
     def __init__(self, bot: Bot, admin_id: int) -> None:
         self.bot = bot
         self.admin_id = admin_id
-        self._keyboard_provider: Optional[KeyboardProvider] = None
+        self._keyboard_provider: KeyboardProvider | None = None
 
     def set_keyboard_provider(self, provider: KeyboardProvider) -> None:
         self._keyboard_provider = provider

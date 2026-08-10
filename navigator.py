@@ -5,9 +5,8 @@ from weakref import WeakSet
 
 from models import MovePlan, Position, RouteDirection
 
-
 _active_location_name: str | None = None
-_instances: WeakSet["SnakeNavigator"] = WeakSet()
+_instances: WeakSet[SnakeNavigator] = WeakSet()
 
 
 def activate_location(location_name: str | None) -> None:
@@ -151,10 +150,7 @@ class SnakeNavigator:
 
     def _inside(self, position: Position) -> bool:
         x, y = position
-        return (
-            self.min_x <= x <= self.max_x
-            and self.min_y <= y <= self.max_y
-        )
+        return self.min_x <= x <= self.max_x and self.min_y <= y <= self.max_y
 
     def _available(self, position: Position) -> bool:
         return (
@@ -184,15 +180,11 @@ class SnakeNavigator:
                 (x, y - 1),
             )
 
-        return tuple(
-            candidate
-            for candidate in candidates
-            if self._available(candidate)
-        )
+        return tuple(candidate for candidate in candidates if self._available(candidate))
 
     def _build_route(self) -> tuple[Position, ...]:
         if not self.obstacle_mode:
-            route: list[Position] = []
+            linear_route: list[Position] = []
 
             for y in range(
                 self.min_y,
@@ -212,17 +204,12 @@ class SnakeNavigator:
                         self.max_x + 1,
                     )
 
-                route.extend(
-                    (x, y)
-                    for x in x_values
-                )
+                linear_route.extend((x, y) for x in x_values)
 
-            return tuple(route)
+            return tuple(linear_route)
 
         if not self._available(self.start):
-            raise ValueError(
-                f"Стартовая клетка {self.start} недоступна."
-            )
+            raise ValueError(f"Стартовая клетка {self.start} недоступна.")
 
         visited: set[Position] = {self.start}
         route: list[Position] = [self.start]
@@ -256,16 +243,10 @@ class SnakeNavigator:
 
         if missing:
             raise ValueError(
-                "На карте есть недостижимые клетки: "
-                + ", ".join(
-                    map(str, sorted(missing))
-                )
+                "На карте есть недостижимые клетки: " + ", ".join(map(str, sorted(missing)))
             )
 
-        while (
-            len(route) > 1
-            and route[-1] == self.start
-        ):
+        while len(route) > 1 and route[-1] == self.start:
             route.pop()
 
         return tuple(route)
@@ -282,10 +263,7 @@ class SnakeNavigator:
                 [],
             ).append(route_index)
 
-        return {
-            position: tuple(indices)
-            for position, indices in index.items()
-        }
+        return {position: tuple(indices) for position, indices in index.items()}
 
     def _nearest_index(
         self,
@@ -300,21 +278,13 @@ class SnakeNavigator:
             if fallback is not None:
                 return fallback
 
-            raise ValueError(
-                f"Координаты {position} отсутствуют в маршруте."
-            )
+            raise ValueError(f"Координаты {position} отсутствуют в маршруте.")
 
-        reference = (
-            self.route_index
-            if around is None
-            else around
-        )
+        reference = self.route_index if around is None else around
 
         return min(
             indices,
-            key=lambda index: abs(
-                index - reference
-            ),
+            key=lambda index: abs(index - reference),
         )
 
     def validate_position(
@@ -322,61 +292,33 @@ class SnakeNavigator:
         position: Position,
     ) -> None:
         if position not in self.position_to_indices:
-            raise ValueError(
-                f"Координаты {position} отсутствуют в маршруте."
-            )
+            raise ValueError(f"Координаты {position} отсутствуют в маршруте.")
 
     def initialize_from_history(
         self,
         positions: Iterable[Position],
     ) -> RouteDirection:
-        history = [
-            position
-            for position in positions
-            if position in self.position_to_indices
-        ]
+        history = [position for position in positions if position in self.position_to_indices]
 
         if not history:
             self.direction = RouteDirection.DOWN
             return self.direction
 
-        self.route_index = self._nearest_index(
-            history[-1]
-        )
+        self.route_index = self._nearest_index(history[-1])
 
-        for previous, current in reversed(
-            list(zip(history, history[1:]))
-        ):
-            previous_indices = (
-                self.position_to_indices[previous]
-            )
-            current_indices = (
-                self.position_to_indices[current]
-            )
+        for previous, current in reversed(list(zip(history, history[1:], strict=False))):
+            previous_indices = self.position_to_indices[previous]
+            current_indices = self.position_to_indices[current]
 
             for previous_index in previous_indices:
-                if (
-                    previous_index + 1
-                    in current_indices
-                ):
-                    self.route_index = (
-                        previous_index + 1
-                    )
-                    self.direction = (
-                        RouteDirection.DOWN
-                    )
+                if previous_index + 1 in current_indices:
+                    self.route_index = previous_index + 1
+                    self.direction = RouteDirection.DOWN
                     return self.direction
 
-                if (
-                    previous_index - 1
-                    in current_indices
-                ):
-                    self.route_index = (
-                        previous_index - 1
-                    )
-                    self.direction = (
-                        RouteDirection.UP
-                    )
+                if previous_index - 1 in current_indices:
+                    self.route_index = previous_index - 1
+                    self.direction = RouteDirection.UP
                     return self.direction
 
         if self.route_index == len(self.route) - 1:
@@ -404,23 +346,12 @@ class SnakeNavigator:
                 return "⬅️"
 
         if delta_x == 0 and delta_y == 1:
-            return (
-                "↘️"
-                if origin_x == 0
-                else "↙️"
-            )
+            return "↘️" if origin_x == 0 else "↙️"
 
         if delta_x == 0 and delta_y == -1:
-            return (
-                "↖️"
-                if origin_x == 0
-                else "↗️"
-            )
+            return "↖️" if origin_x == 0 else "↗️"
 
-        raise ValueError(
-            "Нельзя определить кнопку перехода "
-            f"{origin} → {destination}."
-        )
+        raise ValueError(f"Нельзя определить кнопку перехода {origin} → {destination}.")
 
     @staticmethod
     def _paired_diagonal(button: str) -> str | None:
@@ -464,9 +395,7 @@ class SnakeNavigator:
         elif origin_x <= self.min_x:
             candidates.append("➡️")
         else:
-            candidates.extend(
-                ("⬅️", "➡️")
-            )
+            candidates.extend(("⬅️", "➡️"))
 
         candidates.extend(self.DIAGONAL_BUTTONS)
 
@@ -491,10 +420,7 @@ class SnakeNavigator:
         """
         plan = self.last_plan
 
-        if (
-            plan is None
-            or plan.origin != current_position
-        ):
+        if plan is None or plan.origin != current_position:
             return
 
         self.failed_buttons.setdefault(
@@ -543,9 +469,7 @@ class SnakeNavigator:
         # исключается и ниже выбирается следующий вариант.
         self._remember_failed_last_plan(position)
 
-        self.route_index = self._nearest_index(
-            position
-        )
+        self.route_index = self._nearest_index(position)
 
         direction_before = self.direction
         direction_after = direction_before
@@ -553,27 +477,17 @@ class SnakeNavigator:
         if direction_before is RouteDirection.DOWN:
             if self.route_index == len(self.route) - 1:
                 direction_after = RouteDirection.UP
-                destination_index = (
-                    self.route_index - 1
-                )
+                destination_index = self.route_index - 1
             else:
-                destination_index = (
-                    self.route_index + 1
-                )
+                destination_index = self.route_index + 1
         else:
             if self.route_index == 0:
                 direction_after = RouteDirection.DOWN
-                destination_index = (
-                    self.route_index + 1
-                )
+                destination_index = self.route_index + 1
             else:
-                destination_index = (
-                    self.route_index - 1
-                )
+                destination_index = self.route_index - 1
 
-        destination = self.route[
-            destination_index
-        ]
+        destination = self.route[destination_index]
 
         plan = MovePlan(
             origin=position,
@@ -595,39 +509,23 @@ class SnakeNavigator:
         actual_position: Position,
     ) -> None:
         if actual_position != plan.destination:
-            raise ValueError(
-                f"Ожидалась клетка {plan.destination}, "
-                f"но получена {actual_position}."
-            )
+            raise ValueError(f"Ожидалась клетка {plan.destination}, но получена {actual_position}.")
 
-        origin_index = self._nearest_index(
-            plan.origin
-        )
+        origin_index = self._nearest_index(plan.origin)
 
         expected_index = (
-            origin_index + 1
-            if plan.direction_before
-            is RouteDirection.DOWN
-            else origin_index - 1
+            origin_index + 1 if plan.direction_before is RouteDirection.DOWN else origin_index - 1
         )
 
-        if (
-            0 <= expected_index < len(self.route)
-            and self.route[expected_index]
-            == actual_position
-        ):
+        if 0 <= expected_index < len(self.route) and self.route[expected_index] == actual_position:
             self.route_index = expected_index
         else:
-            self.route_index = (
-                self._nearest_index(
-                    actual_position,
-                    around=origin_index,
-                )
+            self.route_index = self._nearest_index(
+                actual_position,
+                around=origin_index,
             )
 
-        self.direction = (
-            plan.direction_after_success
-        )
+        self.direction = plan.direction_after_success
         self.last_plan = None
 
         # После успешного выхода с клетки старые неудачные кнопки больше
@@ -645,10 +543,7 @@ class SnakeNavigator:
     ) -> None:
         plan = self.last_plan
 
-        if (
-            plan is None
-            or current_position != plan.origin
-        ):
+        if plan is None or current_position != plan.origin:
             return
 
         self.failed_buttons.setdefault(
@@ -660,15 +555,10 @@ class SnakeNavigator:
             mark_destination_blocked
             and self.obstacle_mode
             and self._inside(plan.destination)
-            and plan.destination
-            not in self.blocked_cells
+            and plan.destination not in self.blocked_cells
         ):
-            self.runtime_blocked.add(
-                plan.destination
-            )
-            self._rebuild_after_obstacle(
-                current_position
-            )
+            self.runtime_blocked.add(plan.destination)
+            self._rebuild_after_obstacle(current_position)
 
         self.last_plan = None
 
@@ -679,12 +569,8 @@ class SnakeNavigator:
         old_direction = self.direction
 
         self.route = self._build_route()
-        self.position_to_indices = (
-            self._index_route(self.route)
-        )
-        self.route_index = self._nearest_index(
-            current_position
-        )
+        self.position_to_indices = self._index_route(self.route)
+        self.route_index = self._nearest_index(current_position)
         self.direction = old_direction
 
     def recover_from_actual_transition(
@@ -692,30 +578,16 @@ class SnakeNavigator:
         previous: Position,
         current: Position,
     ) -> bool:
-        if (
-            previous not in self.position_to_indices
-            or current not in self.position_to_indices
-        ):
+        if previous not in self.position_to_indices or current not in self.position_to_indices:
             return False
 
-        previous_indices = (
-            self.position_to_indices[previous]
-        )
-        current_indices = (
-            self.position_to_indices[current]
-        )
+        previous_indices = self.position_to_indices[previous]
+        current_indices = self.position_to_indices[current]
 
         for previous_index in previous_indices:
-            if (
-                previous_index + 1
-                in current_indices
-            ):
-                self.route_index = (
-                    previous_index + 1
-                )
-                self.direction = (
-                    RouteDirection.DOWN
-                )
+            if previous_index + 1 in current_indices:
+                self.route_index = previous_index + 1
+                self.direction = RouteDirection.DOWN
                 self.last_plan = None
                 self.failed_buttons.pop(
                     previous,
@@ -723,16 +595,9 @@ class SnakeNavigator:
                 )
                 return True
 
-            if (
-                previous_index - 1
-                in current_indices
-            ):
-                self.route_index = (
-                    previous_index - 1
-                )
-                self.direction = (
-                    RouteDirection.UP
-                )
+            if previous_index - 1 in current_indices:
+                self.route_index = previous_index - 1
+                self.direction = RouteDirection.UP
                 self.last_plan = None
                 self.failed_buttons.pop(
                     previous,
@@ -742,9 +607,7 @@ class SnakeNavigator:
 
         # Персонаж всё же переместился, но не на соседний элемент текущего
         # маршрута. Синхронизируемся с фактической доступной координатой.
-        self.route_index = self._nearest_index(
-            current
-        )
+        self.route_index = self._nearest_index(current)
         self.last_plan = None
         self.failed_buttons.pop(
             previous,

@@ -3,43 +3,46 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import deque
 from pathlib import Path
-from collections import Counter, deque
-from typing import Optional
+from statistics import FarmStatistics, format_report
+from typing import Any
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 
+from combat_events import parse_combat_round_events
 from config import (
     API_HASH,
     API_ID,
-        CHARACTER_NAME,
+    CHARACTER_NAME,
     COMBAT_PROGRESS_TIMEOUT,
+    DATA_RETENTION_DAYS,
     DEATH_RECOVERY_MAX_WAIT,
     DEATH_RECOVERY_MIN_WAIT,
     DEATH_RECOVERY_RECHECK_INTERVAL,
-    DATA_RETENTION_DAYS,
-    LOG_RETENTION_DAYS,
     GAME_BOT,
     GENERAL_PROGRESS_TIMEOUT,
-        LOG_BACKUP_COUNT,
+    LOG_BACKUP_COUNT,
     LOG_DIRECTORY,
     LOG_FILENAME,
     LOG_MAX_BYTES,
+    LOG_RETENTION_DAYS,
     MAP_MAX_X,
     MAP_MAX_Y,
     MAP_MIN_X,
     MAP_MIN_Y,
-        MAX_RECOVERY_ATTEMPTS,
+    MAX_RECOVERY_ATTEMPTS,
     MIN_HP_AFTER_DEATH,
     MIN_HP_PERCENT_TO_START_BATTLE,
-        MOVE_PROGRESS_TIMEOUT,
+    MOVE_PROGRESS_TIMEOUT,
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
-        STATE_HISTORY_LIMIT,
-        TARGET_SELECTION_TIMEOUT,
+    STATE_HISTORY_LIMIT,
+    TARGET_SELECTION_TIMEOUT,
     WATCHDOG_CHECK_INTERVAL,
 )
+from logger_setup import setup_logging
 from models import (
     ActionType,
     BotState,
@@ -47,6 +50,7 @@ from models import (
     RuntimeContext,
 )
 from navigator import SnakeNavigator
+from notifications import Notifier
 from parser import (
     classify_message,
     extract_combat_target,
@@ -55,17 +59,12 @@ from parser import (
     parse_map,
 )
 from rewards import parse_battle_reward
-from statistics import FarmStatistics, format_report
-from watchdog import ProgressWatchdog
-from logger_setup import setup_logging
-from storage import Storage, utc_now
-from notifications import Notifier
 from settings_service import SettingsService
-from combat_events import parse_combat_round_events
 from skills import choose_skill, parse_current_mana
+from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
-
+from watchdog import ProgressWatchdog
 
 logger = setup_logging(
     log_directory=LOG_DIRECTORY,
@@ -110,7 +109,7 @@ class Farmer:
             flood_sleep_threshold=0,
         )
 
-        self.game_bot = None
+        self.game_bot: Any | None = None
         self.state = BotState.STARTING
         self.running = True
 
@@ -126,30 +125,24 @@ class Farmer:
         )
 
         self.watchdog = ProgressWatchdog()
-        self.watchdog_task: Optional[asyncio.Task] = None
-        self.recovery_task: Optional[asyncio.Task] = None
-        self.recovery_started_at: Optional[float] = None
+        self.watchdog_task: asyncio.Task | None = None
+        self.recovery_task: asyncio.Task | None = None
+        self.recovery_started_at: float | None = None
         self.pause_requested = False
         self.current_cycle = 1
         self.moves_in_cycle = 0
-        self.rest_task: Optional[asyncio.Task] = None
+        self.rest_task: asyncio.Task | None = None
 
-        self.event_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=EVENT_QUEUE_SIZE
-        )
-        self.worker_task: Optional[asyncio.Task] = None
+        self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self.worker_task: asyncio.Task | None = None
 
         self.processed_event_keys: set[tuple] = set()
-        self.processed_event_order: deque[tuple] = deque(
-            maxlen=PROCESSED_EVENT_CACHE_SIZE
-        )
-        self.latest_messages: dict[int, object] = {}
-        self.latest_received_message = None
+        self.processed_event_order: deque[tuple] = deque(maxlen=PROCESSED_EVENT_CACHE_SIZE)
+        self.latest_messages: dict[int, Any] = {}
+        self.latest_received_message: Any | None = None
         self.callback_timeout_count = 0
         self.attempted_action_keys: set[tuple] = set()
-        self.attempted_action_order: deque[tuple] = deque(
-            maxlen=PROCESSED_EVENT_CACHE_SIZE
-        )
+        self.attempted_action_order: deque[tuple] = deque(maxlen=PROCESSED_EVENT_CACHE_SIZE)
 
         self.blessing_refreshed_at: float | None = None
         self.blessing_next_attempt_at = 0.0
@@ -161,9 +154,7 @@ class Farmer:
     def mark_progress(self, reason: str) -> None:
         self.watchdog.mark_progress(reason)
         if self.running:
-            asyncio.create_task(
-                self._persist_progress(reason)
-            )
+            asyncio.create_task(self._persist_progress(reason))
 
     async def _persist_progress(self, reason: str) -> None:
         # Задача могла попасть в очередь до остановки. В таком случае
@@ -174,12 +165,10 @@ class Farmer:
         await self.storage.update_state(
             game_state=self.state.name,
             position_x=(
-                self.context.current_position[0]
-                if self.context.current_position else None
+                self.context.current_position[0] if self.context.current_position else None
             ),
             position_y=(
-                self.context.current_position[1]
-                if self.context.current_position else None
+                self.context.current_position[1] if self.context.current_position else None
             ),
             current_hp=self.context.current_hp,
             max_hp=self.context.max_hp,
@@ -217,11 +206,7 @@ class Farmer:
 
     @staticmethod
     def event_key(message) -> tuple:
-        edit_timestamp = (
-            message.edit_date.timestamp()
-            if message.edit_date
-            else None
-        )
+        edit_timestamp = message.edit_date.timestamp() if message.edit_date else None
         return (
             message.id,
             edit_timestamp,
@@ -233,16 +218,8 @@ class Farmer:
         """Stores an inbound update and rejects older revisions of the same message."""
         previous = self.latest_messages.get(message.id)
         if previous is not None:
-            previous_edit = (
-                previous.edit_date.timestamp()
-                if previous.edit_date
-                else 0.0
-            )
-            current_edit = (
-                message.edit_date.timestamp()
-                if message.edit_date
-                else 0.0
-            )
+            previous_edit = previous.edit_date.timestamp() if previous.edit_date else 0.0
+            current_edit = message.edit_date.timestamp() if message.edit_date else 0.0
             if current_edit < previous_edit:
                 return False
 
@@ -296,9 +273,7 @@ class Farmer:
         try:
             self.event_queue.put_nowait(message)
         except asyncio.QueueFull:
-            await self.stop(
-                "очередь Telegram-событий переполнена"
-            )
+            await self.stop("очередь Telegram-событий переполнена")
 
     async def event_worker(self) -> None:
         while self.running:
@@ -314,10 +289,7 @@ class Farmer:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                await self.stop(
-                    f"ошибка обработки сообщения: "
-                    f"{type(error).__name__}: {error}"
-                )
+                await self.stop(f"ошибка обработки сообщения: {type(error).__name__}: {error}")
             finally:
                 self.event_queue.task_done()
 
@@ -329,7 +301,7 @@ class Farmer:
     def find_button(
         message,
         *,
-        exact: Optional[str] = None,
+        exact: str | None = None,
         contains: tuple[str, ...] = (),
         exclude: tuple[str, ...] = (),
     ):
@@ -410,8 +382,7 @@ class Farmer:
         except RPCError as error:
             if getattr(error, "message", "") != "BOT_RESPONSE_TIMEOUT":
                 self.log(
-                    f"Telegram не выполнил нажатие «{description}»: "
-                    f"{type(error).__name__}: {error}"
+                    f"Telegram не выполнил нажатие «{description}»: {type(error).__name__}: {error}"
                 )
                 return False
 
@@ -421,10 +392,7 @@ class Farmer:
                 f"«{description}» ({self.callback_timeout_count}/{MAX_CALLBACK_TIMEOUTS}): {error}"
             )
             if self.callback_timeout_count >= MAX_CALLBACK_TIMEOUTS:
-                reason = (
-                    "повторный BOT_RESPONSE_TIMEOUT; "
-                    "возможно ограничение inline-кнопок"
-                )
+                reason = "повторный BOT_RESPONSE_TIMEOUT; возможно ограничение inline-кнопок"
                 await self.storage.add_event(
                     "TELEGRAM_CALLBACK_TIMEOUT",
                     reason,
@@ -444,25 +412,20 @@ class Farmer:
         *,
         action_type: ActionType,
         description: str,
-        exact: Optional[str] = None,
+        exact: str | None = None,
         contains: tuple[str, ...] = (),
         exclude: tuple[str, ...] = (),
     ) -> bool:
         delay = self.action_delay(action_type)
 
-        self.log(
-            f"Ожидание {delay:.1f} сек. "
-            f"перед действием: {description}"
-        )
+        self.log(f"Ожидание {delay:.1f} сек. перед действием: {description}")
         await asyncio.sleep(delay)
 
         if not self.running:
             return False
 
         if not self.is_latest_message(message):
-            self.log(
-                f"Отменено устаревшее действие: {description}"
-            )
+            self.log(f"Отменено устаревшее действие: {description}")
             return False
 
         position = self.find_button(
@@ -489,18 +452,11 @@ class Farmer:
             return False
 
         current_hp, max_hp = hp
-        changed = (
-            current_hp != self.context.current_hp
-            or max_hp != self.context.max_hp
-        )
-        if (
-            changed
-        ):
+        changed = current_hp != self.context.current_hp or max_hp != self.context.max_hp
+        if changed:
             self.context.current_hp = current_hp
             self.context.max_hp = max_hp
-            self.log(
-                f"Здоровье обновлено: {current_hp}/{max_hp}"
-            )
+            self.log(f"Здоровье обновлено: {current_hp}/{max_hp}")
         return changed
 
     def has_battle_health(self) -> bool:
@@ -547,9 +503,7 @@ class Farmer:
             f"HP восстановлено до {current_hp}/{max_hp}",
         )
         await self.notifier.send(
-            "❤️ <b>Здоровье восстановлено</b>\n"
-            f"HP: {current_hp}/{max_hp}\n"
-            "Фармер продолжает работу."
+            f"❤️ <b>Здоровье восстановлено</b>\nHP: {current_hp}/{max_hp}\nФармер продолжает работу."
         )
 
     def confirm_pending_move(
@@ -595,14 +549,11 @@ class Farmer:
             if recovered:
                 self.context.move_count += 1
                 self.context.failed_move_attempts = 0
-                self.mark_progress(
-                    "навигатор пересинхронизирован"
-                )
+                self.mark_progress("навигатор пересинхронизирован")
             else:
                 self.context.failed_move_attempts += 1
 
         self.context.pending_move = None
-
 
     async def request_pause(self) -> tuple[bool, str]:
         if not self.running:
@@ -668,9 +619,7 @@ class Farmer:
     async def complete_cycle(self) -> None:
         total = self.settings.values.cycles_count
         if self.current_cycle >= total:
-            await self.stop(
-                f"завершены все циклы: {total}"
-            )
+            await self.stop(f"завершены все циклы: {total}")
             return
 
         rest_seconds = random.uniform(
@@ -678,9 +627,7 @@ class Farmer:
             self.settings.values.cycle_rest_max,
         )
         self.state = BotState.RESTING
-        self.mark_progress(
-            f"передышка после цикла {self.current_cycle}: {int(rest_seconds)} сек."
-        )
+        self.mark_progress(f"передышка после цикла {self.current_cycle}: {int(rest_seconds)} сек.")
         await self.storage.add_event(
             "CYCLE_COMPLETED",
             f"Завершён цикл {self.current_cycle} из {total}; передышка {int(rest_seconds)} сек.",
@@ -689,9 +636,7 @@ class Farmer:
             f"😴 Завершён цикл {self.current_cycle} из {total}\n"
             f"Передышка: {int(rest_seconds // 60)} мин. {int(rest_seconds % 60)} сек."
         )
-        self.rest_task = asyncio.create_task(
-            self.rest_between_cycles(rest_seconds)
-        )
+        self.rest_task = asyncio.create_task(self.rest_between_cycles(rest_seconds))
 
     async def rest_between_cycles(self, seconds: float) -> None:
         try:
@@ -714,6 +659,9 @@ class Farmer:
         await self.process_latest_state()
 
     def blessing_refresh_due(self) -> bool:
+        if not self.settings.values.blessing_enabled:
+            self.blessing_refresh_in_progress = False
+            return False
         now = time.monotonic()
         if self.blessing_refresh_in_progress:
             return False
@@ -734,23 +682,30 @@ class Farmer:
             description=NON_COMBAT_SKILLS_BUTTON,
         )
         if not clicked:
-            self.blessing_next_attempt_at = (
-                time.monotonic() + BLESSING_RETRY_INTERVAL
-            )
-            self.log(
-                "Не удалось открыть небоевые навыки. "
-                "Повторю попытку через 5 минут."
-            )
+            self.blessing_next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
+            self.log("Не удалось открыть небоевые навыки. Повторю попытку через 5 минут.")
             return False
 
         self.blessing_refresh_in_progress = True
-        self.blessing_next_attempt_at = (
-            time.monotonic() + BLESSING_RETRY_INTERVAL
-        )
+        self.blessing_next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
         self.mark_progress("открыто меню небоевых навыков")
         return True
 
     async def handle_blessing_menu(self, message) -> bool:
+        if not self.settings.values.blessing_enabled:
+            was_in_progress = self.blessing_refresh_in_progress
+            self.blessing_refresh_in_progress = False
+            if was_in_progress:
+                returned = await self.click_button(
+                    message,
+                    exact=BACK_TO_MAP_BUTTON,
+                    action_type=ActionType.OPEN_ATTACK,
+                    description=BACK_TO_MAP_BUTTON,
+                )
+                if not returned:
+                    await self.request_map_refresh()
+                return True
+            return False
         if not self.blessing_refresh_in_progress:
             return False
 
@@ -774,15 +729,16 @@ class Farmer:
         return True
 
     def confirm_blessing_from_text(self, text: str) -> None:
+        if not self.settings.values.blessing_enabled:
+            self.blessing_refresh_in_progress = False
+            return
         if not self.blessing_refresh_in_progress:
             return
         if BLESSING_STATUS_MARKER not in normalize(text):
             return
 
         self.blessing_refreshed_at = time.monotonic()
-        self.blessing_next_attempt_at = (
-            self.blessing_refreshed_at + BLESSING_REFRESH_INTERVAL
-        )
+        self.blessing_next_attempt_at = self.blessing_refreshed_at + BLESSING_REFRESH_INTERVAL
         self.blessing_refresh_in_progress = False
         self.log("Благословение подтверждено. Следующее обновление через 29 минут.")
         self.mark_progress("Благословение обновлено")
@@ -795,6 +751,15 @@ class Farmer:
         )
         if map_info is None:
             return
+
+        if map_info.location_name and map_info.location_name != self.navigator.location_name:
+            self.navigator.use_location(map_info.location_name)
+
+        if map_info.movement_blocked:
+            self.navigator.reject_last_plan(
+                map_info.position,
+                mark_destination_blocked=True,
+            )
 
         self.context.current_position = map_info.position
         if map_info.current_hp is not None:
@@ -817,19 +782,13 @@ class Farmer:
         self.state = BotState.MAP
         self.mark_progress("карта получена")
 
-        if (
-            self.context.failed_move_attempts
-            >= MAX_FAILED_MOVE_ATTEMPTS
-        ):
-            await self.recover_latest_state(
-                "неудачные перемещения"
-            )
+        if self.context.failed_move_attempts >= MAX_FAILED_MOVE_ATTEMPTS:
+            await self.recover_latest_state("неудачные перемещения")
             return
 
         if (
             self.context.checked_empty_position is not None
-            and self.context.checked_empty_position
-            != map_info.position
+            and self.context.checked_empty_position != map_info.position
         ):
             self.context.checked_empty_position = None
 
@@ -845,10 +804,7 @@ class Farmer:
             await self.wait_for_battle_health()
             return
 
-        if (
-            map_info.movement_finished
-            and random.random() < self.settings.values.long_pause_chance
-        ):
+        if map_info.movement_finished and random.random() < self.settings.values.long_pause_chance:
             pause = random.uniform(
                 self.settings.values.long_pause_min,
                 self.settings.values.long_pause_max,
@@ -874,10 +830,7 @@ class Farmer:
                 self.mark_progress("открыт список целей")
             return
 
-        if (
-            self.context.checked_empty_position
-            == map_info.position
-        ):
+        if self.context.checked_empty_position == map_info.position:
             self.context.checking_hidden_monsters = False
         elif map_info.has_hidden_monsters:
             self.context.active_target = None
@@ -916,7 +869,7 @@ class Farmer:
     def analyze_target_buttons(
         self,
         message,
-    ) -> tuple[Optional[str], dict[str, tuple[int, int]]]:
+    ) -> tuple[str | None, dict[str, tuple[int, int]]]:
         analysis = analyze_map_targets(
             message,
             self.settings.values.enabled_targets,
@@ -940,9 +893,7 @@ class Farmer:
             if clicked:
                 await self.wait_for_battle_health()
             elif self.running:
-                await self.recover_latest_state(
-                    "низкий HP: не удалось вернуться на карту"
-                )
+                await self.recover_latest_state("низкий HP: не удалось вернуться на карту")
             return
 
         if self.pause_requested:
@@ -956,9 +907,7 @@ class Farmer:
                 await self.recover_latest_state("пауза: не удалось вернуться на карту")
             return
 
-        found_target, target_counts = (
-            self.analyze_target_buttons(message)
-        )
+        found_target, target_counts = self.analyze_target_buttons(message)
 
         event_key = (
             f"{message.id}:"
@@ -985,9 +934,7 @@ class Farmer:
             )
 
             if clicked:
-                self.statistics.record_attacked(
-                    found_target
-                )
+                self.statistics.record_attacked(found_target)
                 self.state = BotState.COMBAT
                 self.mark_progress("цель выбрана")
             return
@@ -999,26 +946,18 @@ class Farmer:
         # монстров. После возврата на карту нужно перейти дальше, а не
         # снова открывать тот же список целей.
         all_matching_targets_are_occupied = bool(target_counts) and all(
-            found > 0 and occupied >= found
-            for found, occupied in target_counts.values()
+            found > 0 and occupied >= found for found, occupied in target_counts.values()
         )
 
-        if (
-            self.context.current_position is not None
-            and (
-                self.context.checking_hidden_monsters
-                or all_matching_targets_are_occupied
-            )
+        if self.context.current_position is not None and (
+            self.context.checking_hidden_monsters or all_matching_targets_are_occupied
         ):
-            self.context.checked_empty_position = (
-                self.context.current_position
-            )
+            self.context.checked_empty_position = self.context.current_position
 
             if all_matching_targets_are_occupied:
                 occupied_summary = ", ".join(
                     f"{target}: {occupied}/{found}"
-                    for target, (found, occupied)
-                    in target_counts.items()
+                    for target, (found, occupied) in target_counts.items()
                 )
                 self.log(
                     "Все подходящие цели на клетке заняты. "
@@ -1038,9 +977,7 @@ class Farmer:
         if clicked:
             self.mark_progress("возврат к карте")
         else:
-            await self.recover_latest_state(
-                "не удалось вернуться к карте"
-            )
+            await self.recover_latest_state("не удалось вернуться к карте")
 
     def analyze_combat_target_buttons(self, message):
         return select_combat_target(
@@ -1056,21 +993,14 @@ class Farmer:
         self.state = BotState.COMBAT
         self.mark_progress("получен список целей навыка")
 
-        target_name, position = self.analyze_combat_target_buttons(
-            message
-        )
+        target_name, position = self.analyze_combat_target_buttons(message)
 
         if position is None:
-            await self.recover_latest_state(
-                "не найдена доступная цель навыка"
-            )
+            await self.recover_latest_state("не найдена доступная цель навыка")
             return
 
         delay = self.action_delay(ActionType.SELECT_TARGET)
-        self.log(
-            f"Ожидание {delay:.1f} сек. перед выбором "
-            f"боевой цели: {target_name}"
-        )
+        self.log(f"Ожидание {delay:.1f} сек. перед выбором боевой цели: {target_name}")
         await asyncio.sleep(delay)
 
         if not self.running:
@@ -1089,13 +1019,9 @@ class Farmer:
             f"боевая цель {target_name}",
         )
         if clicked:
-            self.mark_progress(
-                "цель атакующего навыка выбрана"
-            )
+            self.mark_progress("цель атакующего навыка выбрана")
         elif self.running:
-            await self.recover_latest_state(
-                "не удалось выбрать цель навыка"
-            )
+            await self.recover_latest_state("не удалось выбрать цель навыка")
 
     def skill_available(self, message, skill_name: str) -> bool:
         return choose_skill(
@@ -1110,8 +1036,7 @@ class Farmer:
 
         current_mana = parse_current_mana(message.raw_text or "")
         self.log(
-            "Выбор навыка: "
-            f"мана={current_mana if current_mana is not None else 'не распознана'}"
+            f"Выбор навыка: мана={current_mana if current_mana is not None else 'не распознана'}"
         )
 
         skill_name = choose_skill(
@@ -1188,48 +1113,34 @@ class Farmer:
             level="WARNING",
         )
         await self.notifier.send(
-            "☠️ Персонаж погиб\n"
-            f"Цель: {target_name}\n"
-            "Начато восстановление здоровья."
+            f"☠️ Персонаж погиб\nЦель: {target_name}\nНачато восстановление здоровья."
         )
         self.mark_progress("начато восстановление после смерти")
 
         if self.recovery_task:
             self.recovery_task.cancel()
 
-        self.recovery_task = asyncio.create_task(
-            self.death_recovery_loop()
-        )
+        self.recovery_task = asyncio.create_task(self.death_recovery_loop())
 
     async def death_recovery_loop(self) -> None:
         await asyncio.sleep(DEATH_RECOVERY_MIN_WAIT)
 
         while self.running and self.state is BotState.RECOVERY:
-            elapsed = (
-                time.monotonic()
-                - (self.recovery_started_at or time.monotonic())
-            )
+            elapsed = time.monotonic() - (self.recovery_started_at or time.monotonic())
 
             if elapsed > DEATH_RECOVERY_MAX_WAIT:
-                await self.stop(
-                    "HP не восстановилось за предельное время"
-                )
+                await self.stop("HP не восстановилось за предельное время")
                 return
 
             await self.request_map_refresh()
-            await asyncio.sleep(
-                DEATH_RECOVERY_RECHECK_INTERVAL
-            )
+            await asyncio.sleep(DEATH_RECOVERY_RECHECK_INTERVAL)
 
     async def handle_recovery_map(
         self,
         message,
         map_info,
     ) -> None:
-        elapsed = (
-            time.monotonic()
-            - (self.recovery_started_at or time.monotonic())
-        )
+        elapsed = time.monotonic() - (self.recovery_started_at or time.monotonic())
 
         if elapsed < DEATH_RECOVERY_MIN_WAIT:
             return
@@ -1251,9 +1162,7 @@ class Farmer:
                 f"HP восстановлено до {current_hp}/{map_info.max_hp}",
             )
             await self.notifier.send(
-                "✅ Здоровье восстановлено\n"
-                f"HP: {current_hp}/{map_info.max_hp}\n"
-                "Фарм продолжен."
+                f"✅ Здоровье восстановлено\nHP: {current_hp}/{map_info.max_hp}\nФарм продолжен."
             )
 
             if self.recovery_task:
@@ -1280,8 +1189,7 @@ class Farmer:
             f"Монстр «{disappeared_target}» исчез с текущей клетки",
         )
         self.log(
-            f"Монстр «{disappeared_target}» исчез с клетки. "
-            "Обновляю карту и продолжаю маршрут."
+            f"Монстр «{disappeared_target}» исчез с клетки. Обновляю карту и продолжаю маршрут."
         )
 
         await self.request_map_refresh()
@@ -1292,10 +1200,13 @@ class Farmer:
         # that only needs one.
         message = self.latest_received_message
         if message is not None and self.is_latest_message(message):
-            if self.find_button(
-                message,
-                exact=LOOK_BUTTON,
-            ) is not None:
+            if (
+                self.find_button(
+                    message,
+                    exact=LOOK_BUTTON,
+                )
+                is not None
+            ):
                 await self.click_button(
                     message,
                     exact=LOOK_BUTTON,
@@ -1348,15 +1259,10 @@ class Farmer:
         attempt = self.watchdog.begin_recovery_attempt()
         self.statistics.record_recovery_attempt()
 
-        self.log(
-            f"Восстановление состояния "
-            f"({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}"
-        )
+        self.log(f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}")
 
         if attempt > MAX_RECOVERY_ATTEMPTS:
-            await self.stop(
-                f"исчерпаны попытки восстановления: {reason}"
-            )
+            await self.stop(f"исчерпаны попытки восстановления: {reason}")
             return
 
         # Normally the current game state is the last update Telethon delivered.
@@ -1425,14 +1331,11 @@ class Farmer:
 
             if self.state is BotState.RECOVERY:
                 await self.request_map_refresh()
-                self.mark_progress(
-                    "watchdog обновил карту в восстановлении"
-                )
+                self.mark_progress("watchdog обновил карту в восстановлении")
                 continue
 
             await self.recover_latest_state(
-                f"watchdog: нет прогресса в состоянии "
-                f"{self.state.name}"
+                f"watchdog: нет прогресса в состоянии {self.state.name}"
             )
 
     async def handle_message(self, message) -> None:
@@ -1507,11 +1410,7 @@ class Farmer:
 
                 self.log(
                     "Обнаружено внезапное нападение"
-                    + (
-                        f": {combat_target}"
-                        if combat_target
-                        else ""
-                    )
+                    + (f": {combat_target}" if combat_target else "")
                 )
                 self.mark_progress("внезапное нападение")
             elif "на помощь врагу присоединился" in normalized_text:
@@ -1519,15 +1418,9 @@ class Farmer:
                     self.context.add_combat_enemy(combat_target)
                 self.log(
                     "К бою присоединился дополнительный моб"
-                    + (
-                        f": {combat_target}"
-                        if combat_target
-                        else ""
-                    )
+                    + (f": {combat_target}" if combat_target else "")
                 )
-                self.mark_progress(
-                    "к врагу присоединилось подкрепление"
-                )
+                self.mark_progress("к врагу присоединилось подкрепление")
             else:
                 if combat_target:
                     self.context.active_target = combat_target
@@ -1597,9 +1490,7 @@ class Farmer:
                 return
 
             if "Поражение" in text:
-                await self.enter_death_recovery(
-                    message.id
-                )
+                await self.enter_death_recovery(message.id)
                 return
 
     async def process_latest_state(self) -> None:
@@ -1608,25 +1499,31 @@ class Farmer:
             limit=STATE_HISTORY_LIMIT,
         )
 
-        map_history: list[tuple[int, int]] = []
-
-        for message in reversed(messages):
-            map_info = parse_map(
-                message.raw_text or "",
-                self.settings.values.enabled_targets,
-                CHARACTER_NAME,
-            )
-            if map_info is None:
-                continue
+        parsed_maps = [
+            map_info
+            for message in messages
             if (
-                not map_history
-                or map_history[-1] != map_info.position
-            ):
+                map_info := parse_map(
+                    message.raw_text or "",
+                    self.settings.values.enabled_targets,
+                    CHARACTER_NAME,
+                )
+            )
+            is not None
+        ]
+        latest_map = parsed_maps[0] if parsed_maps else None
+        latest_location = latest_map.location_name if latest_map else None
+        if latest_location:
+            self.navigator.use_location(latest_location)
+
+        map_history: list[tuple[int, int]] = []
+        for map_info in reversed(parsed_maps):
+            if latest_location and map_info.location_name != latest_location:
+                continue
+            if not map_history or map_history[-1] != map_info.position:
                 map_history.append(map_info.position)
 
-        self.navigator.initialize_from_history(
-            map_history
-        )
+        self.navigator.initialize_from_history(map_history)
 
         for message in messages:
             kind = classify_message(
@@ -1651,14 +1548,10 @@ class Farmer:
             if kind is MessageKind.MOVE_STARTED:
                 self.statistics.record_startup_state_recovery()
                 self.state = BotState.MOVING
-                self.mark_progress(
-                    "запуск во время перемещения"
-                )
+                self.mark_progress("запуск во время перемещения")
                 return
 
-        self.mark_progress(
-            "при синхронизации запрошено обновление карты"
-        )
+        self.mark_progress("при синхронизации запрошено обновление карты")
         await self.request_map_refresh()
 
     async def stop(self, reason: str) -> None:
@@ -1714,9 +1607,15 @@ class Farmer:
         deleted_logs = self.cleanup_old_log_files()
         cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
         logger.info(
-            "Очистка хранения: срок %s дн.; events=%s, battles=%s, drops=%s, sessions=%s, unknown=%s, logs=%s",
-            DATA_RETENTION_DAYS, cleanup["events"], cleanup["battles"], cleanup["drops"],
-            cleanup["sessions"], cleanup["unknown_battles"], deleted_logs,
+            "Очистка хранения: срок %s дн.; events=%s, battles=%s, "
+            "drops=%s, sessions=%s, unknown=%s, logs=%s",
+            DATA_RETENTION_DAYS,
+            cleanup["events"],
+            cleanup["battles"],
+            cleanup["drops"],
+            cleanup["sessions"],
+            cleanup["unknown_battles"],
+            deleted_logs,
         )
         self.session_id = await self.storage.start_session(
             cycles_count=self.settings.values.cycles_count,
@@ -1724,11 +1623,13 @@ class Farmer:
         )
         await self.storage.add_event(
             "FARMER_STARTED",
-            f"Фармер запущен: {self.settings.values.cycles_count} цикл(а), по {self.settings.values.moves_per_cycle} ходов",
+            f"Фармер запущен: {self.settings.values.cycles_count} цикл(а), "
+            f"по {self.settings.values.moves_per_cycle} ходов",
         )
         await self.notifier.send(
             "▶️ Фармер запущен\n"
-            f"Циклов: {self.settings.values.cycles_count}\nХодов в цикле: {self.settings.values.moves_per_cycle}"
+            f"Циклов: {self.settings.values.cycles_count}\n"
+            f"Ходов в цикле: {self.settings.values.moves_per_cycle}"
         )
 
         await self.client.start()
@@ -1749,8 +1650,7 @@ class Farmer:
             COMBAT_PROGRESS_TIMEOUT,
         )
         logger.info(
-            "После смерти: ожидание минимум %s сек., "
-            "возврат при HP >= %s",
+            "После смерти: ожидание минимум %s сек., возврат при HP >= %s",
             DEATH_RECOVERY_MIN_WAIT,
             MIN_HP_AFTER_DEATH,
         )
@@ -1769,12 +1669,8 @@ class Farmer:
         async def on_edited_message(event) -> None:
             await self.enqueue_message(event.message)
 
-        self.worker_task = asyncio.create_task(
-            self.event_worker()
-        )
-        self.watchdog_task = asyncio.create_task(
-            self.watchdog_loop()
-        )
+        self.worker_task = asyncio.create_task(self.event_worker())
+        self.watchdog_task = asyncio.create_task(self.watchdog_loop())
 
         await self.process_latest_state()
         await self.client.run_until_disconnected()

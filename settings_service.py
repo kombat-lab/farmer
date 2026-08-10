@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 from config import (
     DEFAULT_ATTACK_DELAY_MAX,
     DEFAULT_ATTACK_DELAY_MIN,
-    DEFAULT_CYCLES_COUNT,
     DEFAULT_CYCLE_REST_MAX,
     DEFAULT_CYCLE_REST_MIN,
-    DEFAULT_LONG_PAUSE_CHANCE,
-    DEFAULT_HEAL_THRESHOLD,
-    DEFAULT_MAX_MANA,
+    DEFAULT_CYCLES_COUNT,
     DEFAULT_HEAL_AMOUNT,
+    DEFAULT_HEAL_THRESHOLD,
+    DEFAULT_LONG_PAUSE_CHANCE,
     DEFAULT_LONG_PAUSE_MAX,
     DEFAULT_LONG_PAUSE_MIN,
+    DEFAULT_MAX_MANA,
     DEFAULT_MOVE_DELAY_MAX,
     DEFAULT_MOVE_DELAY_MIN,
     DEFAULT_MOVES_PER_CYCLE,
@@ -32,11 +33,12 @@ class FarmerSettings:
     cycles_count: int = DEFAULT_CYCLES_COUNT
     moves_per_cycle: int = DEFAULT_MOVES_PER_CYCLE
 
-    enabled_targets: list[str] | None = None
+    enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
     max_mana: int = DEFAULT_MAX_MANA
     heal_amount: int = DEFAULT_HEAL_AMOUNT
+    blessing_enabled: bool = False
 
     move_delay_min: float = DEFAULT_MOVE_DELAY_MIN
     move_delay_max: float = DEFAULT_MOVE_DELAY_MAX
@@ -57,10 +59,6 @@ class FarmerSettings:
     cycle_rest_min: float = DEFAULT_CYCLE_REST_MIN
     cycle_rest_max: float = DEFAULT_CYCLE_REST_MAX
 
-    def __post_init__(self) -> None:
-        if self.enabled_targets is None:
-            self.enabled_targets = list(DEFAULT_TARGET_MONSTERS)
-
 
 class SettingsService:
     def __init__(self, storage: Storage) -> None:
@@ -77,8 +75,7 @@ class SettingsService:
             try:
                 stored["heal_threshold"] = max(
                     1,
-                    int(stored["max_hp"])
-                    - int(stored.get("heal_amount", DEFAULT_HEAL_AMOUNT)),
+                    int(stored["max_hp"]) - int(stored.get("heal_amount", DEFAULT_HEAL_AMOUNT)),
                 )
             except (TypeError, ValueError):
                 stored["heal_threshold"] = DEFAULT_HEAL_THRESHOLD
@@ -89,18 +86,28 @@ class SettingsService:
 
         self._normalize_enabled_targets()
         self._normalize_character()
+        self.values.blessing_enabled = self._normalize_bool(
+            self.values.blessing_enabled,
+            default=False,
+        )
         await self.save_all()
 
     async def save_all(self) -> None:
         for key, value in asdict(self.values).items():
             await self.storage.set_setting(key, value)
 
-    async def set_value(self, key: str, value) -> None:
+    async def set_value(self, key: str, value: Any) -> None:
         if not hasattr(self.values, key):
             raise KeyError(key)
 
         setattr(self.values, key, value)
         await self.storage.set_setting(key, value)
+
+    async def toggle_blessing(self) -> bool:
+        enabled = not self.values.blessing_enabled
+        self.values.blessing_enabled = enabled
+        await self.storage.set_setting("blessing_enabled", enabled)
+        return enabled
 
     async def toggle_target(self, target: str) -> bool:
         if target not in DEFAULT_TARGET_MONSTERS:
@@ -141,9 +148,7 @@ class SettingsService:
         else:
             category_target_set = set(category_targets)
             current_targets = [
-                target
-                for target in current_targets
-                if target not in category_target_set
+                target for target in current_targets if target not in category_target_set
             ]
 
         current_targets = self._sort_targets(current_targets)
@@ -163,10 +168,7 @@ class SettingsService:
             raise ValueError(f"Неизвестная категория мобов: {category}")
 
         selected = set(self.values.enabled_targets or [])
-        category_fully_enabled = all(
-            target in selected
-            for target in category_targets
-        )
+        category_fully_enabled = all(target in selected for target in category_targets)
         new_enabled_state = not category_fully_enabled
 
         await self.set_category_enabled(
@@ -184,10 +186,7 @@ class SettingsService:
 
         selected = set(self.values.enabled_targets or [])
 
-        return all(
-            target in selected
-            for target in category_targets
-        )
+        return all(target in selected for target in category_targets)
 
     def is_category_partially_enabled(self, category: str) -> bool:
         category_targets = TARGET_MONSTER_CATEGORIES.get(category)
@@ -196,10 +195,7 @@ class SettingsService:
             return False
 
         selected = set(self.values.enabled_targets or [])
-        enabled_count = sum(
-            target in selected
-            for target in category_targets
-        )
+        enabled_count = sum(target in selected for target in category_targets)
 
         return 0 < enabled_count < len(category_targets)
 
@@ -207,31 +203,24 @@ class SettingsService:
         category_targets = TARGET_MONSTER_CATEGORIES.get(category, [])
         selected = set(self.values.enabled_targets or [])
 
-        enabled_count = sum(
-            target in selected
-            for target in category_targets
-        )
+        enabled_count = sum(target in selected for target in category_targets)
 
         return enabled_count, len(category_targets)
 
     def _normalize_enabled_targets(self) -> None:
-        enabled_targets = self.values.enabled_targets
+        self.values.enabled_targets = self._coerce_enabled_targets(self.values.enabled_targets)
 
-        if not isinstance(enabled_targets, list):
-            enabled_targets = list(DEFAULT_TARGET_MONSTERS)
-
-        self.values.enabled_targets = self._sort_targets(enabled_targets)
+    @classmethod
+    def _coerce_enabled_targets(cls, value: object) -> list[str]:
+        if not isinstance(value, list):
+            return list(DEFAULT_TARGET_MONSTERS)
+        return cls._sort_targets([target for target in value if isinstance(target, str)])
 
     @staticmethod
     def _sort_targets(targets: list[str]) -> list[str]:
         selected = set(targets)
 
-        return [
-            target
-            for target in DEFAULT_TARGET_MONSTERS
-            if target in selected
-        ]
-
+        return [target for target in DEFAULT_TARGET_MONSTERS if target in selected]
 
     def _normalize_character(self) -> None:
         for key in ("heal_threshold", "max_mana", "heal_amount"):
@@ -243,6 +232,20 @@ class SettingsService:
             setattr(self.values, key, max(1, value))
 
     @staticmethod
+    def _normalize_bool(value: object, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"1", "true", "yes", "on", "да", "вкл"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "нет", "выкл"}:
+                return False
+        return default
+
+    @staticmethod
     def validate_character_value(value: int) -> None:
         if value < 1:
             raise ValueError("Значение должно быть больше нуля.")
@@ -250,6 +253,4 @@ class SettingsService:
     @staticmethod
     def validate_range(minimum: float, maximum: float) -> None:
         if minimum < 0 or maximum < minimum:
-            raise ValueError(
-                "Минимум должен быть >= 0, максимум >= минимума."
-            )
+            raise ValueError("Минимум должен быть >= 0, максимум >= минимума.")

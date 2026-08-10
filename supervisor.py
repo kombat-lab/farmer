@@ -8,9 +8,9 @@ from auto_buff import AutoBuff
 from config import SESSION_NAME
 from farmer import Farmer
 from notifications import Notifier
+from session_lock import SessionLease
 from settings_service import SettingsService
 from storage import Storage
-from session_lock import SessionLease
 
 logger = logging.getLogger("fog_farmer")
 
@@ -46,8 +46,7 @@ class FarmerSupervisor:
 
             if not self.session_lease.acquire():
                 return False, (
-                    "Telethon-сессия уже используется другим "
-                    "экземпляром. Сначала нажмите «Стоп»."
+                    "Telethon-сессия уже используется другим экземпляром. Сначала нажмите «Стоп»."
                 )
 
             try:
@@ -77,25 +76,17 @@ class FarmerSupervisor:
                 f"{type(error).__name__}: {error}",
                 level="CRITICAL",
             )
-            await self.notifier.send(
-                f"Фармер аварийно завершён\n{type(error).__name__}: {error}"
-            )
+            await self.notifier.send(f"Фармер аварийно завершён\n{type(error).__name__}: {error}")
         finally:
             completed_farmer = self.farmer
             reason = (
-                completed_farmer.stop_reason
-                if completed_farmer is not None
-                else None
+                completed_farmer.stop_reason if completed_farmer is not None else None
             ) or "сессия завершена"
             completed_cycles = (
-                completed_farmer.current_cycle
-                if completed_farmer is not None
-                else None
+                completed_farmer.current_cycle if completed_farmer is not None else None
             )
             total_moves = (
-                completed_farmer.context.move_count
-                if completed_farmer is not None
-                else None
+                completed_farmer.context.move_count if completed_farmer is not None else None
             )
 
             self.task = None
@@ -134,16 +125,13 @@ class FarmerSupervisor:
         async with self.lock:
             if not self.is_running() or self.farmer is None:
                 await self.storage.set_setting("farmer_stop_requested", True)
-                return True, (
-                    "Команда остановки передана другому "
-                    "экземпляру фармера."
-                )
+                return True, ("Команда остановки передана другому экземпляру фармера.")
 
             await self.farmer.stop("остановлен через служебного бота")
             if self.task and not self.task.done():
                 try:
                     await asyncio.wait_for(self.task, timeout=15)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     self.task.cancel()
             return True, "Фармер остановлен."
 

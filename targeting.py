@@ -1,27 +1,25 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 from models import ButtonPosition
 from parser import normalize
 from telegram_buttons import get_button_texts
-
 
 HP_PATTERN = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
 
 
 @dataclass(frozen=True)
 class MapTargetAnalysis:
-    selected_target: Optional[str]
+    selected_target: str | None
     target_counts: dict[str, tuple[int, int]]
 
     @property
     def all_matching_targets_are_occupied(self) -> bool:
         return bool(self.target_counts) and all(
-            found > 0 and occupied >= found
-            for found, occupied in self.target_counts.values()
+            found > 0 and occupied >= found for found, occupied in self.target_counts.values()
         )
 
 
@@ -30,7 +28,7 @@ def analyze_map_targets(
     configured_targets: Iterable[str],
 ) -> MapTargetAnalysis:
     target_counts: dict[str, tuple[int, int]] = {}
-    selected_target: Optional[str] = None
+    selected_target: str | None = None
     button_texts = get_button_texts(message)
 
     for configured_target in configured_targets:
@@ -54,7 +52,7 @@ def analyze_map_targets(
     return MapTargetAnalysis(selected_target, target_counts)
 
 
-def _extract_current_hp(button_text: str) -> Optional[int]:
+def _extract_current_hp(button_text: str) -> int | None:
     match = HP_PATTERN.search(button_text)
     if match is None:
         return None
@@ -76,8 +74,8 @@ def _resolve_target_name(
 def select_combat_target(
     message,
     priorities: Iterable[str],
-    active_target: Optional[str] = None,
-) -> tuple[Optional[str], Optional[ButtonPosition]]:
+    active_target: str | None = None,
+) -> tuple[str | None, ButtonPosition | None]:
     if not getattr(message, "buttons", None):
         return None, None
 
@@ -85,10 +83,7 @@ def select_combat_target(
     if active_target and active_target not in ordered_priorities:
         ordered_priorities.append(active_target)
 
-    priority_indexes = {
-        normalize(target): index
-        for index, target in enumerate(ordered_priorities)
-    }
+    priority_indexes = {normalize(target): index for index, target in enumerate(ordered_priorities)}
     ignored = ("отмена", "к карте", "назад", "pvp:", "занят")
     candidates: list[tuple[int, int, int, int, str]] = []
 

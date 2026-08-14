@@ -4,7 +4,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 
-from rewards import BattleReward
+from rewards import BattleReward, parse_item_stack
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,9 @@ class FarmStatistics:
         self.session_wins += 1
         self.session_xp += reward.xp
         self.session_dust += reward.dust
-        self.session_drops.update(reward.items)
+        for item in reward.items:
+            name, quantity = parse_item_stack(item)
+            self.session_drops[name] += quantity
         self.session_targets.setdefault(target_name, Counter())["killed"] += 1
         return True
 

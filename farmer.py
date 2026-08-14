@@ -4,6 +4,7 @@ import asyncio
 import random
 import time
 from collections import deque
+from contextlib import suppress
 from pathlib import Path
 from statistics import FarmStatistics, format_report
 from typing import Any
@@ -79,7 +80,7 @@ BACK_TO_MAP_BUTTON = "↩️ К карте"
 LOOK_BUTTON = "👀 Осмотреться"
 MAP_COMMAND = "Карта"
 
-MAX_FAILED_MOVE_ATTEMPTS = 2
+MAX_FAILED_MOVE_ATTEMPTS = len(SnakeNavigator.ALL_MOVE_BUTTONS)
 EVENT_QUEUE_SIZE = 200
 PROCESSED_EVENT_CACHE_SIZE = 500
 LATEST_MESSAGE_CACHE_SIZE = 200
@@ -132,6 +133,8 @@ class Farmer:
         self.current_cycle = 1
         self.moves_in_cycle = 0
         self.rest_task: asyncio.Task | None = None
+        self.progress_persist_task: asyncio.Task | None = None
+        self.pending_progress_reason: str | None = None
 
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
@@ -153,37 +156,41 @@ class Farmer:
 
     def mark_progress(self, reason: str) -> None:
         self.watchdog.mark_progress(reason)
-        if self.running:
-            asyncio.create_task(self._persist_progress(reason))
+        self.pending_progress_reason = reason
+        if self.running and (
+            self.progress_persist_task is None or self.progress_persist_task.done()
+        ):
+            self.progress_persist_task = asyncio.create_task(self._persist_progress())
 
-    async def _persist_progress(self, reason: str) -> None:
-        # Задача могла попасть в очередь до остановки. В таком случае
-        # не даём ей перезаписать финальную причину завершения сессии.
-        if not self.running:
-            return
-
-        await self.storage.update_state(
-            game_state=self.state.name,
-            position_x=(
-                self.context.current_position[0] if self.context.current_position else None
-            ),
-            position_y=(
-                self.context.current_position[1] if self.context.current_position else None
-            ),
-            current_hp=self.context.current_hp,
-            max_hp=self.context.max_hp,
-            active_target=self.context.active_target,
-            moves=self.context.move_count,
-            max_moves=self.settings.values.moves_per_cycle,
-            last_action=reason,
-            last_progress_at=utc_now(),
-            session_id=self.session_id,
-            current_cycle=self.current_cycle,
-            cycles_count=self.settings.values.cycles_count,
-            moves_in_cycle=self.moves_in_cycle,
-            moves_per_cycle=self.settings.values.moves_per_cycle,
-            pause_requested=int(self.pause_requested),
-        )
+    async def _persist_progress(self) -> None:
+        # Coalesce bursts into one writer. The most recent state is what the
+        # control bot needs; spawning one SQLite task per update can otherwise
+        # amplify a bad incoming-message loop into thousands of pending writes.
+        while self.running and self.pending_progress_reason is not None:
+            reason = self.pending_progress_reason
+            self.pending_progress_reason = None
+            await self.storage.update_state(
+                game_state=self.state.name,
+                position_x=(
+                    self.context.current_position[0] if self.context.current_position else None
+                ),
+                position_y=(
+                    self.context.current_position[1] if self.context.current_position else None
+                ),
+                current_hp=self.context.current_hp,
+                max_hp=self.context.max_hp,
+                active_target=self.context.active_target,
+                moves=self.context.move_count,
+                max_moves=self.settings.values.moves_per_cycle,
+                last_action=reason,
+                last_progress_at=utc_now(),
+                session_id=self.session_id,
+                current_cycle=self.current_cycle,
+                cycles_count=self.settings.values.cycles_count,
+                moves_in_cycle=self.moves_in_cycle,
+                moves_per_cycle=self.settings.values.moves_per_cycle,
+                pause_requested=int(self.pause_requested),
+            )
 
     def validate_config(self) -> None:
         if not isinstance(API_ID, int) or API_ID <= 0:
@@ -262,12 +269,11 @@ class Farmer:
         if not force and not is_latest:
             return
 
-        # Live-события Telethon защищаем от дублей. Но сообщения,
-        # которые мы специально нашли в истории при запуске или
-        # восстановлении, должны быть обработаны повторно: это
-        # фактическое текущее состояние игры, даже если такая редакция
-        # сообщения уже встречалась в предыдущем цикле.
-        if not force and not self.remember_event(message):
+        # Forced startup/recovery messages bypass the duplicate rejection, but
+        # are still remembered. Live recovery must never replay them forever.
+        if force:
+            self.remember_event(message)
+        elif not self.remember_event(message):
             return
 
         try:
@@ -509,9 +515,16 @@ class Farmer:
     def confirm_pending_move(
         self,
         current_position: tuple[int, int],
+        *,
+        movement_blocked: bool = False,
     ) -> None:
         plan = self.context.pending_move
         if plan is None:
+            if movement_blocked:
+                self.navigator.reject_last_plan(
+                    current_position,
+                    mark_destination_blocked=True,
+                )
             return
 
         if current_position == plan.destination:
@@ -534,12 +547,18 @@ class Farmer:
                 f"Всего: {self.context.move_count}"
             )
         elif current_position == plan.origin:
-            self.context.failed_move_attempts += 1
+            buttons_exhausted = self.navigator.reject_last_plan(
+                current_position,
+                mark_destination_blocked=movement_blocked,
+            )
+            if buttons_exhausted:
+                self.context.failed_move_attempts = MAX_FAILED_MOVE_ATTEMPTS
+            else:
+                self.context.failed_move_attempts += 1
             self.log(
                 f"Перемещение через {plan.button} не выполнено. "
-                f"Неудач подряд: "
-                f"{self.context.failed_move_attempts}/"
-                f"{MAX_FAILED_MOVE_ATTEMPTS}"
+                f"Неудач подряд: {self.context.failed_move_attempts}. "
+                "Пробую другую кнопку без запроса истории."
             )
         else:
             recovered = self.navigator.recover_from_actual_transition(
@@ -754,19 +773,18 @@ class Farmer:
 
         if map_info.location_name and map_info.location_name != self.navigator.location_name:
             self.navigator.use_location(map_info.location_name)
-
-        if map_info.movement_blocked:
-            self.navigator.reject_last_plan(
-                map_info.position,
-                mark_destination_blocked=True,
-            )
+            self.context.pending_move = None
+            self.context.failed_move_attempts = 0
 
         self.context.current_position = map_info.position
         if map_info.current_hp is not None:
             self.context.current_hp = map_info.current_hp
             self.context.max_hp = map_info.max_hp
 
-        self.confirm_pending_move(map_info.position)
+        self.confirm_pending_move(
+            map_info.position,
+            movement_blocked=map_info.movement_blocked,
+        )
 
         if self.state is BotState.RECOVERY:
             await self.handle_recovery_map(message, map_info)
@@ -783,7 +801,7 @@ class Farmer:
         self.mark_progress("карта получена")
 
         if self.context.failed_move_attempts >= MAX_FAILED_MOVE_ATTEMPTS:
-            await self.recover_latest_state("неудачные перемещения")
+            await self.stop("игра не выполнила перемещение после проверки всех доступных кнопок")
             return
 
         if (
@@ -1265,22 +1283,21 @@ class Farmer:
             await self.stop(f"исчерпаны попытки восстановления: {reason}")
             return
 
-        # Normally the current game state is the last update Telethon delivered.
-        # Reuse it before asking Telegram for up to 100 history messages.
-        cached = self.latest_received_message
-        if cached is not None and await self.restore_from_message(cached):
-            return
-
         try:
             messages = await self.client.get_messages(
                 self.game_bot,
-                limit=STATE_HISTORY_LIMIT,
+                limit=1,
             )
         except FloodWaitError as error:
             await self.stop_for_flood_wait(error, "восстановление истории")
             return
 
+        # Replaying an already handled inline screen can repeat the exact same
+        # decision forever. Restore only a genuinely unseen newest revision;
+        # older history is useful at startup, but unsafe during live recovery.
         for message in messages:
+            if self.event_key(message) in self.processed_event_keys:
+                continue
             if await self.restore_from_message(message):
                 return
 
@@ -1561,6 +1578,12 @@ class Farmer:
         self.stop_reason = reason
         self.running = False
         self.state = BotState.STOPPED
+        self.pending_progress_reason = None
+
+        if self.progress_persist_task and self.progress_persist_task is not asyncio.current_task():
+            self.progress_persist_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.progress_persist_task
 
         if not self.runtime_finalized:
             self.statistics.finalize_runtime()
@@ -1590,11 +1613,13 @@ class Farmer:
             "FARMER_STOPPED",
             reason,
         )
+        await self.storage.checkpoint()
         for task in (
             self.worker_task,
             self.watchdog_task,
             self.recovery_task,
             self.rest_task,
+            self.progress_persist_task,
         ):
             if task and task is not asyncio.current_task():
                 task.cancel()

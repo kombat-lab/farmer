@@ -65,6 +65,7 @@ async def main() -> None:
             await supervisor.stop()
         await control_bot.stop()
         await bot.session.close()
+        await storage.close()
 
 
 if __name__ == "__main__":

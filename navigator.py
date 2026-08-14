@@ -540,11 +540,13 @@ class SnakeNavigator:
         current_position: Position,
         *,
         mark_destination_blocked: bool = False,
-    ) -> None:
+    ) -> bool:
         plan = self.last_plan
 
         if plan is None or current_position != plan.origin:
-            return
+            return False
+
+        candidates = self._button_candidates(plan.origin, plan.destination)
 
         self.failed_buttons.setdefault(
             current_position,
@@ -561,6 +563,9 @@ class SnakeNavigator:
             self._rebuild_after_obstacle(current_position)
 
         self.last_plan = None
+        return all(
+            button in self.failed_buttons.get(current_position, set()) for button in candidates
+        )
 
     def _rebuild_after_obstacle(
         self,

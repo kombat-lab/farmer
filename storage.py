@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from rewards import parse_item_stack
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -126,7 +128,64 @@ class Storage:
             "pause_requested INTEGER NOT NULL DEFAULT 0",
         ):
             self._add_column("farmer_state", definition)
+        self._normalize_drop_stacks()
         self.connection.commit()
+
+    def _normalize_drop_stacks(self) -> None:
+        """Migrates historical names such as ``Item x3`` into quantity=3."""
+        rows = self.connection.execute("SELECT id,item_name,quantity FROM drops").fetchall()
+        for row in rows:
+            name, multiplier = parse_item_stack(str(row["item_name"]))
+            if multiplier == 1 and name == row["item_name"]:
+                continue
+            self.connection.execute(
+                "UPDATE drops SET item_name=?, quantity=? WHERE id=?",
+                (name, max(1, int(row["quantity"])) * multiplier, int(row["id"])),
+            )
+
+    def _close_abandoned_sessions(self) -> int:
+        """Closes sessions left RUNNING by a killed container or an old defect."""
+        rows = self.connection.execute(
+            """
+            SELECT s.id,s.started_at,s.runtime_seconds,
+                   MAX(b.happened_at) last_battle_at,
+                   MAX(f.last_progress_at) last_progress_at
+            FROM sessions s
+            LEFT JOIN battles b ON b.session_id=s.id
+            LEFT JOIN farmer_state f ON f.session_id=s.id
+            WHERE s.status='RUNNING'
+            GROUP BY s.id
+            """
+        ).fetchall()
+
+        for row in rows:
+            # The last confirmed battle is a more honest end point than the
+            # current restart time. Empty abandoned sessions therefore get a
+            # zero runtime instead of several artificial days.
+            effective_end = str(
+                row["last_progress_at"] or row["last_battle_at"] or row["started_at"]
+            )
+            try:
+                started = datetime.fromisoformat(str(row["started_at"]))
+                finished = datetime.fromisoformat(effective_end)
+                runtime = max(0, int((finished - started).total_seconds()))
+            except ValueError:
+                runtime = max(0, int(row["runtime_seconds"]))
+
+            self.connection.execute(
+                """
+                UPDATE sessions SET ended_at=?, status='INTERRUPTED',
+                    stop_reason=COALESCE(stop_reason, ?), runtime_seconds=?
+                WHERE id=? AND status='RUNNING'
+                """,
+                (
+                    effective_end,
+                    "предыдущий процесс завершился без корректной остановки",
+                    max(runtime, int(row["runtime_seconds"])),
+                    int(row["id"]),
+                ),
+            )
+        return len(rows)
 
     async def cleanup_old_data(self, retention_days: int = 7) -> dict[str, int]:
         """Удаляет диагностические и статистические записи старше retention_days."""
@@ -202,9 +261,11 @@ class Storage:
         moves_per_cycle: int,
     ) -> int:
         async with self.lock:
+            now = utc_now()
+            self._close_abandoned_sessions()
             cursor = self.connection.execute(
                 "INSERT INTO sessions(started_at,status) VALUES (?, 'RUNNING')",
-                (utc_now(),),
+                (now,),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite не вернул ID новой сессии")
@@ -219,7 +280,7 @@ class Storage:
                     last_error=NULL, session_id=?, last_progress_at=?
                 WHERE singleton=1
             """,
-                (cycles_count, moves_per_cycle, sid, utc_now()),
+                (cycles_count, moves_per_cycle, sid, now),
             )
             self.connection.commit()
             return sid
@@ -244,6 +305,23 @@ class Storage:
                 (reason, utc_now()),
             )
             self.connection.commit()
+
+    async def checkpoint(self, *, truncate: bool = False) -> tuple[int, int, int]:
+        """Copies committed WAL pages into the main database file."""
+        mode = "TRUNCATE" if truncate else "PASSIVE"
+        async with self.lock:
+            row = self.connection.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+            if row is None:
+                return 0, 0, 0
+            return int(row[0]), int(row[1]), int(row[2])
+
+    async def close(self) -> None:
+        """Checkpoints WAL and closes SQLite on a graceful application stop."""
+        async with self.lock:
+            try:
+                self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                self.connection.close()
 
     async def update_state(self, **fields) -> None:
         allowed = {
@@ -384,15 +462,16 @@ class Storage:
                 raise RuntimeError("SQLite не вернул ID нового боя")
             battle_id = int(cur.lastrowid)
             for item in items:
-                n = item.casefold().strip()
+                item_name, quantity = parse_item_stack(str(item))
+                n = item_name.casefold()
                 is_card = int(
                     n.startswith("карта ") or n.startswith("🃏карта ") or n.startswith("🃏 карта ")
                 )
                 if is_card:
-                    cards.append(item)
+                    cards.append(item_name)
                 self.connection.execute(
-                    "INSERT INTO drops(battle_id,item_name,quantity,is_card) VALUES (?,?,1,?)",
-                    (battle_id, item, is_card),
+                    "INSERT INTO drops(battle_id,item_name,quantity,is_card) VALUES (?,?,?,?)",
+                    (battle_id, item_name, quantity, is_card),
                 )
             if session_id is not None:
                 self.connection.execute(

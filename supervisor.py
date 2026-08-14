@@ -5,7 +5,6 @@ import logging
 from contextlib import suppress
 from pathlib import Path
 
-from auto_buff import AutoBuff
 from config import SESSION_NAME
 from farmer import Farmer
 from notifications import Notifier
@@ -22,12 +21,10 @@ class FarmerSupervisor:
         storage: Storage,
         notifier: Notifier,
         settings: SettingsService,
-        auto_buff: AutoBuff | None = None,
     ) -> None:
         self.storage = storage
         self.notifier = notifier
         self.settings = settings
-        self.auto_buff = auto_buff
         self.farmer: Farmer | None = None
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
@@ -40,8 +37,6 @@ class FarmerSupervisor:
         async with self.lock:
             if self.is_running():
                 return False, "Фармер уже запущен."
-            if self.auto_buff is not None and self.auto_buff.is_running():
-                return False, "Сначала выключите автобаф: Telethon-сессия уже занята."
             if not self.settings.values.enabled_targets:
                 return False, "Нужно выбрать хотя бы одного моба."
 
@@ -157,7 +152,4 @@ class FarmerSupervisor:
     async def status(self):
         state = await self.storage.get_state()
         state["task_running"] = self.is_running()
-        state["auto_buff_running"] = bool(
-            self.auto_buff is not None and self.auto_buff.is_running()
-        )
         return state

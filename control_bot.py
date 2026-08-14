@@ -10,12 +10,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
-from auto_buff import AutoBuff
 from bot_states import SettingsInput
 from config import ADMIN_TELEGRAM_ID, TARGET_MONSTER_CATEGORIES
 from middlewares import AdminOnlyMiddleware
 from rich_messages import (
-    drops_rich,
     events_rich,
     send_rich_with_fallback,
     settings_rich,
@@ -29,13 +27,14 @@ from supervisor import FarmerSupervisor
 logger = logging.getLogger("fog_farmer")
 
 INFO_ROWS = [
-    ["Состояние", "Статистика", "Дроп"],
-    ["⚠️ События", "✨ Авто баф", "⚙️ Настройки"],
+    ["Состояние", "Статистика"],
+    ["⚙️ Настройки"],
 ]
 SETTINGS_ROWS = [
     ["Количество циклов", "Ходов в цикле"],
     ["Выбор мобов", "❤️ Персонаж"],
     ["⏱ Задержки"],
+    ["📋 Журнал"],
     ["↩️ Главное меню"],
 ]
 CHARACTER_ROWS = [
@@ -52,7 +51,6 @@ DELAYS_ROWS = [
     ["↩️ Настройки"],
 ]
 
-AUTO_BUFF_BACK = "↩️ Главное меню"
 TARGETS_ENABLE_ALL_PREFIX = "✅ Выбрать всех"
 TARGETS_DISABLE_ALL_PREFIX = "❌ Снять всех"
 LOCATION_BUTTON_PREFIX = "📍 "
@@ -207,13 +205,11 @@ class ControlBot:
         storage: Storage,
         supervisor: FarmerSupervisor,
         settings: SettingsService,
-        auto_buff: AutoBuff,
     ) -> None:
         self.bot = bot
         self.storage = storage
         self.supervisor = supervisor
         self.settings = settings
-        self.auto_buff = auto_buff
         self.router = Router(name="control")
         self.dispatcher = Dispatcher(storage=MemoryStorage())
         self.polling_task: asyncio.Task | None = None
@@ -290,65 +286,30 @@ class ControlBot:
             _, result = await self.supervisor.stop()
             await self._send_text(message, f"⏹ {result}")
 
-        @r.message(StateFilter(None), text_is("✨ Авто баф"))
-        async def auto_buff_menu(message: Message) -> None:
-            status = await self.auto_buff.status()
-            running = bool(status["running"])
-            button = "⏹ Выключить автобаф" if running else "▶️ Включить автобаф"
-            text = (
-                "✨ Авто баф\n\n"
-                f"Состояние: {'✅ включён' if running else '❌ выключен'}\n"
-                f"Последний игрок: {status['last_player'] or '—'}\n"
-                f"Успешно: {status['success_count']}\n"
-                f"Ошибок: {status['error_count']}\n\n"
-                "Автобаф принимает приглашение в группу, применяет "
-                "«Благословение» и выходит из группы."
-            )
-            await self._send_text(message, text, [[button], [AUTO_BUFF_BACK]])
-
-        @r.message(StateFilter(None), text_is("▶️ Включить автобаф"))
-        async def enable_auto_buff(message: Message) -> None:
-            if self.supervisor.is_running():
-                await self._send_text(
-                    message,
-                    "Сначала остановите фармера: одна Telethon-сессия "
-                    "не может использоваться одновременно.",
-                    [["✨ Авто баф"], [AUTO_BUFF_BACK]],
-                )
-                return
-            _, result = await self.auto_buff.start()
-            await self._send_text(message, f"✨ {result}", [["✨ Авто баф"], [AUTO_BUFF_BACK]])
-
-        @r.message(StateFilter(None), text_is("⏹ Выключить автобаф"))
-        async def disable_auto_buff(message: Message) -> None:
-            _, result = await self.auto_buff.stop()
-            await self._send_text(message, f"⏹ {result}", [["✨ Авто баф"], [AUTO_BUFF_BACK]])
-
         @r.message(StateFilter(None), text_is("Состояние"))
         async def status_handler(message: Message) -> None:
             current = await self.supervisor.status()
             await self._send_rich(message, status_rich(current), "Состояние фармера получено.")
 
-        @r.message(StateFilter(None), text_is("Статистика"))
+        @r.message(StateFilter(None), text_is("Статистика", "Дроп"))
         async def stats_handler(message: Message) -> None:
             dashboard = await self.storage.get_statistics_dashboard()
+            session = await self.storage.get_current_session()
+            drops = await self.storage.get_drops(session.session_id)
             await self._send_rich(
                 message,
-                stats_rich(dashboard),
+                stats_rich(dashboard, drops),
                 self.storage.format_statistics_text(dashboard),
             )
 
-        @r.message(StateFilter(None), text_is("Дроп"))
-        async def drops_handler(message: Message) -> None:
-            session = await self.storage.get_current_session()
-            drops = await self.storage.get_drops(session.session_id)
-            await self._send_rich(message, drops_rich(drops), "Дроп текущей сессии загружен.")
-
-        @r.message(StateFilter(None), text_is("⚠️ События"))
+        @r.message(StateFilter(None), text_is("📋 Журнал", "⚠️ События"))
         async def events_handler(message: Message) -> None:
             events_list = await self.storage.get_events(15)
             await self._send_rich(
-                message, events_rich(events_list), "⚠️ Последние события загружены."
+                message,
+                events_rich(events_list),
+                "📋 Последние события загружены.",
+                SETTINGS_ROWS,
             )
 
         @r.message(StateFilter(None), text_is("⚙️ Настройки"))

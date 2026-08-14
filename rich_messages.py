@@ -99,7 +99,7 @@ def _duration(seconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def stats_rich(data: dict) -> str:
+def stats_rich(data: dict, drop_items: list[dict] | None = None) -> str:
     battle = data["battle"]
     drops = data["drops"]
     state = data["state"]
@@ -126,42 +126,24 @@ def stats_rich(data: dict) -> str:
             headers=("Моб", "Результат"),
         )
         body += f"<details open><summary>🎯 По мобам</summary>{targets_table}</details>"
-    return rich_document("📈 Статистика сессии", body)
-
-
-def drops_rich(drops: list[dict]) -> str:
-    if not drops:
-        return rich_document("🎁 Дроп текущей сессии", "<p>Предметов пока нет.</p>")
-
-    regular = [row for row in drops if not row["is_card"]]
-    cards = [row for row in drops if row["is_card"]]
-
-    blocks: list[str] = []
-    if regular:
-        blocks.append(
-            rich_table(
-                [(row["item_name"], row["quantity"]) for row in regular],
-                headers=("Предмет", "Количество"),
-            )
+    if drop_items:
+        regular = [row for row in drop_items if not row["is_card"]]
+        cards = [row for row in drop_items if row["is_card"]]
+        drop_rows = [(row["item_name"], row["quantity"]) for row in regular]
+        drop_rows.extend((f"🃏 {row['item_name']}", row["quantity"]) for row in cards)
+        drop_table = rich_table(
+            drop_rows,
+            headers=("Дроп", "Количество"),
         )
+        body += f"<details><summary>🎁 Полученный дроп</summary>{drop_table}</details>"
     else:
-        blocks.append("<p>Обычного дропа нет.</p>")
-
-    card_body = (
-        rich_table(
-            [(row["item_name"], row["quantity"]) for row in cards],
-            headers=("Карта", "Количество"),
-        )
-        if cards
-        else "<p>Карты мобов не выпадали.</p>"
-    )
-    blocks.append(f"<details open><summary>🃏 Карты мобов</summary>{card_body}</details>")
-    return rich_document("🎁 Дроп текущей сессии", "".join(blocks))
+        body += "<details><summary>🎁 Полученный дроп</summary><p>Предметов пока нет.</p></details>"
+    return rich_document("📈 Статистика сессии", body)
 
 
 def events_rich(events: list[dict]) -> str:
     if not events:
-        return rich_document("⚠️ Последние события", "<p>Событий пока нет.</p>")
+        return rich_document("📋 Журнал", "<p>Событий пока нет.</p>")
 
     rows = []
     for event in events:
@@ -169,7 +151,7 @@ def events_rich(events: list[dict]) -> str:
         rows.append((stamp, f"{event['level']} · {event['message']}"))
 
     return rich_document(
-        "⚠️ Последние события",
+        "📋 Журнал",
         rich_table(rows, headers=("Время", "Событие")),
     )
 

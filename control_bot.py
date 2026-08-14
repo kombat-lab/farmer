@@ -87,7 +87,8 @@ def keyboard(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=value) for value in row] for row in rows],
         resize_keyboard=True,
-        is_persistent=True,
+        one_time_keyboard=True,
+        is_persistent=False,
         input_field_placeholder="Выберите действие",
     )
 

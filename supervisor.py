@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from pathlib import Path
 
 from auto_buff import AutoBuff
@@ -59,13 +60,23 @@ class FarmerSupervisor:
             return True, "Фармер запущен."
 
     async def _runner(self):
+        crashed = False
         try:
             assert self.farmer is not None
             await self.farmer.run()
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            crashed = True
             logger.exception("Критическая ошибка фармера")
+            failed_farmer = self.farmer
+            if failed_farmer is not None and failed_farmer.running:
+                try:
+                    await failed_farmer.stop(
+                        f"аварийное завершение: {type(error).__name__}: {error}"
+                    )
+                except Exception:
+                    logger.exception("Не удалось корректно завершить аварийную сессию фармера")
             await self.storage.update_state(
                 process_status="ERROR",
                 game_state="ERROR",
@@ -94,20 +105,21 @@ class FarmerSupervisor:
             self.session_lease.release()
 
             try:
-                if reason.startswith("завершены все циклы"):
-                    await self.notifier.send_event(
-                        "✅ Фарм завершён",
-                        rows=[
-                            ("Циклов выполнено", completed_cycles or "—"),
-                            ("Перемещений", total_moves or 0),
-                            ("Причина", "все запланированные циклы завершены"),
-                        ],
-                    )
-                else:
-                    await self.notifier.send_event(
-                        "⏹ Фармер остановлен",
-                        rows=[("Причина", reason)],
-                    )
+                if not crashed:
+                    if reason.startswith("завершены все циклы"):
+                        await self.notifier.send_event(
+                            "✅ Фарм завершён",
+                            rows=[
+                                ("Циклов выполнено", completed_cycles or "—"),
+                                ("Перемещений", total_moves or 0),
+                                ("Причина", "все запланированные циклы завершены"),
+                            ],
+                        )
+                    else:
+                        await self.notifier.send_event(
+                            "⏹ Фармер остановлен",
+                            rows=[("Причина", reason)],
+                        )
             except Exception:
                 logger.exception("Не удалось обновить клавиатуру после остановки")
 
@@ -133,6 +145,8 @@ class FarmerSupervisor:
                     await asyncio.wait_for(self.task, timeout=15)
                 except TimeoutError:
                     self.task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self.task
             return True, "Фармер остановлен."
 
     async def restart(self):

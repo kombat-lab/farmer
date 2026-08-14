@@ -21,7 +21,6 @@ from config import (
     DATA_RETENTION_DAYS,
     DEATH_RECOVERY_MAX_WAIT,
     DEATH_RECOVERY_MIN_WAIT,
-    DEATH_RECOVERY_RECHECK_INTERVAL,
     GAME_BOT,
     GENERAL_PROGRESS_TIMEOUT,
     LOG_BACKUP_COUNT,
@@ -39,8 +38,12 @@ from config import (
     MOVE_PROGRESS_TIMEOUT,
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
-    STATE_HISTORY_LIMIT,
     TARGET_SELECTION_TIMEOUT,
+    TELEGRAM_ACTION_LIMIT,
+    TELEGRAM_ACTION_MIN_INTERVAL,
+    TELEGRAM_ACTION_WINDOW,
+    TELEGRAM_RECOVERY_LIMIT,
+    TELEGRAM_RECOVERY_WINDOW,
     WATCHDOG_CHECK_INTERVAL,
 )
 from logger_setup import setup_logging
@@ -65,6 +68,12 @@ from skills import choose_skill, parse_current_mana
 from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
+from telegram_safety import (
+    RollingAttemptGuard,
+    StateRefreshGate,
+    TelegramActionLimiter,
+    message_state_key,
+)
 from watchdog import ProgressWatchdog
 
 logger = setup_logging(
@@ -129,12 +138,14 @@ class Farmer:
         self.watchdog_task: asyncio.Task | None = None
         self.recovery_task: asyncio.Task | None = None
         self.recovery_started_at: float | None = None
+        self.recovery_refresh_requested = False
         self.pause_requested = False
         self.current_cycle = 1
         self.moves_in_cycle = 0
         self.rest_task: asyncio.Task | None = None
         self.progress_persist_task: asyncio.Task | None = None
         self.pending_progress_reason: str | None = None
+        self.intentional_waits = 0
 
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
@@ -146,6 +157,17 @@ class Farmer:
         self.callback_timeout_count = 0
         self.attempted_action_keys: set[tuple] = set()
         self.attempted_action_order: deque[tuple] = deque(maxlen=PROCESSED_EVENT_CACHE_SIZE)
+        self.inbound_generation = 0
+        self.state_refresh_gate = StateRefreshGate()
+        self.recovery_attempt_guard = RollingAttemptGuard(
+            max_attempts=TELEGRAM_RECOVERY_LIMIT,
+            window_seconds=TELEGRAM_RECOVERY_WINDOW,
+        )
+        self.telegram_action_limiter = TelegramActionLimiter(
+            min_interval=TELEGRAM_ACTION_MIN_INTERVAL,
+            max_actions=TELEGRAM_ACTION_LIMIT,
+            window_seconds=TELEGRAM_ACTION_WINDOW,
+        )
 
         self.blessing_refreshed_at: float | None = None
         self.blessing_next_attempt_at = 0.0
@@ -213,13 +235,7 @@ class Farmer:
 
     @staticmethod
     def event_key(message) -> tuple:
-        edit_timestamp = message.edit_date.timestamp() if message.edit_date else None
-        return (
-            message.id,
-            edit_timestamp,
-            message.raw_text or "",
-            tuple(get_button_texts(message)),
-        )
+        return message_state_key(message)
 
     def cache_latest_message(self, message) -> bool:
         """Stores an inbound update and rejects older revisions of the same message."""
@@ -235,12 +251,17 @@ class Farmer:
             self.latest_messages.pop(oldest_id, None)
 
         self.latest_messages[message.id] = message
-        self.latest_received_message = message
         return True
 
     def is_latest_message(self, message) -> bool:
-        latest = self.latest_messages.get(message.id)
-        return latest is not None and self.event_key(latest) == self.event_key(message)
+        latest_for_id = self.latest_messages.get(message.id)
+        latest_global = self.latest_received_message
+        return (
+            latest_for_id is not None
+            and latest_global is not None
+            and self.event_key(latest_for_id) == self.event_key(message)
+            and self.event_key(latest_global) == self.event_key(message)
+        )
 
     def remember_event(self, message) -> bool:
         key = self.event_key(message)
@@ -259,22 +280,25 @@ class Farmer:
     async def enqueue_message(
         self,
         message,
-        *,
-        force: bool = False,
     ) -> None:
         if not self.running:
             return
 
         is_latest = self.cache_latest_message(message)
-        if not force and not is_latest:
+        if not is_latest:
             return
 
-        # Forced startup/recovery messages bypass the duplicate rejection, but
-        # are still remembered. Live recovery must never replay them forever.
-        if force:
-            self.remember_event(message)
-        elif not self.remember_event(message):
+        is_new_state = self.remember_event(message)
+        if not is_new_state:
+            if (
+                self.latest_received_message is not None
+                and self.latest_received_message.id == message.id
+                and self.event_key(self.latest_received_message) == self.event_key(message)
+            ):
+                self.latest_received_message = message
             return
+        self.latest_received_message = message
+        self.inbound_generation += 1
 
         try:
             self.event_queue.put_nowait(message)
@@ -329,6 +353,14 @@ class Farmer:
         minimum, maximum = ranges[action_type]
         return random.uniform(minimum, maximum)
 
+    async def intentional_sleep(self, seconds: float) -> None:
+        """Marks configured human-like waits so watchdog does not recover over them."""
+        self.intentional_waits += 1
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            self.intentional_waits -= 1
+
     async def stop_for_flood_wait(self, error: FloodWaitError, action: str) -> None:
         seconds = max(1, int(error.seconds))
         reason = f"Telegram FLOOD_WAIT на {seconds} сек. при действии: {action}"
@@ -370,6 +402,14 @@ class Farmer:
                 "новое состояние. Фармер остановлен вместо повторного запроса."
             )
             await self.stop(reason)
+            return False
+
+        limiter_delay = await self.telegram_action_limiter.acquire()
+        if limiter_delay >= 0.05:
+            self.log(f"Защитный лимит Telegram добавил {limiter_delay:.1f} сек. перед действием.")
+
+        if not self.running or not self.is_latest_message(message):
+            self.log(f"Отменено устаревшее действие: {description}")
             return False
 
         if len(self.attempted_action_order) == self.attempted_action_order.maxlen:
@@ -425,7 +465,7 @@ class Farmer:
         delay = self.action_delay(action_type)
 
         self.log(f"Ожидание {delay:.1f} сек. перед действием: {description}")
-        await asyncio.sleep(delay)
+        await self.intentional_sleep(delay)
 
         if not self.running:
             return False
@@ -827,12 +867,24 @@ class Farmer:
                 self.settings.values.long_pause_min,
                 self.settings.values.long_pause_max,
             )
-            await asyncio.sleep(pause)
+            await self.intentional_sleep(pause)
 
         if await self.try_refresh_blessing_from_map(message):
             return
 
-        if map_info.found_target is not None:
+        if (
+            map_info.found_target is not None
+            and self.context.checked_empty_position == map_info.position
+        ):
+            self.log(
+                f"Цель «{map_info.found_target}» на клетке {map_info.position} "
+                "уже исчезала или была занята; повторное нападение пропущено."
+            )
+
+        if (
+            map_info.found_target is not None
+            and self.context.checked_empty_position != map_info.position
+        ):
             self.context.active_target = map_info.found_target
             self.context.checking_hidden_monsters = False
             self.context.checked_empty_position = None
@@ -967,9 +1019,10 @@ class Farmer:
             found > 0 and occupied >= found for found, occupied in target_counts.values()
         )
 
-        if self.context.current_position is not None and (
-            self.context.checking_hidden_monsters or all_matching_targets_are_occupied
-        ):
+        # The full target list is already available in this inbound message.
+        # If no free configured target was selected, reopening the same list
+        # cannot reveal more data and can only create a request loop.
+        if self.context.current_position is not None:
             self.context.checked_empty_position = self.context.current_position
 
             if all_matching_targets_are_occupied:
@@ -1019,7 +1072,7 @@ class Farmer:
 
         delay = self.action_delay(ActionType.SELECT_TARGET)
         self.log(f"Ожидание {delay:.1f} сек. перед выбором боевой цели: {target_name}")
-        await asyncio.sleep(delay)
+        await self.intentional_sleep(delay)
 
         if not self.running:
             return
@@ -1125,6 +1178,7 @@ class Farmer:
 
         self.state = BotState.RECOVERY
         self.recovery_started_at = time.monotonic()
+        self.recovery_refresh_requested = False
         await self.storage.add_event(
             "PLAYER_DEFEATED",
             f"Поражение от {target_name}; ожидание восстановления HP",
@@ -1143,15 +1197,33 @@ class Farmer:
     async def death_recovery_loop(self) -> None:
         await asyncio.sleep(DEATH_RECOVERY_MIN_WAIT)
 
-        while self.running and self.state is BotState.RECOVERY:
-            elapsed = time.monotonic() - (self.recovery_started_at or time.monotonic())
+        if not self.running or self.state is not BotState.RECOVERY:
+            return
 
-            if elapsed > DEATH_RECOVERY_MAX_WAIT:
-                await self.stop("HP не восстановилось за предельное время")
-                return
+        # HP notifications are parsed locally. If the threshold was reached
+        # during the mandatory pause, exactly one fresh map is requested now.
+        await self.maybe_request_recovery_map()
 
-            await self.request_map_refresh()
-            await asyncio.sleep(DEATH_RECOVERY_RECHECK_INTERVAL)
+        remaining = max(0, DEATH_RECOVERY_MAX_WAIT - DEATH_RECOVERY_MIN_WAIT)
+        await asyncio.sleep(remaining)
+        if self.running and self.state is BotState.RECOVERY:
+            await self.stop("HP не восстановилось за предельное время")
+
+    async def maybe_request_recovery_map(self) -> bool:
+        if self.state is not BotState.RECOVERY or self.recovery_refresh_requested:
+            return False
+
+        elapsed = time.monotonic() - (self.recovery_started_at or time.monotonic())
+        current_hp = self.context.current_hp or 0
+        if elapsed < DEATH_RECOVERY_MIN_WAIT or current_hp < MIN_HP_AFTER_DEATH:
+            return False
+
+        self.recovery_refresh_requested = True
+        self.log(f"HP восстановлено до {current_hp}; запрашиваю карту один раз.")
+        requested = await self.request_map_refresh()
+        if not requested and self.state is BotState.RECOVERY:
+            self.recovery_refresh_requested = False
+        return requested
 
     async def handle_recovery_map(
         self,
@@ -1174,6 +1246,7 @@ class Farmer:
         if current_hp >= MIN_HP_AFTER_DEATH:
             self.state = BotState.MAP
             self.recovery_started_at = None
+            self.recovery_refresh_requested = False
             self.mark_progress("здоровье восстановлено")
             await self.storage.add_event(
                 "RECOVERY_FINISHED",
@@ -1188,6 +1261,10 @@ class Farmer:
                 self.recovery_task = None
 
             await self.handle_map(message, message.raw_text or "")
+        else:
+            # The map can be newer than the preceding HP notification. Wait
+            # for another inbound health update instead of polling Telegram.
+            self.recovery_refresh_requested = False
 
     async def handle_target_gone(self) -> None:
         """Штатно восстанавливает карту, если выбранный моб уже исчез."""
@@ -1212,10 +1289,18 @@ class Farmer:
 
         await self.request_map_refresh()
 
-    async def request_map_refresh(self) -> None:
-        # The latest inbound message is already in memory. Reading 20 history
-        # items before every refresh used two or three RPC calls for an action
-        # that only needs one.
+    async def request_map_refresh(self) -> bool:
+        if not self.event_queue.empty():
+            self.log("Запрос карты не нужен: входящее состояние уже ждёт локального разбора.")
+            return False
+
+        # One semantic inbound state may cause several local recovery paths.
+        # Only the first of them is allowed to reach Telegram.
+        generation = self.inbound_generation
+        if not self.state_refresh_gate.reserve(generation):
+            self.log("Повторный запрос карты для того же состояния подавлен.")
+            return False
+
         message = self.latest_received_message
         if message is not None and self.is_latest_message(message):
             if (
@@ -1225,55 +1310,49 @@ class Farmer:
                 )
                 is not None
             ):
-                await self.click_button(
+                return await self.click_button(
                     message,
                     exact=LOOK_BUTTON,
                     action_type=ActionType.OPEN_ATTACK,
                     description=LOOK_BUTTON,
                 )
-                return
 
         try:
+            limiter_delay = await self.telegram_action_limiter.acquire()
+            if limiter_delay >= 0.05:
+                self.log(
+                    f"Защитный лимит Telegram добавил "
+                    f"{limiter_delay:.1f} сек. перед запросом карты."
+                )
+            if not self.running or self.inbound_generation != generation:
+                self.log("Запрос карты отменён: уже получено новое состояние.")
+                return False
             await self.client.send_message(
                 self.game_bot,
                 MAP_COMMAND,
             )
+            return True
         except FloodWaitError as error:
             await self.stop_for_flood_wait(error, MAP_COMMAND)
-
-    async def restore_from_message(self, message) -> bool:
-        """Restores state from an already available message without an RPC read."""
-        kind = classify_message(
-            message.raw_text or "",
-            self.settings.values.enabled_targets,
-            CHARACTER_NAME,
-        )
-
-        recoverable = {
-            MessageKind.TARGET_GONE,
-            MessageKind.PLAYER_TURN,
-            MessageKind.COMBAT_TARGET_SELECTION,
-            MessageKind.COMBAT_STARTED,
-            MessageKind.TARGET_SELECTION,
-            MessageKind.MAP,
-            MessageKind.BATTLE_FINISHED,
-        }
-        if kind in recoverable:
-            self.statistics.record_successful_recovery()
-            await self.enqueue_message(message, force=True)
-            return True
-
-        if kind is MessageKind.MOVE_STARTED:
-            self.statistics.record_successful_recovery()
-            await self.request_map_refresh()
-            return True
-
-        return False
+            return False
 
     async def recover_latest_state(
         self,
         reason: str,
     ) -> None:
+        if not self.event_queue.empty():
+            self.log(
+                f"Восстановление «{reason}» не требуется: новое состояние уже в локальной очереди."
+            )
+            return
+
+        if not self.recovery_attempt_guard.allow():
+            await self.stop(
+                f"более {TELEGRAM_RECOVERY_LIMIT} аварийных восстановлений "
+                f"за {int(TELEGRAM_RECOVERY_WINDOW // 60)} минут; остановлено для защиты от флуда"
+            )
+            return
+
         attempt = self.watchdog.begin_recovery_attempt()
         self.statistics.record_recovery_attempt()
 
@@ -1283,24 +1362,8 @@ class Farmer:
             await self.stop(f"исчерпаны попытки восстановления: {reason}")
             return
 
-        try:
-            messages = await self.client.get_messages(
-                self.game_bot,
-                limit=1,
-            )
-        except FloodWaitError as error:
-            await self.stop_for_flood_wait(error, "восстановление истории")
-            return
-
-        # Replaying an already handled inline screen can repeat the exact same
-        # decision forever. Restore only a genuinely unseen newest revision;
-        # older history is useful at startup, but unsafe during live recovery.
-        for message in messages:
-            if self.event_key(message) in self.processed_event_keys:
-                continue
-            if await self.restore_from_message(message):
-                return
-
+        # Telethon already delivered the newest state to the local cache.
+        # Reading history here adds an RPC and risks replaying an old inline UI.
         await self.request_map_refresh()
 
     async def watchdog_loop(self) -> None:
@@ -1316,7 +1379,13 @@ class Farmer:
                 BotState.PAUSED,
                 BotState.RESTING,
                 BotState.WAITING_FOR_HEALTH,
+                BotState.RECOVERY,
             }:
+                continue
+
+            # A deliberate safety delay is not a stalled game state. Starting
+            # recovery here would add a second request behind the limiter.
+            if self.intentional_waits or self.telegram_action_limiter.pending:
                 continue
 
             should_recover = self.watchdog.should_recover(
@@ -1346,11 +1415,6 @@ class Farmer:
                 "Пробую восстановить состояние без уведомления."
             )
 
-            if self.state is BotState.RECOVERY:
-                await self.request_map_refresh()
-                self.mark_progress("watchdog обновил карту в восстановлении")
-                continue
-
             await self.recover_latest_state(
                 f"watchdog: нет прогресса в состоянии {self.state.name}"
             )
@@ -1360,7 +1424,7 @@ class Farmer:
             return
 
         text = message.raw_text or ""
-        self.update_hp(text)
+        hp_changed = self.update_hp(text)
         self.confirm_blessing_from_text(text)
 
         kind = classify_message(
@@ -1368,6 +1432,11 @@ class Farmer:
             self.settings.values.enabled_targets,
             CHARACTER_NAME,
         )
+
+        if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
+            await self.maybe_request_recovery_map()
+        if self.state is BotState.RECOVERY and kind is MessageKind.OTHER:
+            return
 
         if self.state is BotState.WAITING_FOR_HEALTH:
             active_battle_kinds = {
@@ -1511,64 +1580,10 @@ class Farmer:
                 return
 
     async def process_latest_state(self) -> None:
-        messages = await self.client.get_messages(
-            self.game_bot,
-            limit=STATE_HISTORY_LIMIT,
-        )
-
-        parsed_maps = [
-            map_info
-            for message in messages
-            if (
-                map_info := parse_map(
-                    message.raw_text or "",
-                    self.settings.values.enabled_targets,
-                    CHARACTER_NAME,
-                )
-            )
-            is not None
-        ]
-        latest_map = parsed_maps[0] if parsed_maps else None
-        latest_location = latest_map.location_name if latest_map else None
-        if latest_location:
-            self.navigator.use_location(latest_location)
-
-        map_history: list[tuple[int, int]] = []
-        for map_info in reversed(parsed_maps):
-            if latest_location and map_info.location_name != latest_location:
-                continue
-            if not map_history or map_history[-1] != map_info.position:
-                map_history.append(map_info.position)
-
-        self.navigator.initialize_from_history(map_history)
-
-        for message in messages:
-            kind = classify_message(
-                message.raw_text or "",
-                self.settings.values.enabled_targets,
-                CHARACTER_NAME,
-            )
-
-            if kind in {
-                MessageKind.PLAYER_TURN,
-                MessageKind.COMBAT_TARGET_SELECTION,
-                MessageKind.COMBAT_STARTED,
-                MessageKind.TARGET_SELECTION,
-                MessageKind.MAP,
-                MessageKind.BATTLE_FINISHED,
-                MessageKind.TARGET_GONE,
-            }:
-                self.statistics.record_startup_state_recovery()
-                await self.enqueue_message(message, force=True)
-                return
-
-            if kind is MessageKind.MOVE_STARTED:
-                self.statistics.record_startup_state_recovery()
-                self.state = BotState.MOVING
-                self.mark_progress("запуск во время перемещения")
-                return
-
-        self.mark_progress("при синхронизации запрошено обновление карты")
+        # Historical inline messages may belong to an old location or an
+        # already completed turn. One fresh map command is both cheaper than a
+        # history read plus an action and safer than replaying stale buttons.
+        self.mark_progress("при запуске запрошено свежее состояние")
         await self.request_map_refresh()
 
     async def stop(self, reason: str) -> None:
@@ -1658,14 +1673,18 @@ class Farmer:
         )
 
         await self.client.start()
-        self.game_bot = await self.client.get_entity(GAME_BOT)
-        me = await self.client.get_me()
+        # Uses the Telethon entity cache and avoids fetching the full entity on
+        # every restart once the peer is known to the session.
+        self.game_bot = await self.client.get_input_entity(GAME_BOT)
 
         logger.info("=" * 72)
         logger.info("FoG Farmer запущен")
+        logger.info("Telegram-сессия подключена")
         logger.info(
-            "Telegram-аккаунт: %s",
-            me.first_name or "без имени",
+            "Telegram-предохранитель: не более %s действий за %s сек., интервал не менее %.1f сек.",
+            TELEGRAM_ACTION_LIMIT,
+            int(TELEGRAM_ACTION_WINDOW),
+            TELEGRAM_ACTION_MIN_INTERVAL,
         )
         logger.info("Персонаж: %s", CHARACTER_NAME)
         logger.info("Цели: %s", self.settings.values.enabled_targets)
@@ -1688,10 +1707,14 @@ class Farmer:
 
         @self.client.on(events.NewMessage(chats=self.game_bot))
         async def on_new_message(event) -> None:
+            if event.message.out:
+                return
             await self.enqueue_message(event.message)
 
         @self.client.on(events.MessageEdited(chats=self.game_bot))
         async def on_edited_message(event) -> None:
+            if event.message.out:
+                return
             await self.enqueue_message(event.message)
 
         self.worker_task = asyncio.create_task(self.event_worker())

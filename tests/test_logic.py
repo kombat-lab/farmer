@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,6 +11,13 @@ from parser import classify_message, parse_map
 from rewards import BattleReward, parse_item_stack
 from skills import HEALING_MANA_RESERVE, choose_skill
 from storage import Storage
+from telegram_safety import (
+    RollingAttemptGuard,
+    StateRefreshGate,
+    TelegramActionLimiter,
+    message_revision_key,
+    message_state_key,
+)
 
 CHARACTER = "Kombat"
 TARGETS = ["Черная мушка"]
@@ -21,7 +29,16 @@ class FakeButton:
 
 
 class FakeMessage:
-    def __init__(self, text: str, buttons: list[list[str]]) -> None:
+    def __init__(
+        self,
+        text: str,
+        buttons: list[list[str]],
+        *,
+        message_id: int = 1,
+        edit_date: datetime | None = None,
+    ) -> None:
+        self.id = message_id
+        self.edit_date = edit_date
         self.raw_text = text
         self.buttons = [[FakeButton(button) for button in row] for row in buttons]
 
@@ -113,6 +130,68 @@ class MovementRecoveryTests(unittest.TestCase):
 
         self.assertEqual(len(buttons), len(set(buttons)))
         self.assertTrue(exhausted)
+
+
+class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_noop_edit_has_same_semantic_state(self) -> None:
+        first = FakeMessage(
+            "Ход игрока",
+            [["Атака"]],
+            edit_date=datetime(2026, 8, 15, tzinfo=UTC),
+        )
+        second = FakeMessage(
+            "Ход игрока",
+            [["Атака"]],
+            edit_date=datetime(2026, 8, 15, tzinfo=UTC) + timedelta(seconds=1),
+        )
+
+        self.assertEqual(message_state_key(first), message_state_key(second))
+        self.assertNotEqual(message_revision_key(first), message_revision_key(second))
+
+    def test_state_refresh_is_reserved_once_per_inbound_generation(self) -> None:
+        gate = StateRefreshGate()
+        self.assertTrue(gate.reserve(7))
+        self.assertFalse(gate.reserve(7))
+        self.assertTrue(gate.reserve(8))
+
+    def test_recovery_attempts_are_bounded_in_a_rolling_window(self) -> None:
+        now = 0.0
+        guard = RollingAttemptGuard(
+            max_attempts=3,
+            window_seconds=600.0,
+            clock=lambda: now,
+        )
+
+        self.assertTrue(guard.allow())
+        self.assertTrue(guard.allow())
+        self.assertTrue(guard.allow())
+        self.assertFalse(guard.allow())
+        now = 601.0
+        self.assertTrue(guard.allow())
+
+    async def test_action_limiter_serializes_and_caps_a_window(self) -> None:
+        now = 0.0
+
+        def clock() -> float:
+            return now
+
+        async def sleep(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        limiter = TelegramActionLimiter(
+            min_interval=1.0,
+            max_actions=2,
+            window_seconds=10.0,
+            clock=clock,
+            sleep=sleep,
+        )
+
+        self.assertEqual(await limiter.acquire(), 0.0)
+        self.assertEqual(await limiter.acquire(), 1.0)
+        self.assertEqual(await limiter.acquire(), 9.0)
+        self.assertEqual(now, 10.0)
+        self.assertFalse(limiter.pending)
 
 
 class RewardTests(unittest.TestCase):

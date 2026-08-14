@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import RPCError
@@ -20,6 +21,7 @@ from parser import (
     extract_player_hp,
     parse_map,
 )
+from session_lock import SessionLease
 
 
 def format_date(value) -> str:
@@ -129,6 +131,10 @@ def validate_config() -> None:
 
 async def main() -> None:
     validate_config()
+    session_lease = SessionLease(Path(f"{SESSION_NAME}.lock"))
+    if not session_lease.acquire():
+        print("Фармер уже использует Telethon-сессию. Сначала остановите фармер.")
+        return
 
     client = TelegramClient(
         SESSION_NAME,
@@ -185,6 +191,7 @@ async def main() -> None:
     finally:
         if client.is_connected():
             await client.disconnect()
+        session_lease.release()
 
 
 if __name__ == "__main__":

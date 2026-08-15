@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -319,16 +320,27 @@ class Storage:
             return dict(row) if row else {}
 
     async def set_setting(self, key: str, value) -> None:
+        await self.set_settings({key: value})
+
+    async def set_settings(self, values: dict) -> None:
+        if not values:
+            return
+        updated_at = utc_now()
+        rows = [
+            (key, json.dumps(value, ensure_ascii=False), updated_at)
+            for key, value in values.items()
+        ]
         async with self.lock:
-            self.connection.execute(
+            self.connection.executemany(
                 """
                 INSERT INTO settings(key,value_json,updated_at)
                 VALUES (?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
                     value_json=excluded.value_json,
                     updated_at=excluded.updated_at
+                WHERE settings.value_json != excluded.value_json
             """,
-                (key, json.dumps(value, ensure_ascii=False), utc_now()),
+                rows,
             )
             self.connection.commit()
 
@@ -337,10 +349,8 @@ class Storage:
             rows = self.connection.execute("SELECT key,value_json FROM settings").fetchall()
             result = {}
             for row in rows:
-                try:
+                with suppress(json.JSONDecodeError):
                     result[row["key"]] = json.loads(row["value_json"])
-                except json.JSONDecodeError:
-                    pass
             return result
 
     async def get_setting(self, key: str, default=None):
@@ -532,7 +542,7 @@ class Storage:
             ).fetchone()
         runtime = session.runtime_seconds
         if session.started_at and session.status == "RUNNING":
-            try:
+            with suppress(ValueError):
                 runtime = max(
                     0,
                     int(
@@ -541,8 +551,6 @@ class Storage:
                         ).total_seconds()
                     ),
                 )
-            except ValueError:
-                pass
         return {
             "session": session,
             "battle": battle,

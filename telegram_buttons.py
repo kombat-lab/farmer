@@ -1,17 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Protocol
-
 from models import ButtonPosition
 from parser import normalize
-
-
-class ButtonLike(Protocol):
-    text: str
-
-
-ButtonRows = Sequence[Sequence[ButtonLike]]
 
 
 def get_button_texts(message) -> list[str]:

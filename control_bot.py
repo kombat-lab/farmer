@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramNetworkError
@@ -38,8 +39,7 @@ SETTINGS_ROWS = [
     ["↩️ Главное меню"],
 ]
 CHARACTER_ROWS = [
-    ["❤️ Порог лечения", "Максимум маны"],
-    ["Сила лечения"],
+    ["❤️ Порог лечения"],
     ["✨ Благословение"],
     ["↩️ Настройки"],
 ]
@@ -62,7 +62,6 @@ def normalize_button_text(value: str | None) -> str:
     """Нормализует текст кнопок Telegram.
 
     Удаляет variation selector у emoji, неразрывные пробелы и лишние пробелы.
-    Благодаря этому старые клавиатуры с ведущими пробелами тоже продолжают работать.
     """
     if not value:
         return ""
@@ -98,12 +97,11 @@ def location_button(category: str) -> str:
 def category_from_location_button(text: str | None) -> str | None:
     normalized = normalize_button_text(text)
 
-    # Новый формат: «📍 Название».
     marker = normalize_button_text(LOCATION_BUTTON_PREFIX)
-    if normalized.startswith(marker):
-        normalized = normalize_button_text(normalized[len(marker) :])
+    if not normalized.startswith(marker):
+        return None
+    normalized = normalize_button_text(normalized[len(marker) :])
 
-    # Старый формат содержал только ведущий пробел, который Telegram мог удалить.
     for category in TARGET_MONSTER_CATEGORIES:
         if normalize_button_text(category) == normalized:
             return category
@@ -291,7 +289,7 @@ class ControlBot:
             current = await self.supervisor.status()
             await self._send_rich(message, status_rich(current), "Состояние фармера получено.")
 
-        @r.message(StateFilter(None), text_is("Статистика", "Дроп"))
+        @r.message(StateFilter(None), text_is("Статистика"))
         async def stats_handler(message: Message) -> None:
             dashboard = await self.storage.get_statistics_dashboard()
             session = await self.storage.get_current_session()
@@ -302,7 +300,7 @@ class ControlBot:
                 self.storage.format_statistics_text(dashboard),
             )
 
-        @r.message(StateFilter(None), text_is("📋 Журнал", "⚠️ События"))
+        @r.message(StateFilter(None), text_is("📋 Журнал"))
         async def events_handler(message: Message) -> None:
             events_list = await self.storage.get_events(15)
             await self._send_rich(
@@ -393,8 +391,6 @@ class ControlBot:
                 message,
                 "❤️ Параметры персонажа\n\n"
                 f"Порог лечения: {values.heal_threshold} HP и ниже\n"
-                f"Максимум маны: {values.max_mana}\n"
-                f"Лечение: +{values.heal_amount} HP\n"
                 f"Благословение: {'включено' if values.blessing_enabled else 'выключено'}",
                 CHARACTER_ROWS,
             )
@@ -411,21 +407,14 @@ class ControlBot:
                 CHARACTER_ROWS,
             )
 
-        character_fields = {
-            normalize_button_text("❤️ Порог лечения"): ("heal_threshold", "порог лечения"),
-            normalize_button_text("Максимум маны"): ("max_mana", "максимальную ману"),
-            normalize_button_text("Сила лечения"): ("heal_amount", "силу лечения"),
-        }
-
-        @r.message(
-            StateFilter(None),
-            F.text.func(lambda value: normalize_button_text(value) in character_fields),
-        )
+        @r.message(StateFilter(None), text_is("❤️ Порог лечения"))
         async def character_value_prompt(message: Message, state: FSMContext) -> None:
-            key, label = character_fields[normalize_button_text(message.text)]
             await state.set_state(SettingsInput.character_value)
-            await state.update_data(character_key=key, character_label=label)
-            await self._send_text(message, f"Отправьте {label} целым числом.", [[CANCEL_BUTTON]])
+            await self._send_text(
+                message,
+                "Отправьте порог лечения целым числом.",
+                [[CANCEL_BUTTON]],
+            )
 
         @r.message(SettingsInput.character_value)
         async def character_value_input(message: Message, state: FSMContext) -> None:
@@ -441,12 +430,10 @@ class ControlBot:
                     message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]]
                 )
                 return
-            data = await state.get_data()
-            await self.settings.set_value(str(data["character_key"]), value)
+            await self.settings.set_value("heal_threshold", value)
             await state.clear()
             await self._send_text(message, "✅ Параметр сохранён.", CHARACTER_ROWS)
 
-        # Цепочка выбора мобов. Все проверки нормализованы и поддерживают старые кнопки.
         @r.message(StateFilter(None), text_is("Выбор мобов", BACK_TO_LOCATIONS_BUTTON))
         async def locations_handler(message: Message) -> None:
             await self._send_text(
@@ -471,31 +458,13 @@ class ControlBot:
                 get_targets_keyboard(category, self.settings),
             )
 
-        @r.message(
-            StateFilter(None),
-            F.text.func(lambda value: starts_with_normalized(value, TARGETS_ENABLE_ALL_PREFIX)),
-        )
-        async def enable_target_category(message: Message) -> None:
-            category = category_from_toggle_button(message.text)
-            if category is None:
-                await self._send_text(
-                    message,
-                    "Не удалось определить локацию.",
-                    get_locations_keyboard(),
-                )
-                return
-            await self.settings.set_category_enabled(category, True)
-            await self._send_text(
-                message,
-                get_targets_text(category, self.settings),
-                get_targets_keyboard(category, self.settings),
-            )
+        def is_category_toggle(value: str | None) -> bool:
+            return starts_with_normalized(
+                value, TARGETS_ENABLE_ALL_PREFIX
+            ) or starts_with_normalized(value, TARGETS_DISABLE_ALL_PREFIX)
 
-        @r.message(
-            StateFilter(None),
-            F.text.func(lambda value: starts_with_normalized(value, TARGETS_DISABLE_ALL_PREFIX)),
-        )
-        async def disable_target_category(message: Message) -> None:
+        @r.message(StateFilter(None), F.text.func(is_category_toggle))
+        async def toggle_target_category(message: Message) -> None:
             category = category_from_toggle_button(message.text)
             if category is None:
                 await self._send_text(
@@ -504,7 +473,8 @@ class ControlBot:
                     get_locations_keyboard(),
                 )
                 return
-            await self.settings.set_category_enabled(category, False)
+            enabled = starts_with_normalized(message.text, TARGETS_ENABLE_ALL_PREFIX)
+            await self.settings.set_category_enabled(category, enabled)
             await self._send_text(
                 message,
                 get_targets_text(category, self.settings),
@@ -643,8 +613,6 @@ class ControlBot:
         if self.polling_task is None:
             return
         await self.dispatcher.stop_polling()
-        try:
+        with suppress(asyncio.CancelledError):
             await self.polling_task
-        except asyncio.CancelledError:
-            pass
         self.polling_task = None

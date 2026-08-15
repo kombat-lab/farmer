@@ -1,38 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-from weakref import WeakSet
-
 from models import MovePlan, Position, RouteDirection
-
-_active_location_name: str | None = None
-_instances: WeakSet[SnakeNavigator] = WeakSet()
-
-
-def activate_location(location_name: str | None) -> None:
-    """Переключает все навигаторы на геометрию карты из сообщения."""
-    global _active_location_name
-
-    if not location_name or location_name == _active_location_name:
-        return
-
-    _active_location_name = location_name
-
-    for navigator in tuple(_instances):
-        navigator.use_location(location_name)
-
-
-def report_blocked_transition(current_position: Position) -> None:
-    """
-    Сообщает навигатору, что последний переход был отклонён игрой.
-
-    Вызывается parser.py при статусе «Туда пройти нельзя».
-    """
-    for navigator in tuple(_instances):
-        navigator.reject_last_plan(
-            current_position,
-            mark_destination_blocked=True,
-        )
 
 
 class SnakeNavigator:
@@ -68,12 +36,6 @@ class SnakeNavigator:
         min_y: int,
         max_y: int,
     ) -> None:
-        self.default_bounds = (
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-        )
         self.direction = RouteDirection.DOWN
         self.route_index = 0
         self.last_plan: MovePlan | None = None
@@ -83,25 +45,20 @@ class SnakeNavigator:
         # Кнопки, которые уже оставили персонажа на той же координате.
         self.failed_buttons: dict[Position, set[str]] = {}
 
-        _instances.add(self)
-
-        if _active_location_name:
-            self.use_location(_active_location_name)
-        else:
-            self._configure(
-                min_x=min_x,
-                max_x=max_x,
-                min_y=min_y,
-                max_y=max_y,
-                start_position=(max_x, min_y),
-                blocked_cells=frozenset(),
-                obstacle_mode=False,
-            )
+        self._configure(
+            min_x=min_x,
+            max_x=max_x,
+            min_y=min_y,
+            max_y=max_y,
+            start_position=(max_x, min_y),
+            blocked_cells=frozenset(),
+            obstacle_mode=False,
+        )
 
     def use_location(self, location_name: str) -> None:
-        from locations import get_location
+        from locations import get_location_geometry
 
-        location = get_location(location_name)
+        geometry = get_location_geometry(location_name)
 
         self.location_name = location_name
         self.runtime_blocked.clear()
@@ -110,13 +67,13 @@ class SnakeNavigator:
         self.last_plan = None
 
         self._configure(
-            min_x=location.min_x,
-            max_x=location.max_x,
-            min_y=location.min_y,
-            max_y=location.max_y,
-            start_position=location.start_position,
-            blocked_cells=location.blocked_cells,
-            obstacle_mode=bool(location.blocked_cells),
+            min_x=geometry.min_x,
+            max_x=geometry.max_x,
+            min_y=geometry.min_y,
+            max_y=geometry.max_y,
+            start_position=geometry.start_position,
+            blocked_cells=geometry.blocked_cells,
+            obstacle_mode=bool(geometry.blocked_cells),
         )
 
     def _configure(
@@ -293,40 +250,6 @@ class SnakeNavigator:
     ) -> None:
         if position not in self.position_to_indices:
             raise ValueError(f"Координаты {position} отсутствуют в маршруте.")
-
-    def initialize_from_history(
-        self,
-        positions: Iterable[Position],
-    ) -> RouteDirection:
-        history = [position for position in positions if position in self.position_to_indices]
-
-        if not history:
-            self.direction = RouteDirection.DOWN
-            return self.direction
-
-        self.route_index = self._nearest_index(history[-1])
-
-        for previous, current in reversed(list(zip(history, history[1:], strict=False))):
-            previous_indices = self.position_to_indices[previous]
-            current_indices = self.position_to_indices[current]
-
-            for previous_index in previous_indices:
-                if previous_index + 1 in current_indices:
-                    self.route_index = previous_index + 1
-                    self.direction = RouteDirection.DOWN
-                    return self.direction
-
-                if previous_index - 1 in current_indices:
-                    self.route_index = previous_index - 1
-                    self.direction = RouteDirection.UP
-                    return self.direction
-
-        if self.route_index == len(self.route) - 1:
-            self.direction = RouteDirection.UP
-        elif self.route_index == 0:
-            self.direction = RouteDirection.DOWN
-
-        return self.direction
 
     @staticmethod
     def _primary_button_between(
@@ -619,11 +542,3 @@ class SnakeNavigator:
             None,
         )
         return True
-
-    @property
-    def start_position(self) -> Position:
-        return self.route[0]
-
-    @property
-    def end_position(self) -> Position:
-        return self.route[-1]

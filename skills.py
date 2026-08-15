@@ -98,10 +98,6 @@ def available_skills(message) -> dict[str, SkillButton]:
     return result
 
 
-def available_skill_names(message) -> set[str]:
-    return set(available_skills(message))
-
-
 def should_use_healing(
     *,
     current_hp: int | None,

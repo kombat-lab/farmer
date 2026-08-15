@@ -5,7 +5,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from blessing import BlessingManager
 from config import DEFAULT_HEAL_THRESHOLD
+from event_cache import BoundedKeyCache
 from models import RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, parse_map
@@ -196,6 +198,49 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(limiter.pending)
 
 
+class SharedComponentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blessing_flow_uses_single_manager(self) -> None:
+        manager = BlessingManager()
+        actions: list[str] = []
+
+        async def click_button(message, **kwargs) -> bool:
+            actions.append(str(kwargs["description"]))
+            return True
+
+        opened = await manager.try_open_from_map(
+            object(),
+            click_button=click_button,
+            log=lambda text: None,
+            mark_progress=lambda text: None,
+        )
+        handled = await manager.handle_menu(
+            object(),
+            find_button=lambda message, **kwargs: (0, 0),
+            click_button=click_button,
+            mark_progress=lambda text: None,
+        )
+        confirmed = manager.confirm_from_text(
+            "Благословение: +5 ко всем характеристикам на 30 мин",
+            log=lambda text: None,
+            mark_progress=lambda text: None,
+        )
+
+        self.assertTrue(opened)
+        self.assertTrue(handled)
+        self.assertTrue(confirmed)
+        self.assertEqual(actions, ["Небоевые навыки", "Благословение"])
+        self.assertFalse(manager.refresh_in_progress)
+
+    async def test_bounded_cache_evicts_oldest_key(self) -> None:
+        cache = BoundedKeyCache(max_size=2)
+        self.assertTrue(cache.remember((1,)))
+        self.assertTrue(cache.remember((2,)))
+        self.assertFalse(cache.remember((2,)))
+        self.assertTrue(cache.remember((3,)))
+        self.assertNotIn((1,), cache)
+        self.assertIn((2,), cache)
+
+
 class RewardTests(unittest.TestCase):
     def test_item_stack_suffix_is_parsed(self) -> None:
         self.assertEqual(parse_item_stack("Золотой хитин x3"), ("Золотой хитин", 3))
@@ -226,15 +271,18 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             )
             await storage.close()
 
-    async def test_legacy_setting_is_not_migrated_on_load(self) -> None:
+    async def test_unknown_setting_is_ignored_without_extra_writes(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
-            await storage.set_setting("max_hp", 610)
+            await storage.set_setting("removed_setting", 610)
             settings = SettingsService(storage)
 
             await settings.load()
 
             self.assertEqual(settings.values.heal_threshold, DEFAULT_HEAL_THRESHOLD)
+            changes_after_first_load = storage.connection.total_changes
+            await settings.load()
+            self.assertEqual(storage.connection.total_changes, changes_after_first_load)
             await storage.close()
 
     async def test_new_session_closes_abandoned_running_sessions(self) -> None:
@@ -274,7 +322,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
 
         stats = FarmStatistics()
         reward = BattleReward(dust=0, xp=0, items=("Осколок x3",))
-        stats.add_victory(1, "Цель", reward)
+        stats.add_victory(1, reward)
         self.assertEqual(stats.session_report().drops, {"Осколок": 3})
 
 

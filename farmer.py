@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections import deque
 from contextlib import suppress
 from pathlib import Path
 from statistics import FarmStatistics, format_report
@@ -12,6 +11,7 @@ from typing import Any
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 
+from blessing import BlessingManager
 from combat_events import parse_combat_round_events
 from config import (
     API_HASH,
@@ -46,6 +46,7 @@ from config import (
     TELEGRAM_RECOVERY_WINDOW,
     WATCHDOG_CHECK_INTERVAL,
 )
+from event_cache import BoundedKeyCache
 from logger_setup import setup_logging
 from models import (
     ActionType,
@@ -95,13 +96,6 @@ PROCESSED_EVENT_CACHE_SIZE = 500
 LATEST_MESSAGE_CACHE_SIZE = 200
 MAX_CALLBACK_TIMEOUTS = 2
 
-BLESSING_REFRESH_INTERVAL = 29 * 60
-BLESSING_RETRY_INTERVAL = 5 * 60
-NON_COMBAT_SKILLS_BUTTON = "Небоевые навыки"
-BLESSING_BUTTON = "Благословение"
-BLESSING_STATUS_MARKER = "благословение: +5 ко всем характеристикам на 30 мин"
-
-
 class Farmer:
     def __init__(self, storage: Storage, notifier: Notifier, settings: SettingsService) -> None:
         self.storage = storage
@@ -125,7 +119,6 @@ class Farmer:
 
         self.context = RuntimeContext()
         self.statistics = FarmStatistics()
-        self.runtime_finalized = False
 
         self.navigator = SnakeNavigator(
             min_x=MAP_MIN_X,
@@ -150,13 +143,11 @@ class Farmer:
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
 
-        self.processed_event_keys: set[tuple] = set()
-        self.processed_event_order: deque[tuple] = deque(maxlen=PROCESSED_EVENT_CACHE_SIZE)
+        self.processed_events = BoundedKeyCache(PROCESSED_EVENT_CACHE_SIZE)
         self.latest_messages: dict[int, Any] = {}
         self.latest_received_message: Any | None = None
         self.callback_timeout_count = 0
-        self.attempted_action_keys: set[tuple] = set()
-        self.attempted_action_order: deque[tuple] = deque(maxlen=PROCESSED_EVENT_CACHE_SIZE)
+        self.attempted_actions = BoundedKeyCache(PROCESSED_EVENT_CACHE_SIZE)
         self.inbound_generation = 0
         self.state_refresh_gate = StateRefreshGate()
         self.recovery_attempt_guard = RollingAttemptGuard(
@@ -169,9 +160,7 @@ class Farmer:
             window_seconds=TELEGRAM_ACTION_WINDOW,
         )
 
-        self.blessing_refreshed_at: float | None = None
-        self.blessing_next_attempt_at = 0.0
-        self.blessing_refresh_in_progress = False
+        self.blessing = BlessingManager()
 
     def log(self, text: str) -> None:
         logger.info("[%s] %s", self.state.name, text)
@@ -230,9 +219,6 @@ class Farmer:
         if not self.settings.values.enabled_targets:
             raise ValueError("Не выбран ни один моб для нападения.")
 
-        if self.settings.values.heal_amount <= 0:
-            raise ValueError("heal_amount должен быть больше нуля.")
-
     @staticmethod
     def event_key(message) -> tuple:
         return message_state_key(message)
@@ -264,18 +250,7 @@ class Farmer:
         )
 
     def remember_event(self, message) -> bool:
-        key = self.event_key(message)
-
-        if key in self.processed_event_keys:
-            return False
-
-        if len(self.processed_event_order) == self.processed_event_order.maxlen:
-            oldest = self.processed_event_order.popleft()
-            self.processed_event_keys.discard(oldest)
-
-        self.processed_event_order.append(key)
-        self.processed_event_keys.add(key)
-        return True
+        return self.processed_events.remember(self.event_key(message))
 
     async def enqueue_message(
         self,
@@ -323,25 +298,6 @@ class Farmer:
             finally:
                 self.event_queue.task_done()
 
-    @staticmethod
-    def get_button_texts(message) -> list[str]:
-        return get_button_texts(message)
-
-    @staticmethod
-    def find_button(
-        message,
-        *,
-        exact: str | None = None,
-        contains: tuple[str, ...] = (),
-        exclude: tuple[str, ...] = (),
-    ):
-        return find_button(
-            message,
-            exact=exact,
-            contains=contains,
-            exclude=exclude,
-        )
-
     def action_delay(self, action_type: ActionType) -> float:
         s = self.settings.values
         ranges = {
@@ -386,7 +342,7 @@ class Farmer:
         description: str,
     ) -> bool:
         action_key = (*self.event_key(message), description)
-        if action_key in self.attempted_action_keys:
+        if action_key in self.attempted_actions:
             reason = (
                 "игра не обновила состояние после inline-действия; "
                 f"повтор «{description}» заблокирован"
@@ -412,11 +368,7 @@ class Farmer:
             self.log(f"Отменено устаревшее действие: {description}")
             return False
 
-        if len(self.attempted_action_order) == self.attempted_action_order.maxlen:
-            oldest = self.attempted_action_order.popleft()
-            self.attempted_action_keys.discard(oldest)
-        self.attempted_action_order.append(action_key)
-        self.attempted_action_keys.add(action_key)
+        self.attempted_actions.remember(action_key)
 
         try:
             await message.click(row, column)
@@ -474,7 +426,7 @@ class Farmer:
             self.log(f"Отменено устаревшее действие: {description}")
             return False
 
-        position = self.find_button(
+        position = find_button(
             message,
             exact=exact,
             contains=contains,
@@ -483,7 +435,7 @@ class Farmer:
         if position is None:
             self.log(
                 f"Кнопка «{description}» больше недоступна. "
-                f"Текущие кнопки: {self.get_button_texts(message)}"
+                f"Текущие кнопки: {get_button_texts(message)}"
             )
             return False
 
@@ -717,44 +669,20 @@ class Farmer:
         )
         await self.process_latest_state()
 
-    def blessing_refresh_due(self) -> bool:
-        if not self.settings.values.blessing_enabled:
-            self.blessing_refresh_in_progress = False
-            return False
-        now = time.monotonic()
-        if self.blessing_refresh_in_progress:
-            return False
-        if now < self.blessing_next_attempt_at:
-            return False
-        if self.blessing_refreshed_at is None:
-            return True
-        return now - self.blessing_refreshed_at >= BLESSING_REFRESH_INTERVAL
-
     async def try_refresh_blessing_from_map(self, message) -> bool:
-        if not self.blessing_refresh_due():
+        if not self.settings.values.blessing_enabled:
+            self.blessing.cancel()
             return False
-
-        clicked = await self.click_button(
+        return await self.blessing.try_open_from_map(
             message,
-            contains=(NON_COMBAT_SKILLS_BUTTON,),
-            action_type=ActionType.OPEN_ATTACK,
-            description=NON_COMBAT_SKILLS_BUTTON,
+            click_button=self.click_button,
+            log=self.log,
+            mark_progress=self.mark_progress,
         )
-        if not clicked:
-            self.blessing_next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
-            self.log("Не удалось открыть небоевые навыки. Повторю попытку через 5 минут.")
-            return False
-
-        self.blessing_refresh_in_progress = True
-        self.blessing_next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
-        self.mark_progress("открыто меню небоевых навыков")
-        return True
 
     async def handle_blessing_menu(self, message) -> bool:
         if not self.settings.values.blessing_enabled:
-            was_in_progress = self.blessing_refresh_in_progress
-            self.blessing_refresh_in_progress = False
-            if was_in_progress:
+            if self.blessing.cancel():
                 returned = await self.click_button(
                     message,
                     exact=BACK_TO_MAP_BUTTON,
@@ -765,42 +693,22 @@ class Farmer:
                     await self.request_map_refresh()
                 return True
             return False
-        if not self.blessing_refresh_in_progress:
-            return False
-
-        position = self.find_button(
+        return await self.blessing.handle_menu(
             message,
-            contains=(BLESSING_BUTTON,),
+            find_button=find_button,
+            click_button=self.click_button,
+            mark_progress=self.mark_progress,
         )
-        if position is None:
-            return False
-
-        clicked = await self.click_button(
-            message,
-            contains=(BLESSING_BUTTON,),
-            action_type=ActionType.USE_SKILL,
-            description=BLESSING_BUTTON,
-        )
-        if clicked:
-            self.mark_progress("использовано Благословение")
-        else:
-            self.blessing_refresh_in_progress = False
-        return True
 
     def confirm_blessing_from_text(self, text: str) -> None:
         if not self.settings.values.blessing_enabled:
-            self.blessing_refresh_in_progress = False
+            self.blessing.cancel()
             return
-        if not self.blessing_refresh_in_progress:
-            return
-        if BLESSING_STATUS_MARKER not in normalize(text):
-            return
-
-        self.blessing_refreshed_at = time.monotonic()
-        self.blessing_next_attempt_at = self.blessing_refreshed_at + BLESSING_REFRESH_INTERVAL
-        self.blessing_refresh_in_progress = False
-        self.log("Благословение подтверждено. Следующее обновление через 29 минут.")
-        self.mark_progress("Благословение обновлено")
+        self.blessing.confirm_from_text(
+            text,
+            log=self.log,
+            mark_progress=self.mark_progress,
+        )
 
     async def handle_map(self, message, text: str) -> None:
         map_info = parse_map(
@@ -886,7 +794,6 @@ class Farmer:
             and self.context.checked_empty_position != map_info.position
         ):
             self.context.active_target = map_info.found_target
-            self.context.checking_hidden_monsters = False
             self.context.checked_empty_position = None
 
             clicked = await self.click_button(
@@ -900,11 +807,11 @@ class Farmer:
                 self.mark_progress("открыт список целей")
             return
 
-        if self.context.checked_empty_position == map_info.position:
-            self.context.checking_hidden_monsters = False
-        elif map_info.has_hidden_monsters:
+        if (
+            self.context.checked_empty_position != map_info.position
+            and map_info.has_hidden_monsters
+        ):
             self.context.active_target = None
-            self.context.checking_hidden_monsters = True
 
             clicked = await self.click_button(
                 message,
@@ -916,8 +823,6 @@ class Farmer:
                 self.state = BotState.TARGET_SELECTION
                 self.mark_progress("открыт полный список целей")
             return
-        else:
-            self.context.checking_hidden_monsters = False
 
         if self.moves_in_cycle >= self.settings.values.moves_per_cycle:
             await self.complete_cycle()
@@ -935,16 +840,6 @@ class Farmer:
             self.context.pending_move = plan
             self.state = BotState.MOVING
             self.mark_progress("команда перемещения отправлена")
-
-    def analyze_target_buttons(
-        self,
-        message,
-    ) -> tuple[str | None, dict[str, tuple[int, int]]]:
-        analysis = analyze_map_targets(
-            message,
-            self.settings.values.enabled_targets,
-        )
-        return analysis.selected_target, analysis.target_counts
 
     async def handle_target_selection(
         self,
@@ -977,22 +872,16 @@ class Farmer:
                 await self.recover_latest_state("пауза: не удалось вернуться на карту")
             return
 
-        found_target, target_counts = self.analyze_target_buttons(message)
-
-        event_key = (
-            f"{message.id}:"
-            f"{message.edit_date.timestamp() if message.edit_date else 0}:"
-            f"{'|'.join(self.get_button_texts(message))}"
+        analysis = analyze_map_targets(
+            message,
+            self.settings.values.enabled_targets,
         )
-        self.statistics.record_target_list(
-            event_key,
-            target_counts,
-        )
+        found_target = analysis.selected_target
+        target_counts = analysis.target_counts
 
         if found_target is not None:
             self.context.active_target = found_target
             self.context.battle_target = found_target
-            self.context.checking_hidden_monsters = False
             self.context.checked_empty_position = None
 
             clicked = await self.click_button(
@@ -1004,7 +893,6 @@ class Farmer:
             )
 
             if clicked:
-                self.statistics.record_attacked(found_target)
                 self.state = BotState.COMBAT
                 self.mark_progress("цель выбрана")
             return
@@ -1037,8 +925,6 @@ class Farmer:
                     f"Занято: {occupied_summary}"
                 )
 
-        self.context.checking_hidden_monsters = False
-
         clicked = await self.click_button(
             message,
             exact=BACK_TO_MAP_BUTTON,
@@ -1050,13 +936,6 @@ class Farmer:
         else:
             await self.recover_latest_state("не удалось вернуться к карте")
 
-    def analyze_combat_target_buttons(self, message):
-        return select_combat_target(
-            message,
-            self.settings.values.enabled_targets,
-            self.context.active_target,
-        )
-
     async def handle_combat_target_selection(
         self,
         message,
@@ -1064,7 +943,11 @@ class Farmer:
         self.state = BotState.COMBAT
         self.mark_progress("получен список целей навыка")
 
-        target_name, position = self.analyze_combat_target_buttons(message)
+        target_name, position = select_combat_target(
+            message,
+            self.settings.values.enabled_targets,
+            self.context.active_target,
+        )
 
         if position is None:
             await self.recover_latest_state("не найдена доступная цель навыка")
@@ -1094,13 +977,6 @@ class Farmer:
         elif self.running:
             await self.recover_latest_state("не удалось выбрать цель навыка")
 
-    def skill_available(self, message, skill_name: str) -> bool:
-        return choose_skill(
-            message,
-            current_hp=self.context.current_hp,
-            heal_threshold=self.settings.values.heal_threshold,
-        ) == normalize(skill_name)
-
     async def handle_combat_turn(self, message) -> None:
         self.state = BotState.COMBAT
         self.mark_progress("ход игрока")
@@ -1119,7 +995,6 @@ class Farmer:
             await self.recover_latest_state("не найден доступный навык")
             return
 
-        self.context.pending_skill = skill_name
         clicked = await self.click_button(
             message,
             contains=(skill_name,),
@@ -1159,10 +1034,7 @@ class Farmer:
         message_id: int,
     ) -> None:
         target_name = self.resolved_battle_target()
-        self.statistics.add_defeat(
-            message_id,
-            target_name,
-        )
+        self.statistics.add_defeat(message_id)
         await self.storage.record_battle(
             telegram_message_id=message_id,
             session_id=self.session_id,
@@ -1174,7 +1046,6 @@ class Farmer:
         self.context.clear_combat()
         self.context.pending_move = None
         self.context.checked_empty_position = None
-        self.context.checking_hidden_monsters = False
 
         self.state = BotState.RECOVERY
         self.recovery_started_at = time.monotonic()
@@ -1271,7 +1142,6 @@ class Farmer:
         disappeared_target = self.context.active_target or "неизвестная цель"
 
         self.context.active_target = None
-        self.context.checking_hidden_monsters = False
         self.context.checked_empty_position = self.context.current_position
         self.context.pending_move = None
         self.context.failed_move_attempts = 0
@@ -1302,20 +1172,17 @@ class Farmer:
             return False
 
         message = self.latest_received_message
-        if message is not None and self.is_latest_message(message):
-            if (
-                self.find_button(
-                    message,
-                    exact=LOOK_BUTTON,
-                )
-                is not None
-            ):
-                return await self.click_button(
-                    message,
-                    exact=LOOK_BUTTON,
-                    action_type=ActionType.OPEN_ATTACK,
-                    description=LOOK_BUTTON,
-                )
+        if (
+            message is not None
+            and self.is_latest_message(message)
+            and find_button(message, exact=LOOK_BUTTON) is not None
+        ):
+            return await self.click_button(
+                message,
+                exact=LOOK_BUTTON,
+                action_type=ActionType.OPEN_ATTACK,
+                description=LOOK_BUTTON,
+            )
 
         try:
             limiter_delay = await self.telegram_action_limiter.acquire()
@@ -1354,7 +1221,6 @@ class Farmer:
             return
 
         attempt = self.watchdog.begin_recovery_attempt()
-        self.statistics.record_recovery_attempt()
 
         self.log(f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}")
 
@@ -1399,8 +1265,6 @@ class Farmer:
 
             if not should_recover:
                 continue
-
-            self.statistics.record_watchdog_trigger()
 
             # Обычное срабатывание watchdog — внутренний механизм
             # самовосстановления. Сохраняем его для диагностики в SQLite
@@ -1486,14 +1350,11 @@ class Farmer:
             if "на вас напали:" in normalized_text:
                 self.context.pending_move = None
                 self.context.failed_move_attempts = 0
-                self.context.checking_hidden_monsters = False
                 self.context.checked_empty_position = None
 
                 if combat_target:
                     self.context.active_target = combat_target
                     self.context.add_combat_enemy(combat_target)
-                self.context.pending_skill = None
-
                 self.log(
                     "Обнаружено внезапное нападение"
                     + (f": {combat_target}" if combat_target else "")
@@ -1511,8 +1372,6 @@ class Farmer:
                 if combat_target:
                     self.context.active_target = combat_target
                     self.context.add_combat_enemy(combat_target)
-                self.context.pending_skill = None
-
                 self.mark_progress("бой начался")
 
             self.state = BotState.COMBAT
@@ -1537,7 +1396,6 @@ class Farmer:
 
                 added = self.statistics.add_victory(
                     message.id,
-                    target_name,
                     reward,
                 )
                 db_added, cards = await self.storage.record_battle(
@@ -1559,9 +1417,8 @@ class Farmer:
                     await self.notifier.card_drop(
                         card,
                         self.context.current_position,
-                    )
+                )
                 if added:
-                    self.context.kill_count += 1
                     logger.info(
                         "\n%s",
                         format_report(
@@ -1571,7 +1428,6 @@ class Farmer:
                     )
 
                 self.context.clear_combat()
-                self.context.checking_hidden_monsters = False
                 self.mark_progress("бой завершён победой")
                 return
 
@@ -1600,22 +1456,11 @@ class Farmer:
             with suppress(asyncio.CancelledError):
                 await self.progress_persist_task
 
-        if not self.runtime_finalized:
-            self.statistics.finalize_runtime()
-            self.runtime_finalized = True
-
         logger.info(
             "\n%s",
             format_report(
                 "ИТОГ ТЕКУЩЕЙ СЕССИИ",
                 self.statistics.session_report(),
-            ),
-        )
-        logger.info(
-            "\n%s",
-            format_report(
-                "ОБЩАЯ СТАТИСТИКА",
-                self.statistics.total_report(),
             ),
         )
         logger.info("Причина остановки: %s", reason)

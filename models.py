@@ -55,7 +55,6 @@ class MapInfo:
     max_hp: int | None
     movement_finished: bool
     location_name: str | None = None
-    map_size: tuple[int, int] | None = None
     status: str | None = None
 
     @property
@@ -88,13 +87,10 @@ class RuntimeContext:
     active_target: str | None = None
     battle_target: str | None = None
     combat_enemies: list[str] = field(default_factory=list)
-    pending_skill: str | None = None
     checked_empty_position: Position | None = None
-    checking_hidden_monsters: bool = False
     pending_move: MovePlan | None = None
     failed_move_attempts: int = 0
     move_count: int = 0
-    kill_count: int = 0
 
     def add_combat_enemy(self, name: str) -> None:
         if not name:
@@ -118,4 +114,3 @@ class RuntimeContext:
         self.active_target = None
         self.battle_target = None
         self.combat_enemies.clear()
-        self.pending_skill = None

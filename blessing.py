@@ -35,6 +35,11 @@ class BlessingManager:
             return True
         return now - self.refreshed_at >= BLESSING_REFRESH_INTERVAL
 
+    def cancel(self) -> bool:
+        was_in_progress = self.refresh_in_progress
+        self.refresh_in_progress = False
+        return was_in_progress
+
     async def try_open_from_map(
         self,
         message,

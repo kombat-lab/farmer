@@ -22,10 +22,6 @@ LOCATION_RE = re.compile(
     r"🗺️\s*([^\n\r]+)",
     re.IGNORECASE,
 )
-MAP_SIZE_RE = re.compile(
-    r"Размер:\s*(\d+)\s*[xх×]\s*(\d+)",
-    re.IGNORECASE,
-)
 STATUS_RE = re.compile(
     r"Статус:\s*([^\n\r]+)",
     re.IGNORECASE,
@@ -149,7 +145,6 @@ def parse_map(
     monsters = parse_monsters(monsters_match.group(2))
     hp = extract_player_hp(text, character_name)
     location_match = LOCATION_RE.search(text)
-    size_match = MAP_SIZE_RE.search(text)
     status_match = STATUS_RE.search(text)
 
     location_name = location_match.group(1).strip() if location_match else None
@@ -167,14 +162,6 @@ def parse_map(
         max_hp=hp[1] if hp else None,
         movement_finished=("Переход между клетками завершён" in text),
         location_name=location_name,
-        map_size=(
-            (
-                int(size_match.group(1)),
-                int(size_match.group(2)),
-            )
-            if size_match
-            else None
-        ),
         status=status,
     )
 

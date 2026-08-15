@@ -18,7 +18,6 @@ CONTROL_BOT_TOKEN = _required("CONTROL_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = int(_required("ADMIN_TELEGRAM_ID"))
 
 # Пути контейнера.
-APP_DIR = Path("/app")
 DATA_DIR = Path("/app/data")
 DB_DIR = DATA_DIR / "db_farmer"
 DATABASE_PATH = DB_DIR / "fog_farmer.sqlite3"
@@ -87,14 +86,6 @@ TARGET_MONSTER_CATEGORIES: dict[str, list[str]] = {
     ],
 }
 
-# Мобы, которые могут самостоятельно инициировать бой.
-AGGRESSIVE_MONSTERS: frozenset[str] = frozenset(
-    {
-        "Лиса-сорванец",
-        "Богомол-пескожвал",
-    }
-)
-
 DEFAULT_TARGET_MONSTERS: list[str] = [
     monster for monsters in TARGET_MONSTER_CATEGORIES.values() for monster in monsters
 ]
@@ -107,8 +98,6 @@ MAP_MAX_Y = 8
 DEFAULT_CYCLES_COUNT = 1
 DEFAULT_MOVES_PER_CYCLE = 80
 DEFAULT_HEAL_THRESHOLD = 325
-DEFAULT_MAX_MANA = 11
-DEFAULT_HEAL_AMOUNT = 102
 MIN_HP_PERCENT_TO_START_BATTLE = 50
 
 DEFAULT_MOVE_DELAY_MIN = 2.0

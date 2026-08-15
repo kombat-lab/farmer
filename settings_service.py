@@ -9,12 +9,10 @@ from config import (
     DEFAULT_CYCLE_REST_MAX,
     DEFAULT_CYCLE_REST_MIN,
     DEFAULT_CYCLES_COUNT,
-    DEFAULT_HEAL_AMOUNT,
     DEFAULT_HEAL_THRESHOLD,
     DEFAULT_LONG_PAUSE_CHANCE,
     DEFAULT_LONG_PAUSE_MAX,
     DEFAULT_LONG_PAUSE_MIN,
-    DEFAULT_MAX_MANA,
     DEFAULT_MOVE_DELAY_MAX,
     DEFAULT_MOVE_DELAY_MIN,
     DEFAULT_MOVES_PER_CYCLE,
@@ -36,8 +34,6 @@ class FarmerSettings:
     enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
-    max_mana: int = DEFAULT_MAX_MANA
-    heal_amount: int = DEFAULT_HEAL_AMOUNT
     blessing_enabled: bool = False
 
     move_delay_min: float = DEFAULT_MOVE_DELAY_MIN
@@ -78,11 +74,7 @@ class SettingsService:
             self.values.blessing_enabled,
             default=False,
         )
-        await self.save_all()
-
-    async def save_all(self) -> None:
-        for key, value in asdict(self.values).items():
-            await self.storage.set_setting(key, value)
+        await self.storage.set_settings(asdict(self.values))
 
     async def set_value(self, key: str, value: Any) -> None:
         if not hasattr(self.values, key):
@@ -149,44 +141,6 @@ class SettingsService:
 
         return current_targets
 
-    async def toggle_category(self, category: str) -> bool:
-        category_targets = TARGET_MONSTER_CATEGORIES.get(category)
-
-        if category_targets is None:
-            raise ValueError(f"Неизвестная категория мобов: {category}")
-
-        selected = set(self.values.enabled_targets or [])
-        category_fully_enabled = all(target in selected for target in category_targets)
-        new_enabled_state = not category_fully_enabled
-
-        await self.set_category_enabled(
-            category,
-            new_enabled_state,
-        )
-
-        return new_enabled_state
-
-    def is_category_enabled(self, category: str) -> bool:
-        category_targets = TARGET_MONSTER_CATEGORIES.get(category)
-
-        if not category_targets:
-            return False
-
-        selected = set(self.values.enabled_targets or [])
-
-        return all(target in selected for target in category_targets)
-
-    def is_category_partially_enabled(self, category: str) -> bool:
-        category_targets = TARGET_MONSTER_CATEGORIES.get(category)
-
-        if not category_targets:
-            return False
-
-        selected = set(self.values.enabled_targets or [])
-        enabled_count = sum(target in selected for target in category_targets)
-
-        return 0 < enabled_count < len(category_targets)
-
     def get_category_enabled_count(self, category: str) -> tuple[int, int]:
         category_targets = TARGET_MONSTER_CATEGORIES.get(category, [])
         selected = set(self.values.enabled_targets or [])
@@ -211,13 +165,11 @@ class SettingsService:
         return [target for target in DEFAULT_TARGET_MONSTERS if target in selected]
 
     def _normalize_character(self) -> None:
-        for key in ("heal_threshold", "max_mana", "heal_amount"):
-            value = getattr(self.values, key)
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                value = 1
-            setattr(self.values, key, max(1, value))
+        try:
+            threshold = int(self.values.heal_threshold)
+        except (TypeError, ValueError):
+            threshold = 1
+        self.values.heal_threshold = max(1, threshold)
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:

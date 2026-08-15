@@ -179,7 +179,7 @@ def settings_rich(settings: SettingsService) -> str:
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),
         ]
     )
-    body += f"<details open><summary>🎯 Активные цели</summary>{targets}</details>"
+    body += f"<details><summary>🎯 Активные цели</summary>{targets}</details>"
     body += f"<details><summary>⏱ Задержки</summary>{delays}</details>"
     return rich_document("⚙️ Настройки", body)
 

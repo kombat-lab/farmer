@@ -12,7 +12,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from bot_states import SettingsInput
-from config import ADMIN_TELEGRAM_ID, TARGET_MONSTER_CATEGORIES
+from config import (
+    ACTIVITY_PROFILE_FAST,
+    ACTIVITY_PROFILE_NORMAL,
+    ADMIN_TELEGRAM_ID,
+    TARGET_MONSTER_CATEGORIES,
+)
 from middlewares import AdminOnlyMiddleware
 from rich_messages import (
     events_rich,
@@ -45,9 +50,10 @@ CHARACTER_ROWS = [
     ["↩️ Настройки"],
 ]
 DELAYS_ROWS = [
+    ["☕ Обычный профиль", "⚡ Быстрый профиль"],
     ["Перемещение", "⚔️ Открытие нападения"],
     ["Выбор цели", "✨ Использование навыка"],
-    ["☕ Длинная пауза", "Шанс длинной паузы"],
+    ["☕ Короткая пауза", "Шанс короткой паузы"],
     ["Передышка между циклами"],
     ["↩️ Настройки"],
 ]
@@ -222,7 +228,7 @@ class ControlBot:
         game_state = str(state.get("game_state") or "STOPPED")
         if not running:
             controls = [["▶️ Запустить"]]
-        elif game_state in {"PAUSED", "RESTING"}:
+        elif game_state in {"PAUSED", "RESTING", "ACTIVITY_BREAK"}:
             controls = [["▶️ Продолжить", "⏹ Стоп"]]
         else:
             controls = [["⏸ Пауза", "⏹ Стоп"]]
@@ -523,12 +529,36 @@ class ControlBot:
                 DELAYS_ROWS,
             )
 
+        @r.message(
+            StateFilter(None),
+            text_is("☕ Обычный профиль", "⚡ Быстрый профиль"),
+        )
+        async def activity_profile_handler(message: Message) -> None:
+            profile = (
+                ACTIVITY_PROFILE_FAST
+                if "Быстрый" in (message.text or "")
+                else ACTIVITY_PROFILE_NORMAL
+            )
+            await self.settings.set_activity_profile(profile)
+            description = (
+                "минимальные задержки, без длительных перерывов"
+                if profile == ACTIVITY_PROFILE_FAST
+                else "настроенные задержки и безопасные перерывы на пустой карте"
+            )
+            await self._send_rich(
+                message,
+                settings_rich(self.settings),
+                f"✅ Выбран профиль: {description}.",
+                DELAYS_ROWS,
+            )
+
         delay_mapping = {
             normalize_button_text("Перемещение"): "move_delay",
             normalize_button_text("⚔️ Открытие нападения"): "attack_delay",
             normalize_button_text("Выбор цели"): "target_delay",
             normalize_button_text("✨ Использование навыка"): "skill_delay",
             normalize_button_text("☕ Длинная пауза"): "long_pause",
+            normalize_button_text("☕ Короткая пауза"): "long_pause",
             normalize_button_text("Передышка между циклами"): "cycle_rest",
         }
 
@@ -574,7 +604,10 @@ class ControlBot:
             await state.clear()
             await self._send_text(message, "✅ Диапазон задержки сохранён.", DELAYS_ROWS)
 
-        @r.message(StateFilter(None), text_is("Шанс длинной паузы"))
+        @r.message(
+            StateFilter(None),
+            text_is("Шанс длинной паузы", "Шанс короткой паузы"),
+        )
         async def chance_prompt(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsInput.long_pause_chance)
             await self._send_text(
@@ -598,7 +631,7 @@ class ControlBot:
                 return
             await self.settings.set_value("long_pause_chance", value / 100)
             await state.clear()
-            await self._send_text(message, f"✅ Шанс длинной паузы: {value:g}%", DELAYS_ROWS)
+            await self._send_text(message, f"✅ Шанс короткой паузы: {value:g}%", DELAYS_ROWS)
 
         @r.message()
         async def fallback_handler(message: Message, state: FSMContext) -> None:

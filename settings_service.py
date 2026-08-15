@@ -4,6 +4,9 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from config import (
+    ACTIVITY_PROFILE_FAST,
+    ACTIVITY_PROFILE_NORMAL,
+    DEFAULT_ACTIVITY_PROFILE,
     DEFAULT_ATTACK_DELAY_MAX,
     DEFAULT_ATTACK_DELAY_MIN,
     DEFAULT_BATTLE_START_HP_PERCENT,
@@ -31,6 +34,7 @@ from storage import Storage
 class FarmerSettings:
     cycles_count: int = DEFAULT_CYCLES_COUNT
     moves_per_cycle: int = DEFAULT_MOVES_PER_CYCLE
+    activity_profile: str = DEFAULT_ACTIVITY_PROFILE
 
     enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
 
@@ -72,6 +76,7 @@ class SettingsService:
 
         self._normalize_enabled_targets()
         self._normalize_character()
+        self._normalize_activity_profile()
         self.values.blessing_enabled = self._normalize_bool(
             self.values.blessing_enabled,
             default=False,
@@ -90,6 +95,14 @@ class SettingsService:
         self.values.blessing_enabled = enabled
         await self.storage.set_setting("blessing_enabled", enabled)
         return enabled
+
+    async def set_activity_profile(self, profile: str) -> str:
+        normalized = str(profile).strip().casefold()
+        if normalized not in {ACTIVITY_PROFILE_NORMAL, ACTIVITY_PROFILE_FAST}:
+            raise ValueError(f"Неизвестный профиль активности: {profile}")
+        self.values.activity_profile = normalized
+        await self.storage.set_setting("activity_profile", normalized)
+        return normalized
 
     async def toggle_target(self, target: str) -> bool:
         if target not in DEFAULT_TARGET_MONSTERS:
@@ -180,6 +193,12 @@ class SettingsService:
         if battle_start_hp not in {50, 100}:
             battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
         self.values.battle_start_hp_percent = battle_start_hp
+
+    def _normalize_activity_profile(self) -> None:
+        profile = str(self.values.activity_profile).strip().casefold()
+        if profile not in {ACTIVITY_PROFILE_NORMAL, ACTIVITY_PROFILE_FAST}:
+            profile = DEFAULT_ACTIVITY_PROFILE
+        self.values.activity_profile = profile
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:

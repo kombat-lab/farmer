@@ -12,6 +12,13 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.types import InputRichMessage, ReplyKeyboardMarkup
 
+from config import (
+    FAST_ATTACK_DELAY,
+    FAST_MOVE_DELAY,
+    FAST_SKILL_DELAY,
+    FAST_TARGET_DELAY,
+)
+
 
 def _e(value: object) -> str:
     return escape(str(value), quote=True)
@@ -52,6 +59,7 @@ def status_rich(state: dict) -> str:
         "RECOVERY": "Восстановление HP",
         "PAUSED": "Пауза",
         "RESTING": "Передышка",
+        "ACTIVITY_BREAK": "Длительный перерыв",
         "STOPPED": "Остановлен",
         "ERROR": "Ошибка",
     }
@@ -59,7 +67,7 @@ def status_rich(state: dict) -> str:
         "🟡"
         if game_state == "PAUSED"
         else "😴"
-        if game_state == "RESTING"
+        if game_state in {"RESTING", "ACTIVITY_BREAK"}
         else "🟢"
         if running
         else "🔴"
@@ -158,16 +166,44 @@ def events_rich(events: list[dict]) -> str:
 
 def settings_rich(settings: SettingsService) -> str:
     s = settings.values
+    profile_name = "Быстрый" if s.activity_profile == "fast" else "Обычный"
+    activity_break = (
+        "отключён"
+        if s.activity_profile == "fast"
+        else "после 25–40 ходов или 25–45 мин.; отдых 4–8 мин."
+    )
     targets = "<ul>" + "".join(f"<li>{_e(target)}</li>" for target in s.enabled_targets) + "</ul>"
+    effective_delays = (
+        (
+            FAST_MOVE_DELAY,
+            FAST_ATTACK_DELAY,
+            FAST_TARGET_DELAY,
+            FAST_SKILL_DELAY,
+        )
+        if s.activity_profile == "fast"
+        else (
+            (s.move_delay_min, s.move_delay_max),
+            (s.attack_delay_min, s.attack_delay_max),
+            (s.target_delay_min, s.target_delay_max),
+            (s.skill_delay_min, s.skill_delay_max),
+        )
+    )
+    move_delay, attack_delay, target_delay, skill_delay = effective_delays
     delays = rich_table(
         [
-            ("Перемещение", f"{s.move_delay_min:g}–{s.move_delay_max:g} сек."),
-            ("Открытие нападения", f"{s.attack_delay_min:g}–{s.attack_delay_max:g} сек."),
-            ("Выбор цели", f"{s.target_delay_min:g}–{s.target_delay_max:g} сек."),
-            ("Использование навыка", f"{s.skill_delay_min:g}–{s.skill_delay_max:g} сек."),
-            ("Длинная пауза", f"{s.long_pause_min:g}–{s.long_pause_max:g} сек."),
-            ("Шанс длинной паузы", f"{s.long_pause_chance * 100:g}%"),
+            ("Перемещение", f"{move_delay[0]:g}–{move_delay[1]:g} сек."),
+            ("Открытие нападения", f"{attack_delay[0]:g}–{attack_delay[1]:g} сек."),
+            ("Выбор цели", f"{target_delay[0]:g}–{target_delay[1]:g} сек."),
+            ("Использование навыка", f"{skill_delay[0]:g}–{skill_delay[1]:g} сек."),
+            (
+                "Короткая пауза",
+                "отключена"
+                if s.activity_profile == "fast"
+                else f"{s.long_pause_min:g}–{s.long_pause_max:g} сек. · "
+                f"шанс {s.long_pause_chance * 100:g}%",
+            ),
             ("Между циклами", f"{s.cycle_rest_min / 60:g}–{s.cycle_rest_max / 60:g} мин."),
+            ("Длительный перерыв", activity_break),
         ],
         headers=("Задержка", "Диапазон"),
     )
@@ -175,6 +211,7 @@ def settings_rich(settings: SettingsService) -> str:
         [
             ("Количество циклов", s.cycles_count),
             ("Ходов в цикле", s.moves_per_cycle),
+            ("Профиль активности", profile_name),
             ("Порог лечения", s.heal_threshold),
             ("HP перед новым боем", f"{s.battle_start_hp_percent}%"),
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),

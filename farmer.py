@@ -4,6 +4,7 @@ import asyncio
 import random
 import time
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import FarmStatistics, format_report
 from typing import Any
@@ -22,6 +23,13 @@ from combat_strategy import (
     choose_combat_action,
 )
 from config import (
+    ACTIVITY_BREAK_DURATION_MAX,
+    ACTIVITY_BREAK_DURATION_MIN,
+    ACTIVITY_BREAK_MOVES_MAX,
+    ACTIVITY_BREAK_MOVES_MIN,
+    ACTIVITY_BREAK_WORK_MAX,
+    ACTIVITY_BREAK_WORK_MIN,
+    ACTIVITY_PROFILE_FAST,
     API_HASH,
     API_ID,
     CHARACTER_NAME,
@@ -29,6 +37,10 @@ from config import (
     DATA_RETENTION_DAYS,
     DEATH_RECOVERY_MAX_WAIT,
     DEATH_RECOVERY_MIN_WAIT,
+    FAST_ATTACK_DELAY,
+    FAST_MOVE_DELAY,
+    FAST_SKILL_DELAY,
+    FAST_TARGET_DELAY,
     GAME_BOT,
     GENERAL_PROGRESS_TIMEOUT,
     LOG_BACKUP_COUNT,
@@ -54,7 +66,7 @@ from config import (
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
-from human_delays import HumanDelayModel, parse_remaining_seconds
+from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
 from logger_setup import setup_logging
 from models import (
     ActionType,
@@ -130,6 +142,7 @@ class Farmer:
         self.combat_decisions: list[CombatDecisionTrace] = []
         self.pending_combat_decision: CombatDecisionTrace | None = None
         self.delay_model = HumanDelayModel()
+        self.activity_break_planner = ActivityBreakPlanner()
         self.statistics = FarmStatistics()
 
         self.navigator = SnakeNavigator(
@@ -148,6 +161,7 @@ class Farmer:
         self.current_cycle = 1
         self.moves_in_cycle = 0
         self.rest_task: asyncio.Task | None = None
+        self.activity_break_task: asyncio.Task | None = None
         self.progress_persist_task: asyncio.Task | None = None
         self.pending_progress_reason: str | None = None
         self.intentional_waits = 0
@@ -318,12 +332,20 @@ class Farmer:
         remaining_seconds: int | None = None,
     ) -> float:
         s = self.settings.values
-        ranges = {
-            ActionType.MOVE: (s.move_delay_min, s.move_delay_max),
-            ActionType.OPEN_ATTACK: (s.attack_delay_min, s.attack_delay_max),
-            ActionType.SELECT_TARGET: (s.target_delay_min, s.target_delay_max),
-            ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
-        }
+        if s.activity_profile == ACTIVITY_PROFILE_FAST:
+            ranges = {
+                ActionType.MOVE: FAST_MOVE_DELAY,
+                ActionType.OPEN_ATTACK: FAST_ATTACK_DELAY,
+                ActionType.SELECT_TARGET: FAST_TARGET_DELAY,
+                ActionType.USE_SKILL: FAST_SKILL_DELAY,
+            }
+        else:
+            ranges = {
+                ActionType.MOVE: (s.move_delay_min, s.move_delay_max),
+                ActionType.OPEN_ATTACK: (s.attack_delay_min, s.attack_delay_max),
+                ActionType.SELECT_TARGET: (s.target_delay_min, s.target_delay_max),
+                ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
+            }
         minimum, maximum = ranges[action_type]
         return self.delay_model.action_delay(
             minimum,
@@ -617,21 +639,27 @@ class Farmer:
             pause_requested=1,
             last_action="запрошена безопасная пауза",
         )
-        if self.state is BotState.RESTING:
+        if self.state in {BotState.RESTING, BotState.ACTIVITY_BREAK}:
             if self.rest_task:
                 self.rest_task.cancel()
                 self.rest_task = None
+            if self.activity_break_task:
+                self.activity_break_task.cancel()
+                self.activity_break_task = None
+            self.activity_break_planner.reset()
             await self.enter_paused()
         return True, "Пауза запрошена. Бот остановится на карте после текущего действия или боя."
 
     async def enter_paused(self) -> None:
         self.pause_requested = False
+        self.activity_break_planner.reset()
         self.state = BotState.PAUSED
         self.mark_progress("фармер поставлен на паузу")
         await self.storage.update_state(
             process_status="PAUSED",
             game_state="PAUSED",
             pause_requested=0,
+            rest_until=None,
         )
         await self.storage.add_event("FARMER_PAUSED", "Фармер поставлен на паузу")
         await self.notifier.send("⏸ <b>Фармер поставлен на паузу</b>")
@@ -646,7 +674,20 @@ class Farmer:
                 self.rest_task = None
             self.current_cycle += 1
             self.moves_in_cycle = 0
+            self.activity_break_planner.reset()
             action = f"передышка пропущена, начат цикл {self.current_cycle}"
+        elif self.state is BotState.ACTIVITY_BREAK:
+            if self.activity_break_task:
+                self.activity_break_task.cancel()
+                self.activity_break_task = None
+            self.activity_break_planner.complete(
+                self.moves_in_cycle,
+                moves_min=ACTIVITY_BREAK_MOVES_MIN,
+                moves_max=ACTIVITY_BREAK_MOVES_MAX,
+                work_min=ACTIVITY_BREAK_WORK_MIN,
+                work_max=ACTIVITY_BREAK_WORK_MAX,
+            )
+            action = "длительный перерыв пропущен"
         elif self.state is BotState.PAUSED:
             action = "продолжение после паузы"
         else:
@@ -690,6 +731,53 @@ class Farmer:
         )
         self.rest_task = asyncio.create_task(self.rest_between_cycles(rest_seconds))
 
+    async def start_activity_break(self) -> None:
+        seconds = self.activity_break_planner.duration(
+            ACTIVITY_BREAK_DURATION_MIN,
+            ACTIVITY_BREAK_DURATION_MAX,
+        )
+        rest_until = datetime.now(UTC) + timedelta(seconds=seconds)
+        self.state = BotState.ACTIVITY_BREAK
+        self.mark_progress(f"длительный перерыв: {int(seconds)} сек.")
+        await self.storage.update_state(rest_until=rest_until.isoformat())
+        await self.storage.add_event(
+            "ACTIVITY_BREAK_STARTED",
+            f"Перерыв на {int(seconds)} сек. после {self.moves_in_cycle} перемещений",
+        )
+        self.log(
+            f"Начат длительный перерыв на {seconds / 60:.1f} мин. "
+            f"после {self.moves_in_cycle} перемещений."
+        )
+        self.activity_break_task = asyncio.create_task(
+            self.finish_activity_break(seconds),
+            name="activity-break",
+        )
+
+    async def finish_activity_break(self, seconds: float) -> None:
+        try:
+            await asyncio.sleep(seconds)
+        except asyncio.CancelledError:
+            return
+        if not self.running or self.state is not BotState.ACTIVITY_BREAK:
+            return
+        self.activity_break_planner.complete(
+            self.moves_in_cycle,
+            moves_min=ACTIVITY_BREAK_MOVES_MIN,
+            moves_max=ACTIVITY_BREAK_MOVES_MAX,
+            work_min=ACTIVITY_BREAK_WORK_MIN,
+            work_max=ACTIVITY_BREAK_WORK_MAX,
+        )
+        self.activity_break_task = None
+        self.state = BotState.STARTING
+        self.mark_progress("длительный перерыв завершён")
+        await self.storage.update_state(rest_until=None)
+        await self.storage.add_event(
+            "ACTIVITY_BREAK_FINISHED",
+            "Длительный перерыв завершён; запрошено одно свежее состояние карты",
+        )
+        self.log("Длительный перерыв завершён. Обновляю карту один раз.")
+        await self.process_latest_state()
+
     async def rest_between_cycles(self, seconds: float) -> None:
         try:
             await asyncio.sleep(seconds)
@@ -699,6 +787,7 @@ class Farmer:
             return
         self.current_cycle += 1
         self.moves_in_cycle = 0
+        self.activity_break_planner.reset()
         self.state = BotState.STARTING
         self.mark_progress(f"начат цикл {self.current_cycle}")
         await self.storage.add_event(
@@ -798,7 +887,7 @@ class Farmer:
             await self.enter_paused()
             return
 
-        if self.state is BotState.RESTING:
+        if self.state in {BotState.RESTING, BotState.ACTIVITY_BREAK}:
             return
 
         self.state = BotState.MAP
@@ -825,16 +914,6 @@ class Farmer:
         if self.battle_health_is_low():
             await self.wait_for_battle_health()
             return
-
-        if map_info.movement_finished and self.delay_model.should_take_long_pause(
-            self.settings.values.long_pause_chance
-        ):
-            pause = self.delay_model.action_delay(
-                self.settings.values.long_pause_min,
-                self.settings.values.long_pause_max,
-            )
-            self.log(f"Длинная пауза после серии перемещений: {pause:.1f} сек.")
-            await self.intentional_sleep(pause)
 
         if await self.try_refresh_blessing_from_map(message):
             return
@@ -886,6 +965,32 @@ class Farmer:
         if self.moves_in_cycle >= self.settings.values.moves_per_cycle:
             await self.complete_cycle()
             return
+
+        if self.settings.values.activity_profile == ACTIVITY_PROFILE_FAST:
+            self.activity_break_planner.reset()
+        elif self.activity_break_planner.is_due(
+            self.moves_in_cycle,
+            moves_min=ACTIVITY_BREAK_MOVES_MIN,
+            moves_max=ACTIVITY_BREAK_MOVES_MAX,
+            work_min=ACTIVITY_BREAK_WORK_MIN,
+            work_max=ACTIVITY_BREAK_WORK_MAX,
+        ):
+            await self.start_activity_break()
+            return
+
+        if (
+            self.settings.values.activity_profile != ACTIVITY_PROFILE_FAST
+            and map_info.movement_finished
+            and self.delay_model.should_take_long_pause(
+                self.settings.values.long_pause_chance
+            )
+        ):
+            pause = self.delay_model.action_delay(
+                self.settings.values.long_pause_min,
+                self.settings.values.long_pause_max,
+            )
+            self.log(f"Короткая пауза на пустой карте: {pause:.1f} сек.")
+            await self.intentional_sleep(pause)
 
         plan = self.navigator.plan(map_info.position)
 
@@ -1355,6 +1460,7 @@ class Farmer:
             if self.state in {
                 BotState.PAUSED,
                 BotState.RESTING,
+                BotState.ACTIVITY_BREAK,
                 BotState.WAITING_FOR_HEALTH,
                 BotState.RECOVERY,
             }:
@@ -1656,6 +1762,7 @@ class Farmer:
             self.watchdog_task,
             self.recovery_task,
             self.rest_task,
+            self.activity_break_task,
             self.progress_persist_task,
         ):
             if task and task is not asyncio.current_task():

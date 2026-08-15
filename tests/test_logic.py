@@ -16,11 +16,16 @@ from combat_strategy import (
     build_decision_trace,
     choose_combat_action,
 )
-from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
+from config import (
+    ACTIVITY_PROFILE_FAST,
+    ACTIVITY_PROFILE_NORMAL,
+    DEFAULT_BATTLE_START_HP_PERCENT,
+    DEFAULT_HEAL_THRESHOLD,
+)
 from event_cache import BoundedKeyCache
 from farmer import Farmer
-from human_delays import HumanDelayModel, parse_remaining_seconds
-from models import BotState, RuntimeContext
+from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
+from models import ActionType, BotState, RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, extract_player_hp, parse_map
 from rewards import BattleReward, parse_item_stack
@@ -844,6 +849,57 @@ class HumanDelayTests(unittest.TestCase):
         self.assertFalse(model.should_take_long_pause(1.0))
         self.assertTrue(model.should_take_long_pause(1.0))
 
+    def test_activity_break_is_armed_by_moves_or_elapsed_time(self) -> None:
+        now = 100.0
+        planner = ActivityBreakPlanner(random.Random(7), clock=lambda: now)
+        arguments = {
+            "moves_min": 25,
+            "moves_max": 40,
+            "work_min": 1500.0,
+            "work_max": 2700.0,
+        }
+
+        self.assertFalse(planner.is_due(0, **arguments))
+        assert planner.next_move is not None and planner.deadline is not None
+        self.assertTrue(25 <= planner.next_move <= 40)
+        self.assertTrue(1600.0 <= planner.deadline <= 2800.0)
+        self.assertTrue(planner.is_due(planner.next_move, **arguments))
+        self.assertFalse(planner.is_due(planner.next_move, **arguments))
+
+        planner.complete(planner.next_move, **arguments)
+        self.assertFalse(planner.break_pending)
+        self.assertGreater(planner.next_move or 0, 40)
+
+        now = planner.deadline or now
+        self.assertTrue(planner.is_due(0, **arguments))
+
+    def test_activity_break_duration_stays_inside_profile(self) -> None:
+        planner = ActivityBreakPlanner(random.Random(3))
+        durations = [planner.duration(240.0, 480.0) for _ in range(100)]
+
+        self.assertTrue(all(240.0 <= duration <= 480.0 for duration in durations))
+
+    def test_fast_profile_uses_small_action_delays(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.delay_model = HumanDelayModel(random.Random(9))
+        farmer.settings = SimpleNamespace(
+            values=SimpleNamespace(
+                activity_profile=ACTIVITY_PROFILE_FAST,
+                move_delay_min=10.0,
+                move_delay_max=20.0,
+                attack_delay_min=10.0,
+                attack_delay_max=20.0,
+                target_delay_min=10.0,
+                target_delay_max=20.0,
+                skill_delay_min=10.0,
+                skill_delay_max=20.0,
+            )
+        )
+
+        delays = [farmer.action_delay(action) for action in ActionType]
+
+        self.assertTrue(all(0.0 <= delay <= 1.2 for delay in delays))
+
 
 class SharedComponentTests(unittest.IsolatedAsyncioTestCase):
     async def test_blessing_flow_uses_single_manager(self) -> None:
@@ -955,9 +1011,58 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 settings.values.battle_start_hp_percent,
                 DEFAULT_BATTLE_START_HP_PERCENT,
             )
+            self.assertEqual(settings.values.activity_profile, ACTIVITY_PROFILE_NORMAL)
             changes_after_first_load = storage.connection.total_changes
             await settings.load()
             self.assertEqual(storage.connection.total_changes, changes_after_first_load)
+            await storage.close()
+
+    async def test_activity_profile_is_validated_and_persisted(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            storage = Storage(path)
+            settings = SettingsService(storage)
+            await settings.load()
+            await settings.set_activity_profile(ACTIVITY_PROFILE_FAST)
+            self.assertEqual(settings.values.activity_profile, ACTIVITY_PROFILE_FAST)
+            await storage.close()
+
+            reopened = Storage(path)
+            loaded = SettingsService(reopened)
+            await loaded.load()
+            self.assertEqual(loaded.values.activity_profile, ACTIVITY_PROFILE_FAST)
+            with self.assertRaises(ValueError):
+                await loaded.set_activity_profile("unknown")
+            await reopened.close()
+
+    async def test_activity_break_resumes_with_one_state_refresh(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            farmer = Farmer.__new__(Farmer)
+            farmer.running = True
+            farmer.state = BotState.ACTIVITY_BREAK
+            farmer.moves_in_cycle = 31
+            farmer.activity_break_planner = ActivityBreakPlanner(random.Random(5))
+            farmer.activity_break_task = None
+            farmer.storage = storage
+            farmer.mark_progress = lambda _reason: None
+            farmer.log = lambda _message: None
+            refreshes = 0
+
+            async def count_refresh() -> None:
+                nonlocal refreshes
+                refreshes += 1
+
+            farmer.process_latest_state = count_refresh
+
+            await farmer.finish_activity_break(0)
+
+            state = await storage.get_state()
+            events = await storage.get_events()
+            self.assertEqual(farmer.state, BotState.STARTING)
+            self.assertEqual(refreshes, 1)
+            self.assertIsNone(state["rest_until"])
+            self.assertEqual(events[0]["event_type"], "ACTIVITY_BREAK_FINISHED")
             await storage.close()
 
     async def test_new_session_closes_abandoned_running_sessions(self) -> None:
@@ -1125,6 +1230,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             farmer.watchdog_task = None
             farmer.recovery_task = None
             farmer.rest_task = None
+            farmer.activity_break_task = None
 
             await farmer.stop("тестовая остановка")
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 import re
+import time
+from collections.abc import Callable
 
 REMAINING_SECONDS_RE = re.compile(r"Осталось:\s*(\d+)\s*сек", re.IGNORECASE)
 TURN_SAFETY_SECONDS = 6.0
@@ -66,3 +68,88 @@ class HumanDelayModel:
 
         self.moves_since_long_pause = 0
         return True
+
+
+class ActivityBreakPlanner:
+    """Schedules sparse safe breaks without polling Telegram while idle."""
+
+    def __init__(
+        self,
+        rng: random.Random | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.rng = rng or random.Random()
+        self.clock = clock
+        self.next_move: int | None = None
+        self.deadline: float | None = None
+        self.break_pending = False
+
+    def reset(self) -> None:
+        self.next_move = None
+        self.deadline = None
+        self.break_pending = False
+
+    def _arm(
+        self,
+        current_move: int,
+        *,
+        moves_min: int,
+        moves_max: int,
+        work_min: float,
+        work_max: float,
+    ) -> None:
+        moves_min = max(1, int(moves_min))
+        moves_max = max(moves_min, int(moves_max))
+        work_min = max(1.0, float(work_min))
+        work_max = max(work_min, float(work_max))
+        self.next_move = current_move + self.rng.randint(moves_min, moves_max)
+        self.deadline = self.clock() + self.rng.uniform(work_min, work_max)
+
+    def is_due(
+        self,
+        current_move: int,
+        *,
+        moves_min: int,
+        moves_max: int,
+        work_min: float,
+        work_max: float,
+    ) -> bool:
+        if self.break_pending:
+            return False
+        if self.next_move is None or self.deadline is None:
+            self._arm(
+                current_move,
+                moves_min=moves_min,
+                moves_max=moves_max,
+                work_min=work_min,
+                work_max=work_max,
+            )
+            return False
+        if current_move < self.next_move and self.clock() < self.deadline:
+            return False
+        self.break_pending = True
+        return True
+
+    def duration(self, minimum: float, maximum: float) -> float:
+        minimum = max(1.0, float(minimum))
+        maximum = max(minimum, float(maximum))
+        return self.rng.triangular(minimum, maximum, minimum + (maximum - minimum) * 0.4)
+
+    def complete(
+        self,
+        current_move: int,
+        *,
+        moves_min: int,
+        moves_max: int,
+        work_min: float,
+        work_max: float,
+    ) -> None:
+        self.break_pending = False
+        self._arm(
+            current_move,
+            moves_min=moves_min,
+            moves_max=moves_max,
+            work_min=work_min,
+            work_max=work_max,
+        )

@@ -13,7 +13,7 @@ from event_cache import BoundedKeyCache
 from human_delays import HumanDelayModel, parse_remaining_seconds
 from models import RuntimeContext
 from navigator import SnakeNavigator
-from parser import classify_message, parse_map
+from parser import classify_message, extract_player_hp, parse_map
 from rewards import BattleReward, parse_item_stack
 from settings_service import SettingsService
 from skills import HEALING_MANA_RESERVE, enough_health_for_battle
@@ -52,6 +52,22 @@ class FakeMessage:
 
 
 class ParserTests(unittest.TestCase):
+    def test_health_recovery_notifications_update_hp(self) -> None:
+        self.assertEqual(
+            extract_player_hp(
+                "❤️ Ваше здоровье восстановилось до 554/780.",
+                CHARACTER,
+            ),
+            (554, 780),
+        )
+        self.assertEqual(
+            extract_player_hp(
+                "❤️ Ваше здоровье полностью восстановлено: 780/780.",
+                CHARACTER,
+            ),
+            (780, 780),
+        )
+
     def test_map_parser_is_pure_and_does_not_switch_navigator(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
         self.assertIsNone(navigator.location_name)

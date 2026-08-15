@@ -15,7 +15,10 @@ MONSTERS_RE = re.compile(
 )
 HEART_HP_RE = re.compile(r"❤️\s*(\d+)\s*/\s*(\d+)")
 HEALTH_RESTORED_RE = re.compile(
-    r"Ваше здоровье восстановилось до\s*(\d+)\s*/\s*(\d+)",
+    r"Ваше здоровье\s+(?:"
+    r"восстановилось\s+до|"
+    r"полностью\s+восстанов(?:илось|лено)\s*:"
+    r")\s*(\d+)\s*/\s*(\d+)",
     re.IGNORECASE,
 )
 LOCATION_RE = re.compile(

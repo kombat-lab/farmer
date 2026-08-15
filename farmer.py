@@ -13,6 +13,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from blessing import BlessingManager
 from combat_events import parse_combat_round_events
+from combat_round import parse_combat_round
 from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
 from config import (
     API_HASH,
@@ -66,7 +67,7 @@ from parser import (
 )
 from rewards import parse_battle_reward
 from settings_service import SettingsService
-from skills import enough_health_for_battle, parse_current_mana
+from skills import enough_health_for_battle
 from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
@@ -1032,7 +1033,8 @@ class Farmer:
         self.state = BotState.COMBAT
         self.mark_progress("ход игрока")
 
-        current_mana = parse_current_mana(message.raw_text or "")
+        round_state = self.combat.latest_round
+        current_mana = round_state.current_mana if round_state is not None else None
         self.log(
             f"Выбор навыка: мана={current_mana if current_mana is not None else 'не распознана'}"
         )
@@ -1043,6 +1045,7 @@ class Farmer:
             current_hp=self.context.current_hp,
             max_hp=self.context.max_hp,
             heal_threshold=self.settings.values.heal_threshold,
+            round_state=round_state,
         )
         if decision is None:
             await self.recover_latest_state("не найден доступный навык")
@@ -1064,7 +1067,11 @@ class Farmer:
             action_type=ActionType.USE_SKILL,
             description=skill_name,
             urgent=decision.urgent,
-            remaining_seconds=parse_remaining_seconds(message.raw_text or ""),
+            remaining_seconds=(
+                round_state.remaining_seconds
+                if round_state is not None
+                else parse_remaining_seconds(message.raw_text or "")
+            ),
         )
         if clicked:
             self.mark_progress(f"использован навык {skill_name}")
@@ -1365,6 +1372,7 @@ class Farmer:
             self.settings.values.enabled_targets,
             CHARACTER_NAME,
         )
+        round_state = parse_combat_round(text, get_button_texts(message))
 
         if kind is MessageKind.COMBAT_STARTED:
             observed_target = extract_combat_target(text)
@@ -1373,7 +1381,7 @@ class Farmer:
                 self.combat.begin(observed_target, text)
             elif self.combat.target_name is None:
                 self.combat.target_name = observed_target
-        self.combat.observe(text, CHARACTER_NAME)
+        self.combat.observe(text, CHARACTER_NAME, round_state)
 
         if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
             await self.maybe_request_recovery_map()
@@ -1399,7 +1407,7 @@ class Farmer:
         if await self.handle_blessing_menu(message):
             return
 
-        round_events = parse_combat_round_events(text)
+        round_events = parse_combat_round_events(text, round_state)
         for defeated_enemy in round_events.defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 
-from parser import HEART_HP_RE, normalize
+from combat_round import CombatRoundState, parse_combat_round, parse_starting_health
+from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
 KNOWN_SKILLS = {
@@ -15,11 +15,7 @@ KNOWN_SKILLS = {
     "атака аколита",
 }
 
-USE_SKILL_RE = re.compile(r"использует\s+([^\n\r]+)", re.IGNORECASE)
-DAMAGE_RE = re.compile(r"^(.+?)\s+получает\s+(\d+)\s+урона(?:\s*·\s*(.+))?$", re.IGNORECASE)
-HEAL_RE = re.compile(r"^(.+?)\s+восстанавливает\s+(\d+)\s+HP(?:\s*·\s*(.+))?$", re.IGNORECASE)
-EFFECT_TURNS_RE = re.compile(r"(?:✦|🔥)?\s*(.+?)\s*·\s*(\d+)\s+ход", re.IGNORECASE)
-STARTING_HP_RE = re.compile(r"(\d+)❤️\s+из\s+(\d+)❤️", re.IGNORECASE)
+PERIODIC_EFFECTS = {"горение", "кровотечение", "яд"}
 
 
 class SkillTarget(Enum):
@@ -118,8 +114,13 @@ class CombatMemory:
     pending_target: SkillTarget | None = None
     pending_urgent: bool = False
     knowledge: RecentCombatKnowledge = field(default_factory=RecentCombatKnowledge)
+    latest_round: CombatRoundState | None = None
+    round_history: list[CombatRoundState] = field(default_factory=list)
+    last_battle_rounds: tuple[CombatRoundState, ...] = ()
 
     def reset(self) -> None:
+        if self.round_history:
+            self.last_battle_rounds = tuple(self.round_history)
         self.target_name = None
         self.enemy_current_hp = None
         self.enemy_max_hp = None
@@ -133,95 +134,96 @@ class CombatMemory:
         self.pending_skill = None
         self.pending_target = None
         self.pending_urgent = False
+        self.latest_round = None
+        self.round_history.clear()
 
     def begin(self, target_name: str | None, text: str = "") -> None:
         self.reset()
         self.target_name = target_name
         self.knowledge.load_into(self)
         if target_name:
-            match = STARTING_HP_RE.search(text)
-            if match:
-                self.enemy_current_hp = int(match.group(1))
-                self.enemy_max_hp = int(match.group(2))
+            starting_hp = parse_starting_health(text)
+            if starting_hp:
+                self.enemy_current_hp, self.enemy_max_hp = starting_hp
 
-    def observe(self, text: str, character_name: str) -> None:
-        if not text:
+    def observe(
+        self,
+        text: str,
+        character_name: str,
+        round_state: CombatRoundState | None = None,
+    ) -> None:
+        parsed = round_state or parse_combat_round(text)
+        if parsed is None:
             return
 
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        self.latest_round = parsed
+        self.round_history.append(parsed)
+        character = normalize(character_name)
         used_skills = [
-            normalize(match)
-            for match in USE_SKILL_RE.findall(text)
-            if normalize(match) in KNOWN_SKILLS
+            normalize(skill.skill)
+            for skill in parsed.skill_uses
+            if character in normalize(skill.actor) and normalize(skill.skill) in KNOWN_SKILLS
         ]
         player_skill = used_skills[-1] if used_skills else self.pending_skill
-        character = normalize(character_name)
 
-        for index, line in enumerate(lines):
-            damage_match = DAMAGE_RE.match(line)
-            if damage_match:
-                recipient = normalize(damage_match.group(1))
-                amount = int(damage_match.group(2))
-                effect = normalize(damage_match.group(3) or "")
-                if character in recipient:
-                    if effect:
-                        self.periodic_damage = amount
-                    else:
-                        self.incoming_damage.add(amount)
-                        self.knowledge.add_incoming(self.target_name, amount)
-                elif player_skill is not None:
-                    self.outgoing_damage.setdefault(player_skill, ObservedRange()).add(amount)
-                    self.knowledge.add_outgoing(self.target_name, player_skill, amount)
+        for damage_event in parsed.damage:
+            recipient = normalize(damage_event.target)
+            effect = normalize(damage_event.effect or "")
+            if character in recipient:
+                if effect in PERIODIC_EFFECTS:
+                    self.periodic_damage = damage_event.amount
+                else:
+                    self.incoming_damage.add(damage_event.amount)
+                    self.knowledge.add_incoming(self.target_name, damage_event.amount)
+            elif player_skill is not None and not damage_event.critical:
+                self.outgoing_damage.setdefault(player_skill, ObservedRange()).add(
+                    damage_event.amount
+                )
+                self.knowledge.add_outgoing(
+                    self.target_name,
+                    player_skill,
+                    damage_event.amount,
+                )
 
-            heal_match = HEAL_RE.match(line)
-            if heal_match and character in normalize(heal_match.group(1)):
-                amount = int(heal_match.group(2))
-                effect = normalize(heal_match.group(3) or "")
-                if effect in {"обновление", "renew"}:
-                    self.renewal_healing.add(amount)
-                    self.knowledge.add_renewal_healing(amount)
-                elif player_skill == "лечение":
-                    self.direct_healing.add(amount)
-                    self.knowledge.add_direct_healing(amount)
+        for healing_event in parsed.healing:
+            if character not in normalize(healing_event.target):
+                continue
+            effect = normalize(healing_event.effect or "")
+            if effect in {"обновление", "renew"}:
+                self.renewal_healing.add(healing_event.amount)
+                self.knowledge.add_renewal_healing(healing_event.amount)
+            elif player_skill == "лечение":
+                self.direct_healing.add(healing_event.amount)
+                self.knowledge.add_direct_healing(healing_event.amount)
 
-            if self.target_name and normalize(self.target_name) in normalize(line):
-                for nearby in lines[index + 1 : index + 3]:
-                    hp_match = HEART_HP_RE.search(nearby)
-                    if hp_match:
-                        self.enemy_current_hp = int(hp_match.group(1))
-                        self.enemy_max_hp = int(hp_match.group(2))
-                        break
+        if self.target_name and (target := parsed.combatant(self.target_name)):
+            self.enemy_current_hp = target.current_hp
+            self.enemy_max_hp = target.max_hp
 
-        effect_turns = {
-            normalize(name): int(turns) for name, turns in EFFECT_TURNS_RE.findall(text)
-        }
+        player = parsed.combatant(character_name)
+        effect_turns = (
+            {normalize(effect.name): effect.turns for effect in player.effects}
+            if player
+            else {}
+        )
         if "обновление" in effect_turns:
             self.renewal_turns = effect_turns["обновление"]
-        elif self._contains_player_health_block(lines, character):
+        elif player is not None:
             self.renewal_turns = 0
 
         periodic_effects = [
             turns
             for name, turns in effect_turns.items()
-            if name in {"горение", "кровотечение", "яд"}
+            if name in PERIODIC_EFFECTS
         ]
         if periodic_effects:
             self.periodic_damage_turns = max(periodic_effects)
-        elif self._contains_player_health_block(lines, character):
+        elif player is not None:
             self.periodic_damage_turns = 0
             self.periodic_damage = 0
 
         if used_skills:
             self.pending_skill = None
-
-    @staticmethod
-    def _contains_player_health_block(lines: list[str], character: str) -> bool:
-        for index, line in enumerate(lines):
-            if character not in normalize(line):
-                continue
-            if any(HEART_HP_RE.search(nearby) for nearby in lines[index + 1 : index + 3]):
-                return True
-        return False
 
     def damage_floor(self, skill_name: str) -> int:
         observed = self.outgoing_damage.get(skill_name)
@@ -301,12 +303,21 @@ def choose_combat_action(
     current_hp: int | None,
     max_hp: int | None,
     heal_threshold: int,
+    round_state: CombatRoundState | None = None,
 ) -> CombatDecision | None:
-    available = available_skills(message)
+    available = (
+        round_state.castable_skills()
+        if round_state is not None and round_state.available_skills
+        else available_skills(message)
+    )
     if not available:
         return None
 
-    current_mana = parse_current_mana(getattr(message, "raw_text", "") or "")
+    current_mana = (
+        round_state.current_mana
+        if round_state is not None
+        else parse_current_mana(getattr(message, "raw_text", "") or "")
+    )
     lethal = _lethal_skill(available, memory)
     if lethal is not None:
         return CombatDecision(

@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
-DEFEATED_RE = re.compile(
-    r"💀\s*(.+?)\s+повержен(?:а|о|ы)?(?:\s*$|\n)", re.IGNORECASE | re.MULTILINE
-)
-NEAR_DEATH_RE = re.compile(r"💀\s*(.+?)\s+на грани смерти", re.IGNORECASE)
+from combat_round import CombatRoundState, parse_combat_round
 
 
 @dataclass(frozen=True)
@@ -15,8 +11,14 @@ class CombatRoundEvents:
     near_death_enemies: tuple[str, ...] = ()
 
 
-def parse_combat_round_events(text: str) -> CombatRoundEvents:
+def parse_combat_round_events(
+    text: str,
+    round_state: CombatRoundState | None = None,
+) -> CombatRoundEvents:
+    parsed = round_state or parse_combat_round(text)
+    if parsed is None:
+        return CombatRoundEvents()
     return CombatRoundEvents(
-        defeated_enemies=tuple(match.strip() for match in DEFEATED_RE.findall(text)),
-        near_death_enemies=tuple(match.strip() for match in NEAR_DEATH_RE.findall(text)),
+        defeated_enemies=parsed.defeated,
+        near_death_enemies=parsed.near_death,
     )

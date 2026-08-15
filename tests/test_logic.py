@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from blessing import BlessingManager
+from combat_round import CombatSide, parse_combat_round
 from combat_strategy import CombatMemory, ObservedRange, SkillTarget, choose_combat_action
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
@@ -261,7 +262,12 @@ class CombatStrategyTests(unittest.TestCase):
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=120)
         memory.observe(
             """🪬🧍Kombat использует Лечение
-Фонарщик получает 160 урона""",
+Фонарщик получает 160 урона ❗️Мощный крит""",
+            CHARACTER,
+        )
+        memory.observe(
+            """🪬🧍Kombat использует Лечение
+Фонарщик получает 158 урона 💢 крит""",
             CHARACTER,
         )
 
@@ -412,9 +418,12 @@ class CombatStrategyTests(unittest.TestCase):
         memory = CombatMemory(target_name="Фонарщик")
         memory.observe(
             """⚔️ Раунд 29
+Левая сторона
 🪬🧍Kombat восстанавливает 40 HP · renew
 🪬🧍Kombat использует Лечение
 🪬🧍Kombat восстанавливает 124 HP
+🪬🧍Kombat
+❤️ 203/780
 ✦ Обновление · 2 хода""",
             CHARACTER,
         )
@@ -422,6 +431,133 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(memory.renewal_tick(), 40)
         self.assertEqual(memory.direct_heal(), 124)
         self.assertEqual(memory.renewal_turns, 2)
+
+
+class CombatRoundModelTests(unittest.TestCase):
+    def test_full_player_round_is_parsed_into_typed_state(self) -> None:
+        parsed = parse_combat_round(
+            """⚔️ Раунд 29
+Левая сторона
+🪬🧍Kombat восстанавливает 40 HP · renew
+🪬🧍Kombat использует Лечение
+🪬🧍Kombat восстанавливает 124 HP
+
+🔷 Мана: 4 → 0
+
+🪬🧍Kombat
+❤️ 203/780
+✦ Стойкость веры · 2 хода
+🦵 Калечение · 1 ход
+✦ Обновление · 2 хода
+
+📊 Урон за раунд: 0"""
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.number, 29)
+        self.assertIs(parsed.side, CombatSide.LEFT)
+        self.assertEqual((parsed.mana_before, parsed.mana_after), (4, 0))
+        self.assertEqual(parsed.current_mana, 0)
+        self.assertEqual(parsed.total_damage, 0)
+        self.assertEqual(parsed.skill_uses[0].skill, "Лечение")
+        self.assertEqual(
+            [(event.amount, event.effect) for event in parsed.healing],
+            [(40, "renew"), (124, None)],
+        )
+        player = parsed.combatant(CHARACTER)
+        self.assertIsNotNone(player)
+        assert player is not None
+        self.assertEqual((player.current_hp, player.max_hp), (203, 780))
+        self.assertEqual(
+            [(effect.name, effect.turns) for effect in player.effects],
+            [("Стойкость веры", 2), ("Калечение", 1), ("Обновление", 2)],
+        )
+
+    def test_enemy_round_records_damage_effects_and_defeat(self) -> None:
+        parsed = parse_combat_round(
+            """⚔️ Раунд 7
+Правая сторона
+Пепельник атакует 🪬🧍Kombat
+🪬🧍Kombat получает 85 урона 💢 крит
+🔥 Наложено: Горение на 3 хода
+💫 Пепельник ушла из-под удара
+💀 Фонарщик повержен
+🪬🧍Kombat
+❤️ 303/870
+🔥 Горение · 3 хода
+📊 Урон за раунд: 85"""
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertIs(parsed.side, CombatSide.RIGHT)
+        self.assertEqual(parsed.attacks[0].actor, "Пепельник")
+        self.assertEqual(parsed.attacks[0].target, "🪬🧍Kombat")
+        self.assertEqual(parsed.damage[0].amount, 85)
+        self.assertTrue(parsed.damage[0].critical)
+        self.assertEqual(
+            (parsed.applied_effects[0].name, parsed.applied_effects[0].turns),
+            ("Горение", 3),
+        )
+        self.assertEqual(parsed.applied_effects[0].target, "🪬🧍Kombat")
+        self.assertEqual(parsed.dodged, ("Пепельник",))
+        self.assertEqual(parsed.defeated, ("Фонарщик",))
+
+    def test_player_prompt_includes_cooldowns_costs_and_timer(self) -> None:
+        parsed = parse_combat_round(
+            """🎯 Раунд 8
+Ход Kombat
+🔷 Мана: 6/12
+⏳ Осталось: 18 сек.
+Выбран навык: Лечение""",
+            (
+                "Обновление [Мана 4] (CD: 2)",
+                "Лечение [Мана 4]",
+                "Святое свечение [Мана 3]",
+                "Атака аколита",
+            ),
+        )
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.turn_actor, "Kombat")
+        self.assertEqual((parsed.current_mana, parsed.max_mana), (6, 12))
+        self.assertEqual(parsed.remaining_seconds, 18)
+        self.assertEqual(len(parsed.available_skills), 4)
+        self.assertEqual(
+            set(parsed.castable_skills()),
+            {"лечение", "святое свечение", "атака аколита"},
+        )
+
+    def test_strategy_uses_the_already_parsed_round(self) -> None:
+        message = FakeMessage("текст намеренно без маны", [["не навык"]])
+        round_state = parse_combat_round(
+            "🎯 Раунд 3\nХод Kombat\n🔷 Мана: 6/12",
+            ("Святое свечение [Мана 3]", "Атака аколита"),
+        )
+        assert round_state is not None
+        decision = choose_combat_action(
+            message,
+            memory=CombatMemory(target_name="Фонарщик", enemy_current_hp=800),
+            current_hp=780,
+            max_hp=780,
+            heal_threshold=300,
+            round_state=round_state,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "атака аколита")
+
+    def test_round_history_is_archived_when_the_next_encounter_starts(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe("⚔️ Раунд 1\nФонарщик атакует Kombat\nKombat получает 60 урона", CHARACTER)
+        memory.begin("Другой моб")
+
+        self.assertEqual(len(memory.last_battle_rounds), 1)
+        self.assertEqual(memory.last_battle_rounds[0].number, 1)
+        self.assertEqual(memory.round_history, [])
 
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(

@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config import UNDEAD_MONSTERS
 from parser import HEART_HP_RE, normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
@@ -236,15 +235,6 @@ class CombatMemory:
     def renewal_tick(self) -> int:
         return self.renewal_healing.floor(40)
 
-    def is_undead(self) -> bool:
-        target = normalize(self.target_name or "")
-        return any(normalize(name) == target for name in UNDEAD_MONSTERS)
-
-
-def _can_use_as_attack(memory: CombatMemory, skill_name: str) -> bool:
-    return skill_name != "лечение" or memory.is_undead()
-
-
 def _lethal_skill(
     available: dict[str, SkillButton],
     memory: CombatMemory,
@@ -256,7 +246,7 @@ def _lethal_skill(
     priority = {"атака аколита": 0, "святое свечение": 1, "лечение": 2}
     for skill_name in ("атака аколита", "святое свечение", "лечение"):
         skill = available.get(skill_name)
-        if skill is None or not _can_use_as_attack(memory, skill_name):
+        if skill is None:
             continue
         if memory.damage_floor(skill_name) >= memory.enemy_current_hp:
             candidates.append((skill.mana_cost, priority[skill_name], skill_name))
@@ -270,7 +260,7 @@ def _estimated_enemy_turns(memory: CombatMemory, available: dict[str, SkillButto
     damages = [
         memory.damage_floor(name)
         for name in available
-        if _can_use_as_attack(memory, name) and memory.damage_floor(name) > 0
+        if memory.damage_floor(name) > 0
     ]
     best_damage = max(damages, default=memory.damage_floor("атака аколита"))
     return max(1, math.ceil(memory.enemy_current_hp / max(1, best_damage)))
@@ -332,11 +322,11 @@ def choose_combat_action(
         return CombatDecision("обновление", SkillTarget.SELF, "упреждающее лечение на три хода")
 
     if current_hp <= heal_threshold and treatment is not None:
-        if memory.is_undead() and can_survive_two and enemy_turns > 1:
+        if can_survive_two and enemy_turns > 1:
             return CombatDecision(
                 "лечение",
                 SkillTarget.ENEMY,
-                "атака нежити безопаснее затягивания боя",
+                "атака Лечением безопаснее затягивания боя",
             )
         return CombatDecision("лечение", SkillTarget.SELF, "достигнут порог лечения")
 
@@ -348,8 +338,8 @@ def choose_combat_action(
     ):
         return CombatDecision("святое свечение", SkillTarget.ENEMY, "лучший обычный урон")
 
-    if treatment is not None and memory.is_undead() and can_survive_two:
-        return CombatDecision("лечение", SkillTarget.ENEMY, "лечение наносит урон нежити")
+    if treatment is not None and can_survive_two:
+        return CombatDecision("лечение", SkillTarget.ENEMY, "доступна атакующая цель Лечения")
 
     if renewal is not None and current_hp <= heal_threshold and memory.renewal_turns <= 0:
         return CombatDecision("обновление", SkillTarget.SELF, "мгновенное лечение недоступно")

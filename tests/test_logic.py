@@ -111,8 +111,8 @@ class SkillTests(unittest.TestCase):
         )
         decision = choose_combat_action(
             message,
-            memory=CombatMemory(target_name="Обычный противник", enemy_current_hp=800),
-            current_hp=300,
+            memory=CombatMemory(target_name="Противник", enemy_current_hp=800),
+            current_hp=180,
             max_hp=845,
             heal_threshold=300,
         )
@@ -123,7 +123,7 @@ class SkillTests(unittest.TestCase):
 
 
 class CombatStrategyTests(unittest.TestCase):
-    def test_treatment_attacks_verified_undead_when_safe(self) -> None:
+    def test_available_treatment_attacks_enemy_when_safe(self) -> None:
         memory = CombatMemory()
         memory.begin("Фонарщик", "Фонарщик\n1025❤️ из 1025❤️")
         memory.enemy_current_hp = 552

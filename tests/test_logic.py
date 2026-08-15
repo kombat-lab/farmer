@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from blessing import BlessingManager
-from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
+from combat_strategy import CombatMemory, ObservedRange, SkillTarget, choose_combat_action
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
 from human_delays import HumanDelayModel, parse_remaining_seconds
@@ -160,6 +160,11 @@ class CombatStrategyTests(unittest.TestCase):
 
     def test_renewal_is_cast_before_health_becomes_critical(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552)
+        memory.incoming_damage.add(57)
+        memory.incoming_damage.add(60)
+        memory.outgoing_damage.setdefault("святое свечение", ObservedRange()).add(80)
+        memory.outgoing_damage["святое свечение"].add(82)
+        memory.renewal_healing.add(40)
         decision = choose_combat_action(
             FakeMessage(
                 "Мана: 8/12",
@@ -178,6 +183,8 @@ class CombatStrategyTests(unittest.TestCase):
 
     def test_lethal_holy_light_ignores_mana_reserve(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=74)
+        memory.outgoing_damage.setdefault("святое свечение", ObservedRange()).add(77)
+        memory.outgoing_damage["святое свечение"].add(80)
         decision = choose_combat_action(
             FakeMessage("Мана: 4/12", [["Святое свечение [Мана 3]"], ["Атака аколита"]]),
             memory=memory,
@@ -200,7 +207,7 @@ class CombatStrategyTests(unittest.TestCase):
             CHARACTER,
         )
 
-        self.assertEqual(memory.damage_floor("лечение"), 89)
+        self.assertEqual(memory.damage_floor("лечение"), 0)
 
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
@@ -220,10 +227,42 @@ class CombatStrategyTests(unittest.TestCase):
 
         self.assertEqual(memory.enemy_current_hp, 935)
         self.assertEqual(memory.outgoing_damage["лечение"].minimum, 90)
-        self.assertEqual(memory.damage_floor("лечение"), 89)
+        self.assertEqual(memory.damage_floor("лечение"), 0)
         self.assertEqual(memory.incoming_damage.maximum, 57)
         self.assertEqual(memory.expected_incoming(), 69)
-        self.assertEqual(memory.predicted_incoming(), 100)
+        self.assertEqual(memory.predicted_incoming(), 77)
+
+    def test_unseen_monster_has_no_invented_damage(self) -> None:
+        tier_one = CombatMemory(target_name="Слабый моб")
+        tier_three = CombatMemory(target_name="Сильный моб")
+
+        self.assertIsNone(tier_one.expected_incoming())
+        self.assertIsNone(tier_one.predicted_incoming())
+        self.assertIsNone(tier_three.expected_incoming())
+        self.assertIsNone(tier_three.predicted_incoming())
+
+    def test_incoming_forecast_adapts_to_observed_monster_damage(self) -> None:
+        weak = CombatMemory(target_name="Слабый моб")
+        weak.incoming_damage.add(10)
+        weak.incoming_damage.add(12)
+        strong = CombatMemory(target_name="Сильный моб")
+        strong.incoming_damage.add(100)
+        strong.incoming_damage.add(120)
+
+        self.assertEqual(weak.expected_incoming(), 13)
+        self.assertEqual(weak.predicted_incoming(), 15)
+        self.assertEqual(strong.expected_incoming(), 127)
+        self.assertEqual(strong.predicted_incoming(), 150)
+
+    def test_recent_damage_is_reused_only_for_the_same_monster(self) -> None:
+        memory = CombatMemory()
+        memory.begin("Слабый моб")
+        memory.observe("🪬🧍Kombat получает 12 урона", CHARACTER)
+
+        memory.begin("Слабый моб")
+        self.assertEqual(memory.expected_incoming(), 15)
+        memory.begin("Другой моб")
+        self.assertIsNone(memory.expected_incoming())
 
     def test_threshold_is_soft_when_damage_race_is_safe(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=300)
@@ -242,6 +281,11 @@ class CombatStrategyTests(unittest.TestCase):
 
     def test_renewal_is_skipped_when_it_cannot_fix_the_forecast(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=653)
+        memory.incoming_damage.add(57)
+        memory.incoming_damage.add(60)
+        memory.outgoing_damage.setdefault("святое свечение", ObservedRange()).add(80)
+        memory.outgoing_damage["святое свечение"].add(82)
+        memory.renewal_healing.add(40)
         decision = choose_combat_action(
             FakeMessage(
                 "Мана: 8/12",
@@ -287,7 +331,8 @@ class CombatStrategyTests(unittest.TestCase):
     def test_periodic_damage_and_renewal_are_included_in_forecast(self) -> None:
         memory = CombatMemory(target_name="Пепельник", enemy_current_hp=500)
         memory.observe(
-            """🪬🧍Kombat получает 14 урона · Горение
+            """🪬🧍Kombat получает 50 урона
+🪬🧍Kombat получает 14 урона · Горение
 🪬🧍Kombat восстанавливает 40 HP · renew
 🪬🧍Kombat
 ❤️ 300/870
@@ -299,10 +344,10 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(memory.renewal_turns, 2)
         self.assertEqual(memory.renewal_tick(), 40)
         self.assertEqual(memory.periodic_damage_turns, 2)
-        self.assertEqual(memory.predicted_incoming(), 84)
-        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 84)
+        self.assertEqual(memory.predicted_incoming(), 82)
+        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 82)
         memory.periodic_damage_turns = 1
-        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 70)
+        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 68)
 
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(

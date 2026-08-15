@@ -50,58 +50,56 @@ class ObservedRange:
         self.samples += 1
         self.total += value
 
-    def floor(self, fallback: int) -> int:
-        if self.minimum is None:
-            return fallback
-        # Одиночный критический удар нельзя принимать за гарантированный.
-        # Из наблюдений разрешено только понижать консервативную границу.
-        return min(fallback, self.minimum)
-
-    def ceiling(self, fallback: int) -> int:
-        if self.maximum is None:
-            return fallback
-        return max(fallback, self.maximum)
-
     def average(self, fallback: float) -> float:
         return self.total / self.samples if self.samples else fallback
 
 
-@dataclass(frozen=True)
-class EnemyProfile:
-    incoming_ceiling: int
-    incoming_expected: int
-    skill_damage_floors: dict[str, int]
+@dataclass
+class RecentCombatKnowledge:
+    """Short in-memory history, isolated per monster and current farmer run."""
 
+    sample_limit: int = 12
+    incoming: dict[str, list[int]] = field(default_factory=dict)
+    outgoing: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    direct_healing: list[int] = field(default_factory=list)
+    renewal_healing: list[int] = field(default_factory=list)
 
-ENEMY_PROFILES: dict[str, EnemyProfile] = {
-    normalize("Фонарщик"): EnemyProfile(
-        incoming_ceiling=100,
-        incoming_expected=60,
-        skill_damage_floors={
-            "лечение": 89,
-            "святое свечение": 77,
-            "атака аколита": 31,
-        },
-    ),
-    normalize("Пепельник"): EnemyProfile(
-        incoming_ceiling=70,
-        incoming_expected=52,
-        skill_damage_floors={
-            "лечение": 100,
-            "святое свечение": 97,
-            "атака аколита": 37,
-        },
-    ),
-    normalize("Костяной заяц"): EnemyProfile(
-        incoming_ceiling=45,
-        incoming_expected=40,
-        skill_damage_floors={
-            "лечение": 120,
-            "святое свечение": 106,
-            "атака аколита": 47,
-        },
-    ),
-}
+    def _append(self, samples: list[int], value: int) -> None:
+        if value <= 0:
+            return
+        samples.append(value)
+        del samples[: max(0, len(samples) - self.sample_limit)]
+
+    def add_incoming(self, target_name: str | None, value: int) -> None:
+        target = normalize(target_name or "")
+        if target:
+            self._append(self.incoming.setdefault(target, []), value)
+
+    def add_outgoing(self, target_name: str | None, skill_name: str, value: int) -> None:
+        target = normalize(target_name or "")
+        if not target:
+            return
+        skills = self.outgoing.setdefault(target, {})
+        self._append(skills.setdefault(skill_name, []), value)
+
+    def add_direct_healing(self, value: int) -> None:
+        self._append(self.direct_healing, value)
+
+    def add_renewal_healing(self, value: int) -> None:
+        self._append(self.renewal_healing, value)
+
+    def load_into(self, memory: CombatMemory) -> None:
+        target = normalize(memory.target_name or "")
+        for value in self.incoming.get(target, []):
+            memory.incoming_damage.add(value)
+        for skill_name, values in self.outgoing.get(target, {}).items():
+            observed = memory.outgoing_damage.setdefault(skill_name, ObservedRange())
+            for value in values:
+                observed.add(value)
+        for value in self.direct_healing:
+            memory.direct_healing.add(value)
+        for value in self.renewal_healing:
+            memory.renewal_healing.add(value)
 
 
 @dataclass
@@ -119,6 +117,7 @@ class CombatMemory:
     pending_skill: str | None = None
     pending_target: SkillTarget | None = None
     pending_urgent: bool = False
+    knowledge: RecentCombatKnowledge = field(default_factory=RecentCombatKnowledge)
 
     def reset(self) -> None:
         self.target_name = None
@@ -138,6 +137,7 @@ class CombatMemory:
     def begin(self, target_name: str | None, text: str = "") -> None:
         self.reset()
         self.target_name = target_name
+        self.knowledge.load_into(self)
         if target_name:
             match = STARTING_HP_RE.search(text)
             if match:
@@ -168,8 +168,10 @@ class CombatMemory:
                         self.periodic_damage = amount
                     else:
                         self.incoming_damage.add(amount)
+                        self.knowledge.add_incoming(self.target_name, amount)
                 elif player_skill is not None:
                     self.outgoing_damage.setdefault(player_skill, ObservedRange()).add(amount)
+                    self.knowledge.add_outgoing(self.target_name, player_skill, amount)
 
             heal_match = HEAL_RE.match(line)
             if heal_match and character in normalize(heal_match.group(1)):
@@ -177,8 +179,10 @@ class CombatMemory:
                 effect = normalize(heal_match.group(3) or "")
                 if effect in {"обновление", "renew"}:
                     self.renewal_healing.add(amount)
+                    self.knowledge.add_renewal_healing(amount)
                 elif player_skill == "лечение":
                     self.direct_healing.add(amount)
+                    self.knowledge.add_direct_healing(amount)
 
             if self.target_name and normalize(self.target_name) in normalize(line):
                 for nearby in lines[index + 1 : index + 3]:
@@ -219,51 +223,41 @@ class CombatMemory:
                 return True
         return False
 
-    def profile(self) -> EnemyProfile:
-        normalized_target = normalize(self.target_name or "")
-        return ENEMY_PROFILES.get(
-            normalized_target,
-            EnemyProfile(
-                incoming_ceiling=100,
-                incoming_expected=65,
-                skill_damage_floors={
-                    "лечение": 80,
-                    "святое свечение": 70,
-                    "атака аколита": 25,
-                },
-            ),
-        )
-
     def damage_floor(self, skill_name: str) -> int:
-        fallback = self.profile().skill_damage_floors.get(skill_name, 0)
         observed = self.outgoing_damage.get(skill_name)
-        return observed.floor(fallback) if observed else fallback
+        if observed is None or observed.samples < 2:
+            # Один результат может оказаться критическим ударом и не даёт
+            # безопасной гарантии для добивания.
+            return 0
+        return observed.minimum or 0
 
-    def predicted_incoming(self, *, after_current_tick: bool = False) -> int:
-        direct = self.incoming_damage.ceiling(self.profile().incoming_ceiling)
+    def predicted_incoming(self, *, after_current_tick: bool = False) -> int | None:
+        if self.incoming_damage.samples <= 0 or self.incoming_damage.maximum is None:
+            return None
+        uncertainty = 1.35 if self.incoming_damage.samples == 1 else 1.25
+        if self.incoming_damage.samples >= 4:
+            uncertainty = 1.15
+        direct = math.ceil(self.incoming_damage.maximum * uncertainty)
         required_turns = 1 if after_current_tick else 0
         periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
         return direct + periodic
 
-    def expected_incoming(self, *, after_current_tick: bool = False) -> int:
-        profile = self.profile()
-        direct_average = max(
-            float(profile.incoming_expected),
-            self.incoming_damage.average(profile.incoming_expected),
-        )
-        direct = min(
-            self.incoming_damage.ceiling(profile.incoming_ceiling),
-            max(1, math.ceil(direct_average * 1.15)),
-        )
+    def expected_incoming(self, *, after_current_tick: bool = False) -> int | None:
+        if self.incoming_damage.samples <= 0:
+            return None
+        uncertainty = 1.20 if self.incoming_damage.samples == 1 else 1.15
+        if self.incoming_damage.samples >= 4:
+            uncertainty = 1.10
+        direct = max(1, math.ceil(self.incoming_damage.average(0.0) * uncertainty))
         required_turns = 1 if after_current_tick else 0
         periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
         return direct + periodic
 
-    def renewal_tick(self) -> int:
-        return self.renewal_healing.floor(40)
+    def renewal_tick(self) -> int | None:
+        return self.renewal_healing.minimum
 
-    def direct_heal(self) -> int:
-        return self.direct_healing.floor(124)
+    def direct_heal(self) -> int | None:
+        return self.direct_healing.minimum
 
 def _lethal_skill(
     available: dict[str, SkillButton],
@@ -284,16 +278,20 @@ def _lethal_skill(
     return min(candidates)[2] if candidates else None
 
 
-def _estimated_enemy_turns(memory: CombatMemory, available: dict[str, SkillButton]) -> int:
+def _estimated_enemy_turns(
+    memory: CombatMemory,
+    available: dict[str, SkillButton],
+) -> int | None:
     if memory.enemy_current_hp is None:
-        return 3
+        return None
     damages = [
         memory.damage_floor(name)
         for name in available
         if memory.damage_floor(name) > 0
     ]
-    best_damage = max(damages, default=memory.damage_floor("атака аколита"))
-    return max(1, math.ceil(memory.enemy_current_hp / max(1, best_damage)))
+    if not damages:
+        return None
+    return max(1, math.ceil(memory.enemy_current_hp / max(damages)))
 
 
 def choose_combat_action(
@@ -326,33 +324,56 @@ def choose_combat_action(
 
     worst_incoming = memory.predicted_incoming(after_current_tick=True)
     expected_incoming = memory.expected_incoming(after_current_tick=True)
+    incoming_known = worst_incoming is not None and expected_incoming is not None
     margin = max(10, math.ceil(max_hp * 0.03))
     if current_hp <= heal_threshold:
         # Порог включает более внимательную оценку риска, но сам по себе
         # больше не приказывает использовать лечение.
         margin += math.ceil(max_hp * 0.02)
 
-    renewal_credit = memory.renewal_tick() if memory.renewal_turns > 0 else 0
+    renewal_tick = memory.renewal_tick() or 0
+    renewal_credit = renewal_tick if memory.renewal_turns > 0 else 0
     periodic_now = memory.periodic_damage if memory.periodic_damage_turns > 0 else 0
     effective_hp = max(0, min(max_hp, current_hp + renewal_credit) - periodic_now)
     missing_hp = max_hp - effective_hp
     enemy_turns = _estimated_enemy_turns(memory, available)
-    future_renewal = max(0, memory.renewal_turns - 1) * memory.renewal_tick()
-    survival_turns = max(
-        0,
-        math.floor((effective_hp + future_renewal - margin) / max(1, expected_incoming)),
+    future_renewal = max(0, memory.renewal_turns - 1) * renewal_tick
+    survival_turns = (
+        max(
+            0,
+            math.floor(
+                (effective_hp + future_renewal - margin) / max(1, expected_incoming)
+            ),
+        )
+        if expected_incoming is not None
+        else None
     )
-    race_is_safe = survival_turns >= enemy_turns
-    can_survive_worst_hit = effective_hp > worst_incoming + margin
-    forecast = (
-        f"до победы≈{enemy_turns} ход., запас≈{survival_turns} ход., "
-        f"входящий урон≈{expected_incoming}/{worst_incoming}"
+    race_is_safe = (
+        survival_turns >= enemy_turns
+        if survival_turns is not None and enemy_turns is not None
+        else None
     )
+    can_survive_worst_hit = (
+        effective_hp > worst_incoming + margin if worst_incoming is not None else None
+    )
+    victory_forecast = (
+        f"до победы≈{enemy_turns} ход."
+        if enemy_turns is not None
+        else "урон по врагу изучается"
+    )
+    if incoming_known:
+        survival_forecast = (
+            f"запас≈{survival_turns} ход., входящий урон≈"
+            f"{expected_incoming}/{worst_incoming}"
+        )
+    else:
+        survival_forecast = "входящий урон изучается"
+    forecast = f"{victory_forecast}, {survival_forecast}"
 
     treatment = available.get("лечение")
     renewal = available.get("обновление")
 
-    if treatment is not None and not can_survive_worst_hit:
+    if treatment is not None and can_survive_worst_hit is False:
         return CombatDecision(
             "лечение",
             SkillTarget.SELF,
@@ -360,25 +381,27 @@ def choose_combat_action(
             urgent=True,
         )
 
-    renewed_survival_turns = max(
-        0,
-        math.floor(
-            (
-                effective_hp
-                + future_renewal
-                + memory.renewal_tick() * 3
-                - margin
-            )
-            / max(1, expected_incoming)
-        ),
+    renewed_survival_turns = (
+        max(
+            0,
+            math.floor(
+                (effective_hp + future_renewal + renewal_tick * 3 - margin)
+                / max(1, expected_incoming)
+            ),
+        )
+        if expected_incoming is not None and renewal_tick > 0
+        else None
     )
     renewal_makes_race_safe = (
         renewal is not None
         and memory.renewal_turns <= 0
-        and missing_hp >= memory.renewal_tick() * 2
+        and renewal_tick > 0
+        and missing_hp >= renewal_tick * 2
+        and enemy_turns is not None
         and enemy_turns >= 3
-        and can_survive_worst_hit
-        and not race_is_safe
+        and can_survive_worst_hit is True
+        and race_is_safe is False
+        and renewed_survival_turns is not None
         and renewed_survival_turns >= enemy_turns
     )
     if renewal_makes_race_safe:
@@ -388,21 +411,46 @@ def choose_combat_action(
             f"периодическое лечение меняет прогноз на безопасный; {forecast}",
         )
 
-    healed_hp = min(max_hp, effective_hp + memory.direct_heal())
-    healed_survival_turns = max(
-        0,
-        math.floor((healed_hp + future_renewal - margin) / max(1, expected_incoming)),
+    direct_heal = memory.direct_heal() or 0
+    healed_hp = min(max_hp, effective_hp + direct_heal)
+    healed_survival_turns = (
+        max(
+            0,
+            math.floor(
+                (healed_hp + future_renewal - margin) / max(1, expected_incoming)
+            ),
+        )
+        if expected_incoming is not None and direct_heal > 0
+        else None
     )
+
+    unknown_enemy_emergency_hp = max(margin * 2, math.ceil(max_hp * 0.25))
     if (
         treatment is not None
-        and not race_is_safe
+        and not incoming_known
+        and current_hp <= unknown_enemy_emergency_hp
+    ):
+        return CombatDecision(
+            "лечение",
+            SkillTarget.SELF,
+            f"критический запас HP, а сила нового противника ещё изучается; {forecast}",
+            urgent=True,
+        )
+
+    if (
+        treatment is not None
+        and race_is_safe is False
+        and survival_turns is not None
         and (current_hp <= heal_threshold or survival_turns <= 2)
+        and enemy_turns is not None
         and (survival_turns <= 2 or enemy_turns - survival_turns >= 2)
+        and healed_survival_turns is not None
         and (
             healed_survival_turns >= enemy_turns
             or (survival_turns <= 2 and healed_survival_turns > survival_turns)
         )
-        and missing_hp >= memory.direct_heal() // 2
+        and direct_heal > 0
+        and missing_hp >= direct_heal // 2
     ):
         return CombatDecision(
             "лечение",
@@ -414,11 +462,14 @@ def choose_combat_action(
     if (
         renewal is not None
         and memory.renewal_turns <= 0
-        and not race_is_safe
+        and race_is_safe is False
         and treatment is None
-        and missing_hp >= memory.renewal_tick() * 2
+        and renewal_tick > 0
+        and missing_hp >= renewal_tick * 2
+        and renewed_survival_turns is not None
+        and survival_turns is not None
         and renewed_survival_turns > survival_turns
-        and can_survive_worst_hit
+        and can_survive_worst_hit is True
     ):
         return CombatDecision(
             "обновление",
@@ -438,14 +489,21 @@ def choose_combat_action(
             f"лучший обычный урон; {forecast}",
         )
 
-    if treatment is not None and can_survive_worst_hit:
+    if treatment is not None and can_survive_worst_hit is not False:
         return CombatDecision(
             "лечение",
             SkillTarget.ENEMY,
             f"урон сокращает бой выгоднее лечения себя; {forecast}",
         )
 
-    if renewal is not None and memory.renewal_turns <= 0 and not race_is_safe:
+    if (
+        renewal is not None
+        and memory.renewal_turns <= 0
+        and (
+            race_is_safe is False
+            or (race_is_safe is None and current_hp <= heal_threshold)
+        )
+    ):
         return CombatDecision(
             "обновление",
             SkillTarget.SELF,

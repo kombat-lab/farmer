@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from models import MovePlan, Position, RouteDirection
 
 
@@ -55,13 +57,25 @@ class SnakeNavigator:
             obstacle_mode=False,
         )
 
-    def use_location(self, location_name: str) -> None:
+    def use_location(
+        self,
+        location_name: str,
+        learned_obstacles: Iterable[Position] = (),
+        current_position: Position | None = None,
+    ) -> None:
         from locations import get_location_geometry
 
         geometry = get_location_geometry(location_name)
 
         self.location_name = location_name
-        self.runtime_blocked.clear()
+        learned = {
+            position
+            for position in learned_obstacles
+            if geometry.min_x <= position[0] <= geometry.max_x
+            and geometry.min_y <= position[1] <= geometry.max_y
+            and position not in geometry.blocked_cells
+        }
+        self.runtime_blocked = learned
         self.failed_buttons.clear()
         self.direction = RouteDirection.DOWN
         self.last_plan = None
@@ -71,9 +85,9 @@ class SnakeNavigator:
             max_x=geometry.max_x,
             min_y=geometry.min_y,
             max_y=geometry.max_y,
-            start_position=geometry.start_position,
+            start_position=current_position or geometry.start_position,
             blocked_cells=geometry.blocked_cells,
-            obstacle_mode=bool(geometry.blocked_cells),
+            obstacle_mode=bool(geometry.blocked_cells or learned),
         )
 
     def _configure(
@@ -183,26 +197,9 @@ class SnakeNavigator:
 
         visit(self.start)
 
-        expected = {
-            (x, y)
-            for y in range(
-                self.min_y,
-                self.max_y + 1,
-            )
-            for x in range(
-                self.min_x,
-                self.max_x + 1,
-            )
-            if self._available((x, y))
-        }
-
-        missing = expected - visited
-
-        if missing:
-            raise ValueError(
-                "На карте есть недостижимые клетки: " + ", ".join(map(str, sorted(missing)))
-            )
-
+        # Изученные препятствия могут отделить часть прямоугольника сплошной
+        # стеной. Такая область физически недоступна из текущей позиции и не
+        # должна аварийно останавливать исследование достижимого компонента.
         while len(route) > 1 and route[-1] == self.start:
             route.pop()
 
@@ -478,11 +475,11 @@ class SnakeNavigator:
 
         if (
             mark_destination_blocked
-            and self.obstacle_mode
             and self._inside(plan.destination)
             and plan.destination not in self.blocked_cells
         ):
             self.runtime_blocked.add(plan.destination)
+            self.obstacle_mode = True
             self._rebuild_after_obstacle(current_position)
 
         self.last_plan = None
@@ -496,6 +493,7 @@ class SnakeNavigator:
     ) -> None:
         old_direction = self.direction
 
+        self.start = current_position
         self.route = self._build_route()
         self.position_to_indices = self._index_route(self.route)
         self.route_index = self._nearest_index(current_position)

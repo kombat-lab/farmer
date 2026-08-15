@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from blessing import BlessingManager
+from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
 from models import RuntimeContext
@@ -13,8 +14,9 @@ from navigator import SnakeNavigator
 from parser import classify_message, parse_map
 from rewards import BattleReward, parse_item_stack
 from settings_service import SettingsService
-from skills import HEALING_MANA_RESERVE, choose_skill, enough_health_for_battle
+from skills import HEALING_MANA_RESERVE, enough_health_for_battle
 from storage import Storage
+from targeting import select_combat_target
 from telegram_safety import (
     RollingAttemptGuard,
     StateRefreshGate,
@@ -90,21 +92,175 @@ class SkillTests(unittest.TestCase):
             "Мана: 6/11",
             [["Святое свечение (-3 маны)"], ["Атака аколита"]],
         )
-        self.assertEqual(HEALING_MANA_RESERVE, 4)
-        self.assertEqual(
-            choose_skill(message, current_hp=800, heal_threshold=300),
-            "атака аколита",
+        decision = choose_combat_action(
+            message,
+            memory=CombatMemory(target_name="Фонарщик", enemy_current_hp=800),
+            current_hp=800,
+            max_hp=845,
+            heal_threshold=300,
         )
+        self.assertEqual(HEALING_MANA_RESERVE, 4)
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "атака аколита")
 
     def test_healing_has_priority_below_threshold(self) -> None:
         message = FakeMessage(
             "Мана: 11/11",
             [["Лечение (-4 маны)"], ["Святое свечение (-3 маны)"]],
         )
-        self.assertEqual(
-            choose_skill(message, current_hp=300, heal_threshold=300),
-            "лечение",
+        decision = choose_combat_action(
+            message,
+            memory=CombatMemory(target_name="Обычный противник", enemy_current_hp=800),
+            current_hp=300,
+            max_hp=845,
+            heal_threshold=300,
         )
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.SELF)
+
+
+class CombatStrategyTests(unittest.TestCase):
+    def test_treatment_attacks_verified_undead_when_safe(self) -> None:
+        memory = CombatMemory()
+        memory.begin("Фонарщик", "Фонарщик\n1025❤️ из 1025❤️")
+        memory.enemy_current_hp = 552
+        decision = choose_combat_action(
+            FakeMessage("Мана: 8/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=493,
+            max_hp=780,
+            heal_threshold=300,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.ENEMY)
+
+    def test_treatment_targets_player_when_next_hit_is_dangerous(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552)
+        decision = choose_combat_action(
+            FakeMessage("Мана: 8/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=110,
+            max_hp=780,
+            heal_threshold=300,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.SELF)
+
+    def test_renewal_is_cast_before_health_becomes_critical(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552)
+        decision = choose_combat_action(
+            FakeMessage(
+                "Мана: 8/12",
+                [["Обновление [Мана 4]"], ["Святое свечение [Мана 3]"], ["Атака аколита"]],
+            ),
+            memory=memory,
+            current_hp=430,
+            max_hp=780,
+            heal_threshold=300,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "обновление")
+        self.assertIs(decision.target, SkillTarget.SELF)
+
+    def test_lethal_holy_light_ignores_mana_reserve(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=74)
+        decision = choose_combat_action(
+            FakeMessage("Мана: 4/12", [["Святое свечение [Мана 3]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=200,
+            max_hp=780,
+            heal_threshold=300,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "святое свечение")
+        self.assertIs(decision.target, SkillTarget.ENEMY)
+
+    def test_critical_hit_does_not_raise_guaranteed_damage(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=120)
+        memory.observe(
+            """🪬🧍Kombat использует Лечение
+Фонарщик получает 160 урона""",
+            CHARACTER,
+        )
+
+        self.assertEqual(memory.damage_floor("лечение"), 89)
+
+    def test_real_round_updates_local_damage_model(self) -> None:
+        memory = CombatMemory()
+        memory.begin("Фонарщик", "Вы напали:\nФонарщик\n1025❤️ из 1025❤️")
+        memory.observe(
+            """⚔️ Раунд 1
+🪬🧍Kombat использует Лечение
+Фонарщик получает 90 урона
+Фонарщик
+❤️ 935/1025
+Фонарщик атакует 🪬🧍Kombat
+🪬🧍Kombat получает 57 урона
+🪬🧍Kombat
+❤️ 723/780""",
+            CHARACTER,
+        )
+
+        self.assertEqual(memory.enemy_current_hp, 935)
+        self.assertEqual(memory.outgoing_damage["лечение"].minimum, 90)
+        self.assertEqual(memory.damage_floor("лечение"), 89)
+        self.assertEqual(memory.incoming_damage.maximum, 57)
+
+    def test_periodic_damage_and_renewal_are_included_in_forecast(self) -> None:
+        memory = CombatMemory(target_name="Пепельник", enemy_current_hp=500)
+        memory.observe(
+            """🪬🧍Kombat получает 14 урона · Горение
+🪬🧍Kombat восстанавливает 40 HP · renew
+🪬🧍Kombat
+❤️ 300/870
+✦ Обновление · 2 хода
+🔥 Горение · 2 хода""",
+            CHARACTER,
+        )
+
+        self.assertEqual(memory.renewal_turns, 2)
+        self.assertEqual(memory.renewal_tick(), 40)
+        self.assertEqual(memory.periodic_damage_turns, 2)
+        self.assertEqual(memory.predicted_incoming(), 84)
+        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 84)
+        memory.periodic_damage_turns = 1
+        self.assertEqual(memory.predicted_incoming(after_current_tick=True), 70)
+
+    def test_target_selector_obeys_skill_intent(self) -> None:
+        message = FakeMessage(
+            "Выберите цель для «Лечение»",
+            [["🎯 Kombat [493/780]"], ["🎯 Фонарщик [552/1025]"], ["↩️ Отмена"]],
+        )
+        self_target, self_position = select_combat_target(
+            message,
+            ["Фонарщик"],
+            preferred_target="self",
+            character_name=CHARACTER,
+        )
+        enemy_target, enemy_position = select_combat_target(
+            message,
+            ["Фонарщик"],
+            preferred_target="enemy",
+            character_name=CHARACTER,
+        )
+
+        self.assertIn("Kombat", self_target or "")
+        self.assertEqual(self_position, (0, 0))
+        self.assertEqual(enemy_target, "Фонарщик")
+        self.assertEqual(enemy_position, (1, 0))
 
 
 class ModelTests(unittest.TestCase):
@@ -140,6 +296,31 @@ class MovementRecoveryTests(unittest.TestCase):
 
         self.assertEqual(len(buttons), len(set(buttons)))
         self.assertTrue(exhausted)
+
+    def test_unknown_obstacle_is_learned_on_burned_field(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location("Выжженное поле")
+
+        self.assertEqual((navigator.max_x, navigator.max_y), (11, 11))
+        plan = navigator.plan((11, 0))
+        navigator.reject_last_plan((11, 0), mark_destination_blocked=True)
+
+        self.assertIn(plan.destination, navigator.runtime_blocked)
+        self.assertTrue(navigator.obstacle_mode)
+        self.assertNotIn(plan.destination, navigator.position_to_indices)
+
+    def test_route_stays_in_reachable_component_after_learned_wall(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        wall = {(5, y) for y in range(12)}
+        navigator.use_location(
+            "Выжженное поле",
+            wall,
+            current_position=(11, 0),
+        )
+
+        self.assertTrue(navigator.route)
+        self.assertTrue(all(x > 5 for x, _ in navigator.route))
+        self.assertEqual(navigator.plan((11, 0)).origin, (11, 0))
 
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -276,6 +457,21 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 }.issubset(columns)
             )
             await storage.close()
+
+    async def test_learned_map_obstacles_survive_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            storage = Storage(path)
+            self.assertTrue(await storage.remember_map_obstacle("Выжженное поле", (4, 7)))
+            self.assertFalse(await storage.remember_map_obstacle("Выжженное поле", (4, 7)))
+            await storage.close()
+
+            reopened = Storage(path)
+            self.assertEqual(
+                await reopened.get_map_obstacles("Выжженное поле"),
+                {(4, 7)},
+            )
+            await reopened.close()
 
     async def test_unknown_setting_is_ignored_without_extra_writes(self) -> None:
         with TemporaryDirectory() as directory:

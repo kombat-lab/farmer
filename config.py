@@ -84,7 +84,21 @@ TARGET_MONSTER_CATEGORIES: dict[str, list[str]] = {
         "Серый волк",
         "Пенёк",
     ],
+    "Выжженное поле": [
+        "Фонарщик",
+    ],
 }
+
+# «Лечение» наносит урон нежити. Только подтверждённые противники входят
+# в этот список: ошибочно лечить обычного моба значительно опаснее, чем
+# временно использовать против него базовую атаку.
+UNDEAD_MONSTERS: frozenset[str] = frozenset(
+    {
+        "Фонарщик",
+        "Пепельник",
+        "Костяной заяц",
+    }
+)
 
 DEFAULT_TARGET_MONSTERS: list[str] = [
     monster for monsters in TARGET_MONSTER_CATEGORIES.values() for monster in monsters

@@ -116,6 +116,14 @@ class Storage:
             value_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS map_obstacles (
+            location_name TEXT NOT NULL,
+            position_x INTEGER NOT NULL,
+            position_y INTEGER NOT NULL,
+            discovered_at TEXT NOT NULL,
+            PRIMARY KEY(location_name, position_x, position_y)
+        );
         """)
         self.connection.commit()
 
@@ -365,6 +373,37 @@ class Storage:
                 return json.loads(row["value_json"])
             except json.JSONDecodeError:
                 return default
+
+    async def remember_map_obstacle(
+        self,
+        location_name: str,
+        position: tuple[int, int],
+    ) -> bool:
+        """Persist a blocked cell learned from an inbound map message."""
+        x, y = position
+        async with self.lock:
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO map_obstacles(
+                    location_name, position_x, position_y, discovered_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (location_name, x, y, utc_now()),
+            )
+            self.connection.commit()
+            return cursor.rowcount > 0
+
+    async def get_map_obstacles(self, location_name: str) -> set[tuple[int, int]]:
+        async with self.lock:
+            rows = self.connection.execute(
+                """
+                SELECT position_x, position_y
+                FROM map_obstacles
+                WHERE location_name=?
+                """,
+                (location_name,),
+            ).fetchall()
+            return {(int(row["position_x"]), int(row["position_y"])) for row in rows}
 
     async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
         async with self.lock:

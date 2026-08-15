@@ -13,6 +13,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from blessing import BlessingManager
 from combat_events import parse_combat_round_events
+from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
 from config import (
     API_HASH,
     API_ID,
@@ -64,7 +65,7 @@ from parser import (
 )
 from rewards import parse_battle_reward
 from settings_service import SettingsService
-from skills import choose_skill, enough_health_for_battle, parse_current_mana
+from skills import enough_health_for_battle, parse_current_mana
 from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
@@ -117,6 +118,7 @@ class Farmer:
         self.running = True
 
         self.context = RuntimeContext()
+        self.combat = CombatMemory()
         self.statistics = FarmStatistics()
 
         self.navigator = SnakeNavigator(
@@ -509,7 +511,8 @@ class Farmer:
         current_position: tuple[int, int],
         *,
         movement_blocked: bool = False,
-    ) -> None:
+    ) -> tuple[int, int] | None:
+        previous_obstacles = set(self.navigator.runtime_blocked)
         plan = self.context.pending_move
         if plan is None:
             if movement_blocked:
@@ -517,7 +520,8 @@ class Farmer:
                     current_position,
                     mark_destination_blocked=True,
                 )
-            return
+            learned = self.navigator.runtime_blocked - previous_obstacles
+            return next(iter(learned), None)
 
         if current_position == plan.destination:
             self.navigator.confirm_success(
@@ -565,6 +569,8 @@ class Farmer:
                 self.context.failed_move_attempts += 1
 
         self.context.pending_move = None
+        learned = self.navigator.runtime_blocked - previous_obstacles
+        return next(iter(learned), None)
 
     async def request_pause(self) -> tuple[bool, str]:
         if not self.running:
@@ -720,7 +726,12 @@ class Farmer:
             return
 
         if map_info.location_name and map_info.location_name != self.navigator.location_name:
-            self.navigator.use_location(map_info.location_name)
+            learned_obstacles = await self.storage.get_map_obstacles(map_info.location_name)
+            self.navigator.use_location(
+                map_info.location_name,
+                learned_obstacles,
+                current_position=map_info.position,
+            )
             self.context.pending_move = None
             self.context.failed_move_attempts = 0
 
@@ -729,10 +740,20 @@ class Farmer:
             self.context.current_hp = map_info.current_hp
             self.context.max_hp = map_info.max_hp
 
-        self.confirm_pending_move(
+        learned_obstacle = self.confirm_pending_move(
             map_info.position,
             movement_blocked=map_info.movement_blocked,
         )
+        if learned_obstacle is not None and self.navigator.location_name:
+            inserted = await self.storage.remember_map_obstacle(
+                self.navigator.location_name,
+                learned_obstacle,
+            )
+            if inserted:
+                self.log(
+                    f"Изучено препятствие: {self.navigator.location_name} "
+                    f"{learned_obstacle}. Маршрут перестроен локально."
+                )
 
         if self.state is BotState.RECOVERY:
             await self.handle_recovery_map(message, map_info)
@@ -947,6 +968,10 @@ class Farmer:
             message,
             self.settings.values.enabled_targets,
             self.context.active_target,
+            preferred_target=(
+                "self" if self.combat.pending_target is SkillTarget.SELF else "enemy"
+            ),
+            character_name=CHARACTER_NAME,
         )
 
         if position is None:
@@ -973,7 +998,7 @@ class Farmer:
             f"боевая цель {target_name}",
         )
         if clicked:
-            self.mark_progress("цель атакующего навыка выбрана")
+            self.mark_progress("цель навыка выбрана")
         elif self.running:
             await self.recover_latest_state("не удалось выбрать цель навыка")
 
@@ -986,14 +1011,25 @@ class Farmer:
             f"Выбор навыка: мана={current_mana if current_mana is not None else 'не распознана'}"
         )
 
-        skill_name = choose_skill(
+        decision = choose_combat_action(
             message,
+            memory=self.combat,
             current_hp=self.context.current_hp,
+            max_hp=self.context.max_hp,
             heal_threshold=self.settings.values.heal_threshold,
         )
-        if skill_name is None:
+        if decision is None:
             await self.recover_latest_state("не найден доступный навык")
             return
+
+        skill_name = decision.skill_name
+        self.combat.pending_skill = skill_name
+        self.combat.pending_target = decision.target
+        self.log(
+            f"Тактика: {skill_name} → {decision.target.value}; "
+            f"причина: {decision.reason}; прогноз входящего урона="
+            f"{self.combat.predicted_incoming()}"
+        )
 
         clicked = await self.click_button(
             message,
@@ -1004,6 +1040,9 @@ class Farmer:
         )
         if clicked:
             self.mark_progress(f"использован навык {skill_name}")
+        else:
+            self.combat.pending_skill = None
+            self.combat.pending_target = None
 
     def resolved_battle_target(self) -> str:
         candidates = [
@@ -1044,6 +1083,7 @@ class Farmer:
         )
 
         self.context.clear_combat()
+        self.combat.reset()
         self.context.pending_move = None
         self.context.checked_empty_position = None
 
@@ -1297,6 +1337,15 @@ class Farmer:
             CHARACTER_NAME,
         )
 
+        if kind is MessageKind.COMBAT_STARTED:
+            observed_target = extract_combat_target(text)
+            normalized_text = normalize(text)
+            if "на помощь врагу присоединился" not in normalized_text:
+                self.combat.begin(observed_target, text)
+            elif self.combat.target_name is None:
+                self.combat.target_name = observed_target
+        self.combat.observe(text, CHARACTER_NAME)
+
         if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
             await self.maybe_request_recovery_map()
         if self.state is BotState.RECOVERY and kind is MessageKind.OTHER:
@@ -1325,6 +1374,11 @@ class Farmer:
         for defeated_enemy in round_events.defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")
+            if normalize(self.combat.target_name or "") == normalize(defeated_enemy):
+                if self.context.active_target:
+                    self.combat.begin(self.context.active_target)
+                else:
+                    self.combat.reset()
 
         if kind is MessageKind.MAP:
             await self.handle_map(message, text)
@@ -1428,6 +1482,7 @@ class Farmer:
                     )
 
                 self.context.clear_combat()
+                self.combat.reset()
                 self.mark_progress("бой завершён победой")
                 return
 

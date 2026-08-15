@@ -43,6 +43,14 @@ _LOCATION_GEOMETRY: dict[str, LocationGeometry] = {
             }
         ),
     ),
+    "Выжженное поле": LocationGeometry(
+        min_x=0,
+        max_x=11,
+        min_y=0,
+        max_y=11,
+        start_position=(0, 0),
+        blocked_cells=frozenset(),
+    ),
 }
 
 def get_location_geometry(name: str) -> LocationGeometry:

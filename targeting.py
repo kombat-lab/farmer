@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
 from models import ButtonPosition
 from parser import normalize
@@ -75,6 +76,9 @@ def select_combat_target(
     message,
     priorities: Iterable[str],
     active_target: str | None = None,
+    *,
+    preferred_target: Literal["self", "enemy"] | None = None,
+    character_name: str | None = None,
 ) -> tuple[str | None, ButtonPosition | None]:
     if not getattr(message, "buttons", None):
         return None, None
@@ -92,6 +96,12 @@ def select_combat_target(
             text = getattr(button, "text", "").strip()
             normalized = normalize(text)
             if not text or any(value in normalized for value in ignored):
+                continue
+
+            is_character = bool(character_name and normalize(character_name) in normalized)
+            if preferred_target == "self" and not is_character:
+                continue
+            if preferred_target == "enemy" and is_character:
                 continue
 
             current_hp = _extract_current_hp(text)

@@ -8,7 +8,13 @@ from tempfile import TemporaryDirectory
 
 from blessing import BlessingManager
 from combat_round import CombatSide, parse_combat_round
-from combat_strategy import CombatMemory, ObservedRange, SkillTarget, choose_combat_action
+from combat_strategy import (
+    CombatMemory,
+    ObservedRange,
+    SkillTarget,
+    build_decision_trace,
+    choose_combat_action,
+)
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
 from human_delays import HumanDelayModel, parse_remaining_seconds
@@ -559,6 +565,42 @@ class CombatRoundModelTests(unittest.TestCase):
         self.assertEqual(memory.last_battle_rounds[0].number, 1)
         self.assertEqual(memory.round_history, [])
 
+    def test_decision_trace_explains_and_serializes_the_plan(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552, enemy_max_hp=1025)
+        memory.incoming_damage.add(58)
+        memory.incoming_damage.add(64)
+        round_state = parse_combat_round(
+            "🎯 Раунд 8\nХод Kombat\n🔷 Мана: 6/12",
+            ("Лечение [Мана 4]", "Атака аколита"),
+        )
+        assert round_state is not None
+        decision = choose_combat_action(
+            FakeMessage("", []),
+            memory=memory,
+            current_hp=493,
+            max_hp=780,
+            heal_threshold=300,
+            round_state=round_state,
+        )
+        assert decision is not None
+        trace = build_decision_trace(
+            created_at="2026-08-15T20:00:00+00:00",
+            telegram_message_id=17,
+            memory=memory,
+            round_state=round_state,
+            current_hp=493,
+            max_hp=780,
+            decision=decision,
+        )
+
+        payload = trace.as_payload()
+        self.assertEqual(payload["target_name"], "Фонарщик")
+        self.assertEqual(payload["round_number"], 8)
+        self.assertEqual(payload["incoming_damage"]["samples"], 2)
+        self.assertEqual(payload["decision"]["skill_name"], decision.skill_name)
+        self.assertIn("[COMBAT_PLAN]", trace.format_log())
+        self.assertIn("причина:", trace.format_log())
+
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(
             "Выберите цель для «Лечение»",
@@ -800,6 +842,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "pause_requested",
                 }.issubset(columns)
             )
+            tables = {
+                str(row["name"])
+                for row in storage.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertIn("combat_decisions", tables)
+            self.assertIn("combat_strategy_stats", tables)
             await storage.close()
 
     async def test_learned_map_obstacles_survive_restart(self) -> None:
@@ -865,6 +915,54 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             drops = await storage.get_drops(session_id)
             self.assertEqual(drops[0]["item_name"], "Золотой хитин")
             self.assertEqual(drops[0]["quantity"], 3)
+            await storage.close()
+
+    async def test_combat_decisions_are_linked_to_battle_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+            trace = {
+                "created_at": "2026-08-15T20:00:00+00:00",
+                "telegram_message_id": 10,
+                "target_name": "Фонарщик",
+                "round_number": 8,
+                "decision": {
+                    "skill_name": "Лечение",
+                    "target": "enemy",
+                    "reason": "добивание",
+                    "urgent": True,
+                },
+            }
+            await storage.record_battle(
+                telegram_message_id=11,
+                session_id=session_id,
+                target_name="Фонарщик",
+                result="VICTORY",
+                combat_decisions=(trace,),
+            )
+
+            decisions = await storage.get_combat_decisions("Фонарщик")
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions[0]["result"], "VICTORY")
+            self.assertEqual(decisions[0]["chosen_skill"], "Лечение")
+            self.assertEqual(decisions[0]["trace"]["round_number"], 8)
+
+            faster_trace = dict(trace)
+            faster_trace["telegram_message_id"] = 12
+            faster_trace["round_number"] = 6
+            await storage.record_battle(
+                telegram_message_id=13,
+                session_id=session_id,
+                target_name="Фонарщик",
+                result="VICTORY",
+                combat_decisions=(faster_trace,),
+            )
+            strategies = await storage.get_combat_strategy_stats("Фонарщик")
+            self.assertEqual(len(strategies), 1)
+            self.assertEqual(strategies[0]["strategy_signature"], "Лечение→enemy")
+            self.assertEqual(strategies[0]["victories"], 2)
+            self.assertEqual(strategies[0]["best_victory_rounds"], 6)
+            self.assertEqual(strategies[0]["average_rounds"], 7.0)
             await storage.close()
 
     def test_runtime_statistics_count_stack_quantity(self) -> None:

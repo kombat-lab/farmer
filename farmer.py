@@ -14,7 +14,13 @@ from telethon.errors import FloodWaitError, RPCError
 from blessing import BlessingManager
 from combat_events import parse_combat_round_events
 from combat_round import parse_combat_round
-from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
+from combat_strategy import (
+    CombatDecisionTrace,
+    CombatMemory,
+    SkillTarget,
+    build_decision_trace,
+    choose_combat_action,
+)
 from config import (
     API_HASH,
     API_ID,
@@ -121,6 +127,8 @@ class Farmer:
 
         self.context = RuntimeContext()
         self.combat = CombatMemory()
+        self.combat_decisions: list[CombatDecisionTrace] = []
+        self.pending_combat_decision: CombatDecisionTrace | None = None
         self.delay_model = HumanDelayModel()
         self.statistics = FarmStatistics()
 
@@ -1033,6 +1041,13 @@ class Farmer:
         self.state = BotState.COMBAT
         self.mark_progress("ход игрока")
 
+        if self.pending_combat_decision is not None:
+            self.log(
+                "Предыдущее боевое решение не подтверждено сообщением игры; "
+                "оно не попадёт в статистику."
+            )
+            self.pending_combat_decision = None
+
         round_state = self.combat.latest_round
         current_mana = round_state.current_mana if round_state is not None else None
         self.log(
@@ -1055,10 +1070,16 @@ class Farmer:
         self.combat.pending_skill = skill_name
         self.combat.pending_target = decision.target
         self.combat.pending_urgent = decision.urgent
-        self.log(
-            f"Тактика: {skill_name} → {decision.target.value}; "
-            f"причина: {decision.reason}"
+        decision_trace = build_decision_trace(
+            created_at=utc_now(),
+            telegram_message_id=int(message.id),
+            memory=self.combat,
+            round_state=round_state,
+            current_hp=self.context.current_hp,
+            max_hp=self.context.max_hp,
+            decision=decision,
         )
+        self.log(decision_trace.format_log())
 
         clicked = await self.click_button(
             message,
@@ -1074,11 +1095,13 @@ class Farmer:
             ),
         )
         if clicked:
+            self.pending_combat_decision = decision_trace
             self.mark_progress(f"использован навык {skill_name}")
         else:
             self.combat.pending_skill = None
             self.combat.pending_target = None
             self.combat.pending_urgent = False
+            self.pending_combat_decision = None
 
     def resolved_battle_target(self) -> str:
         candidates = [
@@ -1116,10 +1139,15 @@ class Farmer:
             target_name=target_name,
             result="DEFEAT",
             position=self.context.current_position,
+            combat_decisions=tuple(
+                trace.as_payload() for trace in self.combat_decisions
+            ),
         )
 
         self.context.clear_combat()
         self.combat.reset()
+        self.combat_decisions.clear()
+        self.pending_combat_decision = None
         self.context.pending_move = None
         self.context.checked_empty_position = None
 
@@ -1378,9 +1406,29 @@ class Farmer:
             observed_target = extract_combat_target(text)
             normalized_text = normalize(text)
             if "на помощь врагу присоединился" not in normalized_text:
+                self.combat_decisions.clear()
+                self.pending_combat_decision = None
                 self.combat.begin(observed_target, text)
             elif self.combat.target_name is None:
                 self.combat.target_name = observed_target
+        if self.pending_combat_decision is not None and round_state is not None:
+            player_skills = [
+                skill
+                for skill in round_state.skill_uses
+                if normalize(CHARACTER_NAME) in normalize(skill.actor)
+            ]
+            if player_skills:
+                confirmed_skill = player_skills[-1].skill
+                expected_skill = self.pending_combat_decision.decision.skill_name
+                if normalize(expected_skill) == normalize(confirmed_skill):
+                    self.combat_decisions.append(self.pending_combat_decision)
+                else:
+                    self.log(
+                        "Игра подтвердила другой навык: "
+                        f"ожидался «{expected_skill}», применён «{confirmed_skill}». "
+                        "Решение исключено из статистики."
+                    )
+                self.pending_combat_decision = None
         self.combat.observe(text, CHARACTER_NAME, round_state)
 
         if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
@@ -1498,6 +1546,9 @@ class Farmer:
                     dust=reward.dust,
                     items=reward.items,
                     position=self.context.current_position,
+                    combat_decisions=tuple(
+                        trace.as_payload() for trace in self.combat_decisions
+                    ),
                 )
                 for card in cards:
                     await self.storage.add_event(
@@ -1520,6 +1571,8 @@ class Farmer:
 
                 self.context.clear_combat()
                 self.combat.reset()
+                self.combat_decisions.clear()
+                self.pending_combat_decision = None
                 self.mark_progress("бой завершён победой")
                 return
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from combat_round import CombatRoundState, parse_combat_round, parse_starting_health
 from parser import normalize
@@ -29,6 +30,140 @@ class CombatDecision:
     target: SkillTarget
     reason: str
     urgent: bool = False
+
+
+@dataclass(frozen=True)
+class SkillAvailability:
+    name: str
+    mana_cost: int
+    cooldown: int
+    castable: bool
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "mana_cost": self.mana_cost,
+            "cooldown": self.cooldown,
+            "castable": self.castable,
+        }
+
+
+@dataclass(frozen=True)
+class DamageEstimate:
+    skill_name: str
+    minimum: int | None
+    maximum: int | None
+    average: float | None
+    samples: int
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "skill_name": self.skill_name,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "average": self.average,
+            "samples": self.samples,
+        }
+
+
+@dataclass(frozen=True)
+class CombatDecisionTrace:
+    created_at: str
+    telegram_message_id: int
+    target_name: str
+    round_number: int | None
+    player_current_hp: int | None
+    player_max_hp: int | None
+    enemy_current_hp: int | None
+    enemy_max_hp: int | None
+    current_mana: int | None
+    maximum_mana: int | None
+    renewal_turns: int
+    renewal_tick: int | None
+    periodic_damage: int
+    periodic_damage_turns: int
+    incoming_minimum: int | None
+    incoming_maximum: int | None
+    incoming_average: float | None
+    incoming_samples: int
+    expected_next_hit: int | None
+    worst_next_hit: int | None
+    skills: tuple[SkillAvailability, ...]
+    outgoing_damage: tuple[DamageEstimate, ...]
+    decision: CombatDecision
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "model_version": 1,
+            "created_at": self.created_at,
+            "telegram_message_id": self.telegram_message_id,
+            "target_name": self.target_name,
+            "round_number": self.round_number,
+            "player": {
+                "current_hp": self.player_current_hp,
+                "max_hp": self.player_max_hp,
+            },
+            "enemy": {
+                "current_hp": self.enemy_current_hp,
+                "max_hp": self.enemy_max_hp,
+            },
+            "mana": {"current": self.current_mana, "maximum": self.maximum_mana},
+            "renewal": {"turns": self.renewal_turns, "tick": self.renewal_tick},
+            "periodic_damage": {
+                "amount": self.periodic_damage,
+                "turns": self.periodic_damage_turns,
+            },
+            "incoming_damage": {
+                "minimum": self.incoming_minimum,
+                "maximum": self.incoming_maximum,
+                "average": self.incoming_average,
+                "samples": self.incoming_samples,
+                "expected_next_hit": self.expected_next_hit,
+                "worst_next_hit": self.worst_next_hit,
+            },
+            "skills": [skill.as_payload() for skill in self.skills],
+            "outgoing_damage": [estimate.as_payload() for estimate in self.outgoing_damage],
+            "decision": {
+                "skill_name": self.decision.skill_name,
+                "target": self.decision.target.value,
+                "reason": self.decision.reason,
+                "urgent": self.decision.urgent,
+            },
+        }
+
+    def format_log(self) -> str:
+        def value(number: int | float | None) -> str:
+            if number is None:
+                return "?"
+            if isinstance(number, float):
+                return f"{number:.1f}"
+            return str(number)
+
+        skills = ", ".join(
+            f"{skill.name}[мана {skill.mana_cost}; CD {skill.cooldown}; "
+            f"{'доступен' if skill.castable else 'недоступен'}]"
+            for skill in self.skills
+        )
+        incoming = (
+            f"наблюдения={self.incoming_samples}, "
+            f"min/сред/max={value(self.incoming_minimum)}/"
+            f"{value(self.incoming_average)}/{value(self.incoming_maximum)}, "
+            f"прогноз={value(self.expected_next_hit)}/{value(self.worst_next_hit)}"
+        )
+        return (
+            "[COMBAT_PLAN]\n"
+            f"  Моб: {self.target_name}; раунд: {value(self.round_number)}\n"
+            f"  Состояние: HP {value(self.player_current_hp)}/{value(self.player_max_hp)}; "
+            f"враг {value(self.enemy_current_hp)}/{value(self.enemy_max_hp)}; "
+            f"мана {value(self.current_mana)}/{value(self.maximum_mana)}\n"
+            f"  Эффекты: Обновление {self.renewal_turns} ход. × "
+            f"{value(self.renewal_tick)} HP; периодический урон "
+            f"{self.periodic_damage} × {self.periodic_damage_turns} ход.\n"
+            f"  Входящий урон: {incoming}\n"
+            f"  Навыки: {skills or 'не распознаны'}\n"
+            f"  Решение: {self.decision.skill_name} → {self.decision.target.value}; "
+            f"причина: {self.decision.reason}"
+        )
 
 
 @dataclass
@@ -260,6 +395,66 @@ class CombatMemory:
 
     def direct_heal(self) -> int | None:
         return self.direct_healing.minimum
+
+
+def build_decision_trace(
+    *,
+    created_at: str,
+    telegram_message_id: int,
+    memory: CombatMemory,
+    round_state: CombatRoundState | None,
+    current_hp: int | None,
+    max_hp: int | None,
+    decision: CombatDecision,
+) -> CombatDecisionTrace:
+    current_mana = round_state.current_mana if round_state is not None else None
+    maximum_mana = round_state.max_mana if round_state is not None else None
+    skills = tuple(
+        SkillAvailability(
+            name=skill.name,
+            mana_cost=skill.mana_cost,
+            cooldown=skill.cooldown,
+            castable=skill.can_cast(current_mana),
+        )
+        for skill in (round_state.available_skills if round_state is not None else ())
+    )
+    outgoing = tuple(
+        DamageEstimate(
+            skill_name=skill_name,
+            minimum=observed.minimum,
+            maximum=observed.maximum,
+            average=(observed.average(0.0) if observed.samples else None),
+            samples=observed.samples,
+        )
+        for skill_name, observed in sorted(memory.outgoing_damage.items())
+    )
+    incoming = memory.incoming_damage
+    return CombatDecisionTrace(
+        created_at=created_at,
+        telegram_message_id=telegram_message_id,
+        target_name=memory.target_name or "неопределённый моб",
+        round_number=round_state.number if round_state is not None else None,
+        player_current_hp=current_hp,
+        player_max_hp=max_hp,
+        enemy_current_hp=memory.enemy_current_hp,
+        enemy_max_hp=memory.enemy_max_hp,
+        current_mana=current_mana,
+        maximum_mana=maximum_mana,
+        renewal_turns=memory.renewal_turns,
+        renewal_tick=memory.renewal_tick(),
+        periodic_damage=memory.periodic_damage,
+        periodic_damage_turns=memory.periodic_damage_turns,
+        incoming_minimum=incoming.minimum,
+        incoming_maximum=incoming.maximum,
+        incoming_average=(incoming.average(0.0) if incoming.samples else None),
+        incoming_samples=incoming.samples,
+        expected_next_hit=memory.expected_incoming(after_current_tick=True),
+        worst_next_hit=memory.predicted_incoming(after_current_tick=True),
+        skills=skills,
+        outgoing_damage=outgoing,
+        decision=decision,
+    )
+
 
 def _lethal_skill(
     available: dict[str, SkillButton],

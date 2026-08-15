@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from rewards import parse_item_stack
 
@@ -75,6 +76,37 @@ class Storage:
             quantity INTEGER NOT NULL DEFAULT 1,
             is_card INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS combat_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            battle_id INTEGER NOT NULL,
+            sequence_number INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            telegram_message_id INTEGER NOT NULL,
+            target_name TEXT NOT NULL,
+            round_number INTEGER,
+            chosen_skill TEXT NOT NULL,
+            chosen_target TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            urgent INTEGER NOT NULL DEFAULT 0,
+            trace_json TEXT NOT NULL,
+            UNIQUE(battle_id, sequence_number),
+            FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_combat_decisions_target
+            ON combat_decisions(target_name, chosen_skill);
+
+        CREATE TABLE IF NOT EXISTS combat_strategy_stats (
+            target_name TEXT NOT NULL,
+            strategy_signature TEXT NOT NULL,
+            battles INTEGER NOT NULL DEFAULT 0,
+            victories INTEGER NOT NULL DEFAULT 0,
+            defeats INTEGER NOT NULL DEFAULT 0,
+            total_rounds INTEGER NOT NULL DEFAULT 0,
+            best_victory_rounds INTEGER,
+            last_used_at TEXT NOT NULL,
+            PRIMARY KEY(target_name, strategy_signature)
         );
 
         CREATE TABLE IF NOT EXISTS farmer_state (
@@ -436,6 +468,7 @@ class Storage:
         dust=0,
         items=(),
         position=None,
+        combat_decisions: tuple[dict[str, Any], ...] = (),
     ) -> tuple[bool, list[str]]:
         cards: list[str] = []
         async with self.lock:
@@ -467,6 +500,83 @@ class Storage:
             if cur.lastrowid is None:
                 raise RuntimeError("SQLite не вернул ID нового боя")
             battle_id = int(cur.lastrowid)
+            for sequence_number, trace in enumerate(combat_decisions, start=1):
+                decision = trace.get("decision")
+                decision_data = decision if isinstance(decision, dict) else {}
+                self.connection.execute(
+                    """
+                    INSERT INTO combat_decisions(
+                        battle_id,sequence_number,created_at,telegram_message_id,
+                        target_name,round_number,chosen_skill,chosen_target,
+                        reason,urgent,trace_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        battle_id,
+                        sequence_number,
+                        str(trace.get("created_at") or utc_now()),
+                        int(trace.get("telegram_message_id") or 0),
+                        str(trace.get("target_name") or target_name),
+                        trace.get("round_number"),
+                        str(decision_data.get("skill_name") or "неизвестно"),
+                        str(decision_data.get("target") or "unknown"),
+                        str(decision_data.get("reason") or ""),
+                        int(bool(decision_data.get("urgent"))),
+                        json.dumps(trace, ensure_ascii=False),
+                    ),
+                )
+            if combat_decisions:
+                decisions: list[dict[str, Any]] = []
+                for trace in combat_decisions:
+                    raw_decision = trace.get("decision")
+                    decisions.append(
+                        {str(key): value for key, value in raw_decision.items()}
+                        if isinstance(raw_decision, dict)
+                        else {}
+                    )
+                strategy_signature = " > ".join(
+                    f"{decision.get('skill_name', 'неизвестно')}→"
+                    f"{decision.get('target', 'unknown')}"
+                    for decision in decisions
+                )
+                round_numbers = [
+                    int(trace["round_number"])
+                    for trace in combat_decisions
+                    if isinstance(trace.get("round_number"), int)
+                ]
+                rounds = max(round_numbers, default=len(combat_decisions))
+                victory_rounds = rounds if result == "VICTORY" else None
+                self.connection.execute(
+                    """
+                    INSERT INTO combat_strategy_stats(
+                        target_name,strategy_signature,battles,victories,defeats,
+                        total_rounds,best_victory_rounds,last_used_at
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    ON CONFLICT(target_name,strategy_signature) DO UPDATE SET
+                        battles=battles+1,
+                        victories=victories+excluded.victories,
+                        defeats=defeats+excluded.defeats,
+                        total_rounds=total_rounds+excluded.total_rounds,
+                        best_victory_rounds=CASE
+                            WHEN excluded.best_victory_rounds IS NULL
+                                THEN best_victory_rounds
+                            WHEN best_victory_rounds IS NULL
+                                THEN excluded.best_victory_rounds
+                            ELSE MIN(best_victory_rounds, excluded.best_victory_rounds)
+                        END,
+                        last_used_at=excluded.last_used_at
+                    """,
+                    (
+                        target_name,
+                        strategy_signature,
+                        1,
+                        int(result == "VICTORY"),
+                        int(result == "DEFEAT"),
+                        rounds,
+                        victory_rounds,
+                        utc_now(),
+                    ),
+                )
             for item in items:
                 item_name, quantity = parse_item_stack(str(item))
                 n = item_name.casefold()
@@ -495,6 +605,48 @@ class Storage:
                 )
             self.connection.commit()
             return True, cards
+
+    async def get_combat_decisions(self, target_name: str | None = None) -> list[dict]:
+        query = """
+            SELECT cd.*, b.result
+            FROM combat_decisions cd
+            JOIN battles b ON b.id=cd.battle_id
+        """
+        params: tuple = ()
+        if target_name is not None:
+            query += " WHERE cd.target_name=?"
+            params = (target_name,)
+        query += " ORDER BY cd.id"
+
+        async with self.lock:
+            rows = self.connection.execute(query, params).fetchall()
+            result: list[dict] = []
+            for row in rows:
+                item = dict(row)
+                with suppress(json.JSONDecodeError):
+                    item["trace"] = json.loads(str(item.pop("trace_json")))
+                result.append(item)
+            return result
+
+    async def get_combat_strategy_stats(
+        self,
+        target_name: str | None = None,
+    ) -> list[dict]:
+        query = """
+            SELECT *,
+                   CASE WHEN battles > 0
+                       THEN CAST(victories AS REAL) / battles ELSE 0 END AS win_rate,
+                   CASE WHEN battles > 0
+                       THEN CAST(total_rounds AS REAL) / battles ELSE NULL END AS average_rounds
+            FROM combat_strategy_stats
+        """
+        params: tuple = ()
+        if target_name is not None:
+            query += " WHERE target_name=?"
+            params = (target_name,)
+        query += " ORDER BY win_rate DESC, average_rounds ASC"
+        async with self.lock:
+            return [dict(row) for row in self.connection.execute(query, params).fetchall()]
 
     async def get_current_session(self) -> SessionSummary:
         async with self.lock:

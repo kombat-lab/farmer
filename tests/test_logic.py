@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ from blessing import BlessingManager
 from combat_strategy import CombatMemory, SkillTarget, choose_combat_action
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
+from human_delays import HumanDelayModel, parse_remaining_seconds
 from models import RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, parse_map
@@ -120,6 +122,7 @@ class SkillTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.skill_name, "лечение")
         self.assertIs(decision.target, SkillTarget.SELF)
+        self.assertTrue(decision.urgent)
 
 
 class CombatStrategyTests(unittest.TestCase):
@@ -187,6 +190,7 @@ class CombatStrategyTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.skill_name, "святое свечение")
         self.assertIs(decision.target, SkillTarget.ENEMY)
+        self.assertTrue(decision.urgent)
 
     def test_critical_hit_does_not_raise_guaranteed_damage(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=120)
@@ -218,6 +222,67 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(memory.outgoing_damage["лечение"].minimum, 90)
         self.assertEqual(memory.damage_floor("лечение"), 89)
         self.assertEqual(memory.incoming_damage.maximum, 57)
+        self.assertEqual(memory.expected_incoming(), 69)
+        self.assertEqual(memory.predicted_incoming(), 100)
+
+    def test_threshold_is_soft_when_damage_race_is_safe(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=300)
+        decision = choose_combat_action(
+            FakeMessage("Мана: 8/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=400,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.ENEMY)
+
+    def test_renewal_is_skipped_when_it_cannot_fix_the_forecast(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=653)
+        decision = choose_combat_action(
+            FakeMessage(
+                "Мана: 8/12",
+                [
+                    ["Обновление [Мана 4]"],
+                    ["Лечение [Мана 4]"],
+                    ["Святое свечение [Мана 3]"],
+                    ["Атака аколита"],
+                ],
+            ),
+            memory=memory,
+            current_hp=461,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "святое свечение")
+
+    def test_high_soft_threshold_does_not_force_early_healing(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=855)
+        decision = choose_combat_action(
+            FakeMessage(
+                "Мана: 8/12",
+                [
+                    ["Обновление [Мана 4]"],
+                    ["Лечение [Мана 4]"],
+                    ["Святое свечение [Мана 3]"],
+                    ["Атака аколита"],
+                ],
+            ),
+            memory=memory,
+            current_hp=590,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "святое свечение")
 
     def test_periodic_damage_and_renewal_are_included_in_forecast(self) -> None:
         memory = CombatMemory(target_name="Пепельник", enemy_current_hp=500)
@@ -383,6 +448,30 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await limiter.acquire(), 9.0)
         self.assertEqual(now, 10.0)
         self.assertFalse(limiter.pending)
+
+
+class HumanDelayTests(unittest.TestCase):
+    def test_delays_stay_inside_configured_ranges(self) -> None:
+        model = HumanDelayModel(random.Random(7))
+        normal = [model.action_delay(2.0, 7.0) for _ in range(100)]
+        urgent = [model.action_delay(2.0, 7.0, urgent=True) for _ in range(100)]
+
+        self.assertTrue(all(2.0 <= delay <= 7.0 for delay in normal))
+        self.assertTrue(all(2.0 <= delay <= 4.0 for delay in urgent))
+        self.assertLess(sum(normal) / len(normal), 4.8)
+
+    def test_turn_timer_caps_delay_with_safety_margin(self) -> None:
+        model = HumanDelayModel(random.Random(3))
+
+        self.assertLessEqual(model.action_delay(2.0, 7.0, remaining_seconds=7), 1.0)
+        self.assertEqual(parse_remaining_seconds("⏳ Осталось: 24 сек"), 24)
+
+    def test_long_pause_cannot_repeat_every_move(self) -> None:
+        model = HumanDelayModel(random.Random(1))
+
+        self.assertFalse(model.should_take_long_pause(1.0))
+        self.assertFalse(model.should_take_long_pause(1.0))
+        self.assertTrue(model.should_take_long_pause(1.0))
 
 
 class SharedComponentTests(unittest.IsolatedAsyncioTestCase):

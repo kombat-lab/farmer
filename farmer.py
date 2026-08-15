@@ -47,6 +47,7 @@ from config import (
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
+from human_delays import HumanDelayModel, parse_remaining_seconds
 from logger_setup import setup_logging
 from models import (
     ActionType,
@@ -119,6 +120,7 @@ class Farmer:
 
         self.context = RuntimeContext()
         self.combat = CombatMemory()
+        self.delay_model = HumanDelayModel()
         self.statistics = FarmStatistics()
 
         self.navigator = SnakeNavigator(
@@ -299,7 +301,13 @@ class Farmer:
             finally:
                 self.event_queue.task_done()
 
-    def action_delay(self, action_type: ActionType) -> float:
+    def action_delay(
+        self,
+        action_type: ActionType,
+        *,
+        urgent: bool = False,
+        remaining_seconds: int | None = None,
+    ) -> float:
         s = self.settings.values
         ranges = {
             ActionType.MOVE: (s.move_delay_min, s.move_delay_max),
@@ -308,7 +316,12 @@ class Farmer:
             ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
         }
         minimum, maximum = ranges[action_type]
-        return random.uniform(minimum, maximum)
+        return self.delay_model.action_delay(
+            minimum,
+            maximum,
+            urgent=urgent,
+            remaining_seconds=remaining_seconds,
+        )
 
     async def intentional_sleep(self, seconds: float) -> None:
         """Marks configured human-like waits so watchdog does not recover over them."""
@@ -414,8 +427,14 @@ class Farmer:
         exact: str | None = None,
         contains: tuple[str, ...] = (),
         exclude: tuple[str, ...] = (),
+        urgent: bool = False,
+        remaining_seconds: int | None = None,
     ) -> bool:
-        delay = self.action_delay(action_type)
+        delay = self.action_delay(
+            action_type,
+            urgent=urgent,
+            remaining_seconds=remaining_seconds,
+        )
 
         self.log(f"Ожидание {delay:.1f} сек. перед действием: {description}")
         await self.intentional_sleep(delay)
@@ -791,11 +810,14 @@ class Farmer:
             await self.wait_for_battle_health()
             return
 
-        if map_info.movement_finished and random.random() < self.settings.values.long_pause_chance:
-            pause = random.uniform(
+        if map_info.movement_finished and self.delay_model.should_take_long_pause(
+            self.settings.values.long_pause_chance
+        ):
+            pause = self.delay_model.action_delay(
                 self.settings.values.long_pause_min,
                 self.settings.values.long_pause_max,
             )
+            self.log(f"Длинная пауза после серии перемещений: {pause:.1f} сек.")
             await self.intentional_sleep(pause)
 
         if await self.try_refresh_blessing_from_map(message):
@@ -978,7 +1000,11 @@ class Farmer:
             await self.recover_latest_state("не найдена доступная цель навыка")
             return
 
-        delay = self.action_delay(ActionType.SELECT_TARGET)
+        delay = self.action_delay(
+            ActionType.SELECT_TARGET,
+            urgent=self.combat.pending_urgent,
+            remaining_seconds=parse_remaining_seconds(message.raw_text or ""),
+        )
         self.log(f"Ожидание {delay:.1f} сек. перед выбором боевой цели: {target_name}")
         await self.intentional_sleep(delay)
 
@@ -1025,10 +1051,10 @@ class Farmer:
         skill_name = decision.skill_name
         self.combat.pending_skill = skill_name
         self.combat.pending_target = decision.target
+        self.combat.pending_urgent = decision.urgent
         self.log(
             f"Тактика: {skill_name} → {decision.target.value}; "
-            f"причина: {decision.reason}; прогноз входящего урона="
-            f"{self.combat.predicted_incoming()}"
+            f"причина: {decision.reason}"
         )
 
         clicked = await self.click_button(
@@ -1037,12 +1063,15 @@ class Farmer:
             exclude=("CD:",),
             action_type=ActionType.USE_SKILL,
             description=skill_name,
+            urgent=decision.urgent,
+            remaining_seconds=parse_remaining_seconds(message.raw_text or ""),
         )
         if clicked:
             self.mark_progress(f"использован навык {skill_name}")
         else:
             self.combat.pending_skill = None
             self.combat.pending_target = None
+            self.combat.pending_urgent = False
 
     def resolved_battle_target(self) -> str:
         candidates = [

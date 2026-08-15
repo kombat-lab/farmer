@@ -423,6 +423,11 @@ def choose_combat_action(
         if expected_incoming is not None and direct_heal > 0
         else None
     )
+    race_gap = (
+        enemy_turns - survival_turns
+        if enemy_turns is not None and survival_turns is not None
+        else None
+    )
 
     unknown_enemy_emergency_hp = max(margin * 2, math.ceil(max_hp * 0.25))
     if (
@@ -439,23 +444,36 @@ def choose_combat_action(
 
     if (
         treatment is not None
+        and direct_heal <= 0
+        and race_is_safe is False
+        and survival_turns is not None
+        and race_gap is not None
+        and race_gap >= 2
+        and (current_hp <= heal_threshold or survival_turns <= 2)
+    ):
+        return CombatDecision(
+            "лечение",
+            SkillTarget.SELF,
+            f"первое безопасное самолечение уточнит его силу; {forecast}",
+            urgent=survival_turns <= 1,
+        )
+
+    if (
+        treatment is not None
         and race_is_safe is False
         and survival_turns is not None
         and (current_hp <= heal_threshold or survival_turns <= 2)
-        and enemy_turns is not None
-        and (survival_turns <= 2 or enemy_turns - survival_turns >= 2)
+        and race_gap is not None
+        and (survival_turns <= 2 or race_gap >= 2)
         and healed_survival_turns is not None
-        and (
-            healed_survival_turns >= enemy_turns
-            or (survival_turns <= 2 and healed_survival_turns > survival_turns)
-        )
+        and healed_survival_turns > survival_turns
         and direct_heal > 0
         and missing_hp >= direct_heal // 2
     ):
         return CombatDecision(
             "лечение",
             SkillTarget.SELF,
-            f"мгновенное лечение меняет прогноз на безопасный; {forecast}",
+            f"мгновенное лечение увеличивает запас ходов; {forecast}",
             urgent=survival_turns <= 1,
         )
 

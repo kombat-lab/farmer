@@ -142,6 +142,15 @@ class SkillTests(unittest.TestCase):
 
 
 class CombatStrategyTests(unittest.TestCase):
+    @staticmethod
+    def unsafe_race_memory() -> CombatMemory:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=800)
+        memory.incoming_damage.add(60)
+        memory.incoming_damage.add(62)
+        memory.outgoing_damage.setdefault("лечение", ObservedRange()).add(90)
+        memory.outgoing_damage["лечение"].add(92)
+        return memory
+
     def test_available_treatment_attacks_enemy_when_safe(self) -> None:
         memory = CombatMemory()
         memory.begin("Фонарщик", "Фонарщик\n1025❤️ из 1025❤️")
@@ -173,6 +182,39 @@ class CombatStrategyTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.skill_name, "лечение")
         self.assertIs(decision.target, SkillTarget.SELF)
+
+    def test_unsafe_race_bootstraps_unknown_self_healing(self) -> None:
+        memory = self.unsafe_race_memory()
+        decision = choose_combat_action(
+            FakeMessage("Мана: 4/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=400,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.SELF)
+        self.assertIn("уточнит его силу", decision.reason)
+
+    def test_known_self_healing_can_improve_an_unsafe_race(self) -> None:
+        memory = self.unsafe_race_memory()
+        memory.direct_healing.add(124)
+        decision = choose_combat_action(
+            FakeMessage("Мана: 4/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=400,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.SELF)
+        self.assertIn("увеличивает запас ходов", decision.reason)
 
     def test_renewal_is_cast_before_health_becomes_critical(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552)
@@ -295,7 +337,7 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(decision.skill_name, "лечение")
         self.assertIs(decision.target, SkillTarget.ENEMY)
 
-    def test_renewal_is_skipped_when_it_cannot_fix_the_forecast(self) -> None:
+    def test_direct_heal_replaces_renewal_when_renewal_cannot_fix_forecast(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=653)
         memory.incoming_damage.add(57)
         memory.incoming_damage.add(60)
@@ -320,7 +362,8 @@ class CombatStrategyTests(unittest.TestCase):
 
         self.assertIsNotNone(decision)
         assert decision is not None
-        self.assertEqual(decision.skill_name, "святое свечение")
+        self.assertEqual(decision.skill_name, "лечение")
+        self.assertIs(decision.target, SkillTarget.SELF)
 
     def test_high_soft_threshold_does_not_force_early_healing(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=855)
@@ -364,6 +407,21 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(memory.predicted_incoming(after_current_tick=True), 82)
         memory.periodic_damage_turns = 1
         self.assertEqual(memory.predicted_incoming(after_current_tick=True), 68)
+
+    def test_real_round_learns_direct_and_renewal_healing(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            """⚔️ Раунд 29
+🪬🧍Kombat восстанавливает 40 HP · renew
+🪬🧍Kombat использует Лечение
+🪬🧍Kombat восстанавливает 124 HP
+✦ Обновление · 2 хода""",
+            CHARACTER,
+        )
+
+        self.assertEqual(memory.renewal_tick(), 40)
+        self.assertEqual(memory.direct_heal(), 124)
+        self.assertEqual(memory.renewal_turns, 2)
 
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(

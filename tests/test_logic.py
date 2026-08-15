@@ -5,10 +5,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from config import DEFAULT_HEAL_THRESHOLD
 from models import RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, parse_map
 from rewards import BattleReward, parse_item_stack
+from settings_service import SettingsService
 from skills import HEALING_MANA_RESERVE, choose_skill
 from storage import Storage
 from telegram_safety import (
@@ -202,6 +204,39 @@ class RewardTests(unittest.TestCase):
 
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_database_uses_current_schema_directly(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            columns = {
+                str(row["name"])
+                for row in storage.connection.execute(
+                    "PRAGMA table_info(farmer_state)"
+                ).fetchall()
+            }
+
+            self.assertTrue(
+                {
+                    "current_cycle",
+                    "cycles_count",
+                    "moves_in_cycle",
+                    "moves_per_cycle",
+                    "rest_until",
+                    "pause_requested",
+                }.issubset(columns)
+            )
+            await storage.close()
+
+    async def test_legacy_setting_is_not_migrated_on_load(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.set_setting("max_hp", 610)
+            settings = SettingsService(storage)
+
+            await settings.load()
+
+            self.assertEqual(settings.values.heal_threshold, DEFAULT_HEAL_THRESHOLD)
+            await storage.close()
+
     async def test_new_session_closes_abandoned_running_sessions(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")

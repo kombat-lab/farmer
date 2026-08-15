@@ -38,15 +38,6 @@ class Storage:
         self.connection.execute("PRAGMA busy_timeout=5000")
         self._create_schema()
 
-    def _columns(self, table: str) -> set[str]:
-        rows = self.connection.execute(f"PRAGMA table_info({table})").fetchall()
-        return {row[1] for row in rows}
-
-    def _add_column(self, table: str, definition: str) -> None:
-        name = definition.split()[0]
-        if name not in self._columns(table):
-            self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
-
     def _create_schema(self) -> None:
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
@@ -99,7 +90,13 @@ class Storage:
             last_action TEXT,
             last_progress_at TEXT,
             last_error TEXT,
-            session_id INTEGER
+            session_id INTEGER,
+            current_cycle INTEGER NOT NULL DEFAULT 1,
+            cycles_count INTEGER NOT NULL DEFAULT 1,
+            moves_in_cycle INTEGER NOT NULL DEFAULT 0,
+            moves_per_cycle INTEGER NOT NULL DEFAULT 80,
+            rest_until TEXT,
+            pause_requested INTEGER NOT NULL DEFAULT 0
         );
         INSERT OR IGNORE INTO farmer_state(singleton) VALUES (1);
 
@@ -119,29 +116,7 @@ class Storage:
             updated_at TEXT NOT NULL
         );
         """)
-        for definition in (
-            "current_cycle INTEGER NOT NULL DEFAULT 1",
-            "cycles_count INTEGER NOT NULL DEFAULT 1",
-            "moves_in_cycle INTEGER NOT NULL DEFAULT 0",
-            "moves_per_cycle INTEGER NOT NULL DEFAULT 80",
-            "rest_until TEXT",
-            "pause_requested INTEGER NOT NULL DEFAULT 0",
-        ):
-            self._add_column("farmer_state", definition)
-        self._normalize_drop_stacks()
         self.connection.commit()
-
-    def _normalize_drop_stacks(self) -> None:
-        """Migrates historical names such as ``Item x3`` into quantity=3."""
-        rows = self.connection.execute("SELECT id,item_name,quantity FROM drops").fetchall()
-        for row in rows:
-            name, multiplier = parse_item_stack(str(row["item_name"]))
-            if multiplier == 1 and name == row["item_name"]:
-                continue
-            self.connection.execute(
-                "UPDATE drops SET item_name=?, quantity=? WHERE id=?",
-                (name, max(1, int(row["quantity"])) * multiplier, int(row["id"])),
-            )
 
     def _close_abandoned_sessions(self) -> int:
         """Closes sessions left RUNNING by a killed container or an old defect."""
@@ -191,23 +166,6 @@ class Storage:
         """Удаляет диагностические и статистические записи старше retention_days."""
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, retention_days))).isoformat()
         async with self.lock:
-            # Сначала удаляем ошибочные старые агрегаты с неизвестной целью.
-            unknown_battles = self.connection.execute(
-                "SELECT id FROM battles WHERE trim(lower(target_name)) IN (?, ?)",
-                ("неизвестная цель", "unknown target"),
-            ).fetchall()
-            unknown_ids = [int(row["id"]) for row in unknown_battles]
-            if unknown_ids:
-                placeholders = ",".join("?" for _ in unknown_ids)
-                self.connection.execute(
-                    f"DELETE FROM drops WHERE battle_id IN ({placeholders})",
-                    unknown_ids,
-                )
-                self.connection.execute(
-                    f"DELETE FROM battles WHERE id IN ({placeholders})",
-                    unknown_ids,
-                )
-
             deleted_events = self.connection.execute(
                 "DELETE FROM events WHERE created_at < ?", (cutoff,)
             ).rowcount
@@ -251,7 +209,6 @@ class Storage:
                 "drops": max(0, deleted_drops),
                 "battles": max(0, deleted_battles),
                 "sessions": max(0, deleted_sessions),
-                "unknown_battles": len(unknown_ids),
             }
 
     async def start_session(

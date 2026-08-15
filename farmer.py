@@ -1648,13 +1648,12 @@ class Farmer:
         cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
         logger.info(
             "Очистка хранения: срок %s дн.; events=%s, battles=%s, "
-            "drops=%s, sessions=%s, unknown=%s, logs=%s",
+            "drops=%s, sessions=%s, logs=%s",
             DATA_RETENTION_DAYS,
             cleanup["events"],
             cleanup["battles"],
             cleanup["drops"],
             cleanup["sessions"],
-            cleanup["unknown_battles"],
             deleted_logs,
         )
         self.session_id = await self.storage.start_session(

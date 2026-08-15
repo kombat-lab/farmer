@@ -68,18 +68,6 @@ class SettingsService:
     async def load(self) -> None:
         stored = await self.storage.get_settings()
 
-        # Preserve the old effective behaviour during an upgrade. Previously
-        # healing started at max_hp - heal_amount; the user can then adjust the
-        # resulting explicit threshold directly in the control bot.
-        if "heal_threshold" not in stored and "max_hp" in stored:
-            try:
-                stored["heal_threshold"] = max(
-                    1,
-                    int(stored["max_hp"]) - int(stored.get("heal_amount", DEFAULT_HEAL_AMOUNT)),
-                )
-            except (TypeError, ValueError):
-                stored["heal_threshold"] = DEFAULT_HEAL_THRESHOLD
-
         for key, value in stored.items():
             if hasattr(self.values, key):
                 setattr(self.values, key, value)

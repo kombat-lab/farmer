@@ -5,6 +5,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from blessing import BlessingManager
 from combat_round import CombatSide, parse_combat_round
@@ -17,8 +18,9 @@ from combat_strategy import (
 )
 from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
+from farmer import Farmer
 from human_delays import HumanDelayModel, parse_remaining_seconds
-from models import RuntimeContext
+from models import BotState, RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, extract_player_hp, parse_map
 from rewards import BattleReward, parse_item_stack
@@ -278,6 +280,62 @@ class CombatStrategyTests(unittest.TestCase):
         )
 
         self.assertEqual(memory.damage_floor("лечение"), 0)
+
+    def test_periodic_enemy_damage_is_not_attributed_to_player_skill(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        for direct in (32, 34):
+            memory.observe(
+                f"""🪬🧍Kombat использует Атака аколита
+Фонарщик получает {direct} урона
+Фонарщик получает 15 урона · Горение""",
+                CHARACTER,
+            )
+
+        observed = memory.outgoing_damage["атака аколита"]
+        self.assertEqual((observed.minimum, observed.maximum, observed.samples), (32, 34, 2))
+        self.assertEqual(memory.damage_floor("атака аколита"), 32)
+
+    def test_critical_incoming_hits_have_separate_risk_model(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        for _ in range(9):
+            memory.observe("🪬🧍Kombat получает 60 урона", CHARACTER)
+        memory.observe("🪬🧍Kombat получает 107 урона 💢 крит", CHARACTER)
+
+        self.assertEqual(memory.incoming_damage.samples, 9)
+        self.assertEqual(memory.critical_incoming_damage.samples, 1)
+        self.assertEqual(memory.critical_incoming_rate(), 0.1)
+        self.assertEqual(memory.expected_incoming(), 72)
+        self.assertEqual(memory.predicted_incoming(), 134)
+
+    def test_enemy_turn_forecast_uses_stable_cooldown_cycle(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=768)
+        for value in (30, 32):
+            memory.outgoing_damage.setdefault("атака аколита", ObservedRange()).add(value)
+        for value in (80, 82):
+            memory.outgoing_damage.setdefault("святое свечение", ObservedRange()).add(value)
+        memory.skill_cooldowns["святое свечение"] = 1
+
+        basic_only = choose_combat_action(
+            FakeMessage("Мана: 4/12", [["Атака аколита"]]),
+            memory=memory,
+            current_hp=700,
+            max_hp=780,
+            heal_threshold=300,
+        )
+        with_holy = choose_combat_action(
+            FakeMessage("Мана: 8/12", [["Святое свечение [Мана 3]"], ["Атака аколита"]]),
+            memory=memory,
+            current_hp=700,
+            max_hp=780,
+            heal_threshold=300,
+        )
+
+        self.assertEqual(memory.sustainable_damage_floor(), 55)
+        self.assertIsNotNone(basic_only)
+        self.assertIsNotNone(with_holy)
+        assert basic_only is not None and with_holy is not None
+        self.assertIn("до победы≈14 ход.", basic_only.reason)
+        self.assertIn("до победы≈14 ход.", with_holy.reason)
 
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
@@ -684,6 +742,22 @@ class MovementRecoveryTests(unittest.TestCase):
         self.assertTrue(all(x > 5 for x, _ in navigator.route))
         self.assertEqual(navigator.plan((11, 0)).origin, (11, 0))
 
+    def test_recovered_move_counts_toward_current_cycle(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.navigator = SnakeNavigator(0, 8, 0, 8)
+        farmer.context = RuntimeContext()
+        farmer.context.pending_move = farmer.navigator.plan((8, 0))
+        farmer.moves_in_cycle = 7
+        farmer.mark_progress = lambda _reason: None
+        farmer.log = lambda _message: None
+
+        actual_position = (6, 0)
+        self.assertNotEqual(actual_position, farmer.context.pending_move.destination)
+        farmer.confirm_pending_move(actual_position)
+
+        self.assertEqual(farmer.context.move_count, 1)
+        self.assertEqual(farmer.moves_in_cycle, 8)
+
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_noop_edit_has_same_semantic_state(self) -> None:
@@ -850,6 +924,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertIn("combat_decisions", tables)
             self.assertIn("combat_strategy_stats", tables)
+            self.assertIn("combat_policy_stats", tables)
             await storage.close()
 
     async def test_learned_map_obstacles_survive_restart(self) -> None:
@@ -963,6 +1038,101 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(strategies[0]["victories"], 2)
             self.assertEqual(strategies[0]["best_victory_rounds"], 6)
             self.assertEqual(strategies[0]["average_rounds"], 7.0)
+            await storage.close()
+
+    async def test_different_sequences_share_semantic_policy_stats(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+
+            def trace(round_number: int, skill: str, target: str) -> dict:
+                return {
+                    "created_at": "2026-08-15T20:00:00+00:00",
+                    "telegram_message_id": round_number,
+                    "target_name": "Фонарщик",
+                    "round_number": round_number,
+                    "decision": {
+                        "skill_name": skill,
+                        "target": target,
+                        "reason": "test",
+                        "urgent": False,
+                    },
+                }
+
+            first = (
+                trace(1, "Святое свечение", "enemy"),
+                trace(2, "Атака аколита", "enemy"),
+                trace(3, "Лечение", "self"),
+                trace(4, "Обновление", "self"),
+            )
+            second = (first[1], first[0], first[3], first[2])
+            await storage.record_battle(
+                telegram_message_id=100,
+                session_id=session_id,
+                target_name="Фонарщик",
+                result="VICTORY",
+                combat_decisions=first,
+            )
+            await storage.record_battle(
+                telegram_message_id=101,
+                session_id=session_id,
+                target_name="Фонарщик",
+                result="VICTORY",
+                combat_decisions=second,
+            )
+
+            exact = await storage.get_combat_strategy_stats("Фонарщик")
+            policies = await storage.get_combat_policy_stats("Фонарщик")
+            self.assertEqual(len(exact), 2)
+            self.assertEqual(len(policies), 1)
+            self.assertEqual(policies[0]["battles"], 2)
+            self.assertEqual(policies[0]["total_actions"], 8)
+            self.assertEqual(policies[0]["offensive_ratio"], 0.5)
+            await storage.close()
+
+    async def test_stop_persists_final_movement_snapshot(self) -> None:
+        from statistics import FarmStatistics
+
+        class DisconnectedClient:
+            def is_connected(self) -> bool:
+                return False
+
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=80)
+            farmer = Farmer.__new__(Farmer)
+            farmer.running = True
+            farmer.state = BotState.MAP
+            farmer.stop_reason = None
+            farmer.pending_progress_reason = None
+            farmer.progress_persist_task = None
+            farmer.context = RuntimeContext(
+                current_position=(4, 5),
+                current_hp=780,
+                max_hp=780,
+                move_count=89,
+            )
+            farmer.moves_in_cycle = 80
+            farmer.current_cycle = 1
+            farmer.session_id = session_id
+            farmer.settings = SimpleNamespace(
+                values=SimpleNamespace(moves_per_cycle=80, cycles_count=1)
+            )
+            farmer.statistics = FarmStatistics()
+            farmer.storage = storage
+            farmer.client = DisconnectedClient()
+            farmer.worker_task = None
+            farmer.watchdog_task = None
+            farmer.recovery_task = None
+            farmer.rest_task = None
+
+            await farmer.stop("тестовая остановка")
+
+            state = await storage.get_state()
+            self.assertEqual(state["moves"], 89)
+            self.assertEqual(state["moves_in_cycle"], 80)
+            self.assertEqual(state["position_x"], 4)
+            self.assertEqual(state["position_y"], 5)
             await storage.close()
 
     def test_runtime_statistics_count_stack_quantity(self) -> None:

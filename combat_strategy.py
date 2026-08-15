@@ -86,15 +86,21 @@ class CombatDecisionTrace:
     incoming_maximum: int | None
     incoming_average: float | None
     incoming_samples: int
+    critical_incoming_minimum: int | None
+    critical_incoming_maximum: int | None
+    critical_incoming_average: float | None
+    critical_incoming_samples: int
+    critical_incoming_rate: float
     expected_next_hit: int | None
     worst_next_hit: int | None
+    sustainable_damage_per_turn: int | None
     skills: tuple[SkillAvailability, ...]
     outgoing_damage: tuple[DamageEstimate, ...]
     decision: CombatDecision
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "model_version": 1,
+            "model_version": 2,
             "created_at": self.created_at,
             "telegram_message_id": self.telegram_message_id,
             "target_name": self.target_name,
@@ -120,7 +126,15 @@ class CombatDecisionTrace:
                 "samples": self.incoming_samples,
                 "expected_next_hit": self.expected_next_hit,
                 "worst_next_hit": self.worst_next_hit,
+                "critical": {
+                    "minimum": self.critical_incoming_minimum,
+                    "maximum": self.critical_incoming_maximum,
+                    "average": self.critical_incoming_average,
+                    "samples": self.critical_incoming_samples,
+                    "rate": self.critical_incoming_rate,
+                },
             },
+            "sustainable_damage_per_turn": self.sustainable_damage_per_turn,
             "skills": [skill.as_payload() for skill in self.skills],
             "outgoing_damage": [estimate.as_payload() for estimate in self.outgoing_damage],
             "decision": {
@@ -150,6 +164,13 @@ class CombatDecisionTrace:
             f"{value(self.incoming_average)}/{value(self.incoming_maximum)}, "
             f"прогноз={value(self.expected_next_hit)}/{value(self.worst_next_hit)}"
         )
+        critical = (
+            f"криты={self.critical_incoming_samples} "
+            f"({self.critical_incoming_rate:.0%}), "
+            f"min/сред/max={value(self.critical_incoming_minimum)}/"
+            f"{value(self.critical_incoming_average)}/"
+            f"{value(self.critical_incoming_maximum)}"
+        )
         return (
             "[COMBAT_PLAN]\n"
             f"  Моб: {self.target_name}; раунд: {value(self.round_number)}\n"
@@ -159,7 +180,9 @@ class CombatDecisionTrace:
             f"  Эффекты: Обновление {self.renewal_turns} ход. × "
             f"{value(self.renewal_tick)} HP; периодический урон "
             f"{self.periodic_damage} × {self.periodic_damage_turns} ход.\n"
-            f"  Входящий урон: {incoming}\n"
+            f"  Входящий урон: {incoming}; {critical}\n"
+            f"  Устойчивый темп урона: "
+            f"{value(self.sustainable_damage_per_turn)} HP/ход\n"
             f"  Навыки: {skills or 'не распознаны'}\n"
             f"  Решение: {self.decision.skill_name} → {self.decision.target.value}; "
             f"причина: {self.decision.reason}"
@@ -191,7 +214,9 @@ class RecentCombatKnowledge:
 
     sample_limit: int = 12
     incoming: dict[str, list[int]] = field(default_factory=dict)
+    critical_incoming: dict[str, list[int]] = field(default_factory=dict)
     outgoing: dict[str, dict[str, list[int]]] = field(default_factory=dict)
+    skill_cooldowns: dict[str, int] = field(default_factory=dict)
     direct_healing: list[int] = field(default_factory=list)
     renewal_healing: list[int] = field(default_factory=list)
 
@@ -201,10 +226,25 @@ class RecentCombatKnowledge:
         samples.append(value)
         del samples[: max(0, len(samples) - self.sample_limit)]
 
-    def add_incoming(self, target_name: str | None, value: int) -> None:
+    def add_incoming(
+        self,
+        target_name: str | None,
+        value: int,
+        *,
+        critical: bool = False,
+    ) -> None:
         target = normalize(target_name or "")
         if target:
-            self._append(self.incoming.setdefault(target, []), value)
+            collection = self.critical_incoming if critical else self.incoming
+            self._append(collection.setdefault(target, []), value)
+
+    def observe_cooldown(self, skill_name: str, cooldown: int) -> None:
+        normalized = normalize(skill_name)
+        if normalized:
+            self.skill_cooldowns[normalized] = max(
+                cooldown,
+                self.skill_cooldowns.get(normalized, 0),
+            )
 
     def add_outgoing(self, target_name: str | None, skill_name: str, value: int) -> None:
         target = normalize(target_name or "")
@@ -223,6 +263,8 @@ class RecentCombatKnowledge:
         target = normalize(memory.target_name or "")
         for value in self.incoming.get(target, []):
             memory.incoming_damage.add(value)
+        for value in self.critical_incoming.get(target, []):
+            memory.critical_incoming_damage.add(value)
         for skill_name, values in self.outgoing.get(target, {}).items():
             observed = memory.outgoing_damage.setdefault(skill_name, ObservedRange())
             for value in values:
@@ -231,6 +273,7 @@ class RecentCombatKnowledge:
             memory.direct_healing.add(value)
         for value in self.renewal_healing:
             memory.renewal_healing.add(value)
+        memory.skill_cooldowns.update(self.skill_cooldowns)
 
 
 @dataclass
@@ -242,7 +285,9 @@ class CombatMemory:
     periodic_damage: int = 0
     periodic_damage_turns: int = 0
     incoming_damage: ObservedRange = field(default_factory=ObservedRange)
+    critical_incoming_damage: ObservedRange = field(default_factory=ObservedRange)
     outgoing_damage: dict[str, ObservedRange] = field(default_factory=dict)
+    skill_cooldowns: dict[str, int] = field(default_factory=dict)
     direct_healing: ObservedRange = field(default_factory=ObservedRange)
     renewal_healing: ObservedRange = field(default_factory=ObservedRange)
     pending_skill: str | None = None
@@ -263,7 +308,9 @@ class CombatMemory:
         self.periodic_damage = 0
         self.periodic_damage_turns = 0
         self.incoming_damage = ObservedRange()
+        self.critical_incoming_damage = ObservedRange()
         self.outgoing_damage.clear()
+        self.skill_cooldowns.clear()
         self.direct_healing = ObservedRange()
         self.renewal_healing = ObservedRange()
         self.pending_skill = None
@@ -301,16 +348,35 @@ class CombatMemory:
         ]
         player_skill = used_skills[-1] if used_skills else self.pending_skill
 
+        for skill in parsed.available_skills:
+            skill_name = normalize(skill.name)
+            self.skill_cooldowns[skill_name] = max(
+                skill.cooldown,
+                self.skill_cooldowns.get(skill_name, 0),
+            )
+            self.knowledge.observe_cooldown(skill_name, skill.cooldown)
+
         for damage_event in parsed.damage:
             recipient = normalize(damage_event.target)
             effect = normalize(damage_event.effect or "")
             if character in recipient:
                 if effect in PERIODIC_EFFECTS:
                     self.periodic_damage = damage_event.amount
+                elif damage_event.critical:
+                    self.critical_incoming_damage.add(damage_event.amount)
+                    self.knowledge.add_incoming(
+                        self.target_name,
+                        damage_event.amount,
+                        critical=True,
+                    )
                 else:
                     self.incoming_damage.add(damage_event.amount)
                     self.knowledge.add_incoming(self.target_name, damage_event.amount)
-            elif player_skill is not None and not damage_event.critical:
+            elif (
+                player_skill is not None
+                and effect not in PERIODIC_EFFECTS
+                and not damage_event.critical
+            ):
                 self.outgoing_damage.setdefault(player_skill, ObservedRange()).add(
                     damage_event.amount
                 )
@@ -369,23 +435,39 @@ class CombatMemory:
         return observed.minimum or 0
 
     def predicted_incoming(self, *, after_current_tick: bool = False) -> int | None:
-        if self.incoming_damage.samples <= 0 or self.incoming_damage.maximum is None:
+        normal = self.incoming_damage
+        critical = self.critical_incoming_damage
+        if normal.samples <= 0 and critical.samples <= 0:
             return None
-        uncertainty = 1.35 if self.incoming_damage.samples == 1 else 1.25
-        if self.incoming_damage.samples >= 4:
-            uncertainty = 1.15
-        direct = math.ceil(self.incoming_damage.maximum * uncertainty)
+        estimates: list[int] = []
+        if normal.maximum is not None:
+            uncertainty = 1.35 if normal.samples == 1 else 1.25
+            if normal.samples >= 4:
+                uncertainty = 1.15
+            estimates.append(math.ceil(normal.maximum * uncertainty))
+        if critical.maximum is not None:
+            # После первого подтверждённого крита его величина становится
+            # отдельной верхней границей, а не завышает каждый обычный удар.
+            uncertainty = 1.25 if critical.samples == 1 else 1.15
+            if critical.samples >= 4:
+                uncertainty = 1.10
+            estimates.append(math.ceil(critical.maximum * uncertainty))
+        direct = max(estimates)
         required_turns = 1 if after_current_tick else 0
         periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
         return direct + periodic
 
     def expected_incoming(self, *, after_current_tick: bool = False) -> int | None:
-        if self.incoming_damage.samples <= 0:
+        normal = self.incoming_damage
+        critical = self.critical_incoming_damage
+        total_samples = normal.samples + critical.samples
+        if total_samples <= 0:
             return None
-        uncertainty = 1.20 if self.incoming_damage.samples == 1 else 1.15
-        if self.incoming_damage.samples >= 4:
+        uncertainty = 1.20 if total_samples == 1 else 1.15
+        if total_samples >= 4:
             uncertainty = 1.10
-        direct = max(1, math.ceil(self.incoming_damage.average(0.0) * uncertainty))
+        average = (normal.total + critical.total) / total_samples
+        direct = max(1, math.ceil(average * uncertainty))
         required_turns = 1 if after_current_tick else 0
         periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
         return direct + periodic
@@ -395,6 +477,25 @@ class CombatMemory:
 
     def direct_heal(self) -> int | None:
         return self.direct_healing.minimum
+
+    def critical_incoming_rate(self) -> float:
+        total = self.incoming_damage.samples + self.critical_incoming_damage.samples
+        return self.critical_incoming_damage.samples / total if total else 0.0
+
+    def sustainable_damage_floor(self) -> int:
+        """Conservative damage per turn across a normal cooldown cycle."""
+        basic = self.damage_floor("атака аколита")
+        candidates = [basic] if basic > 0 else []
+        for skill_name in ("святое свечение", "лечение"):
+            special = self.damage_floor(skill_name)
+            if special <= 0:
+                continue
+            if basic <= 0:
+                candidates.append(special)
+                continue
+            interval = max(2, self.skill_cooldowns.get(skill_name, 0) + 1)
+            candidates.append(basic + (special - basic) // interval)
+        return max(candidates, default=0)
 
 
 def build_decision_trace(
@@ -429,6 +530,7 @@ def build_decision_trace(
         for skill_name, observed in sorted(memory.outgoing_damage.items())
     )
     incoming = memory.incoming_damage
+    critical_incoming = memory.critical_incoming_damage
     return CombatDecisionTrace(
         created_at=created_at,
         telegram_message_id=telegram_message_id,
@@ -448,8 +550,16 @@ def build_decision_trace(
         incoming_maximum=incoming.maximum,
         incoming_average=(incoming.average(0.0) if incoming.samples else None),
         incoming_samples=incoming.samples,
+        critical_incoming_minimum=critical_incoming.minimum,
+        critical_incoming_maximum=critical_incoming.maximum,
+        critical_incoming_average=(
+            critical_incoming.average(0.0) if critical_incoming.samples else None
+        ),
+        critical_incoming_samples=critical_incoming.samples,
+        critical_incoming_rate=memory.critical_incoming_rate(),
         expected_next_hit=memory.expected_incoming(after_current_tick=True),
         worst_next_hit=memory.predicted_incoming(after_current_tick=True),
+        sustainable_damage_per_turn=memory.sustainable_damage_floor() or None,
         skills=skills,
         outgoing_damage=outgoing,
         decision=decision,
@@ -477,18 +587,13 @@ def _lethal_skill(
 
 def _estimated_enemy_turns(
     memory: CombatMemory,
-    available: dict[str, SkillButton],
 ) -> int | None:
     if memory.enemy_current_hp is None:
         return None
-    damages = [
-        memory.damage_floor(name)
-        for name in available
-        if memory.damage_floor(name) > 0
-    ]
-    if not damages:
+    sustainable_damage = memory.sustainable_damage_floor()
+    if sustainable_damage <= 0:
         return None
-    return max(1, math.ceil(memory.enemy_current_hp / max(damages)))
+    return max(1, math.ceil(memory.enemy_current_hp / sustainable_damage))
 
 
 def choose_combat_action(
@@ -542,7 +647,7 @@ def choose_combat_action(
     periodic_now = memory.periodic_damage if memory.periodic_damage_turns > 0 else 0
     effective_hp = max(0, min(max_hp, current_hp + renewal_credit) - periodic_now)
     missing_hp = max_hp - effective_hp
-    enemy_turns = _estimated_enemy_turns(memory, available)
+    enemy_turns = _estimated_enemy_turns(memory)
     future_renewal = max(0, memory.renewal_turns - 1) * renewal_tick
     survival_turns = (
         max(
@@ -563,7 +668,8 @@ def choose_combat_action(
         effective_hp > worst_incoming + margin if worst_incoming is not None else None
     )
     victory_forecast = (
-        f"до победы≈{enemy_turns} ход."
+        f"до победы≈{enemy_turns} ход. при темпе≈"
+        f"{memory.sustainable_damage_floor()} HP/ход"
         if enemy_turns is not None
         else "урон по врагу изучается"
     )

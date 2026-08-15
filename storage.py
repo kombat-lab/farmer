@@ -29,6 +29,79 @@ class SessionSummary:
     runtime_seconds: int
 
 
+@dataclass(frozen=True)
+class CombatPolicySummary:
+    key: str
+    total_actions: int
+    offensive_actions: int
+    self_heals: int
+    renewals: int
+
+
+def combat_policy_summary(decisions: list[dict[str, Any]]) -> CombatPolicySummary:
+    """Groups different button sequences by their meaningful battle style."""
+    total = len(decisions)
+    offensive = sum(
+        str(decision.get("target", "")).casefold() == "enemy"
+        for decision in decisions
+    )
+    self_heals = sum(
+        str(decision.get("skill_name", "")).casefold() == "лечение"
+        and str(decision.get("target", "")).casefold() == "self"
+        for decision in decisions
+    )
+    renewals = sum(
+        str(decision.get("skill_name", "")).casefold() == "обновление"
+        and str(decision.get("target", "")).casefold() == "self"
+        for decision in decisions
+    )
+
+    aggression_ratio = offensive / total if total else 0.0
+    aggression = (
+        "aggressive"
+        if aggression_ratio >= 0.80
+        else "balanced"
+        if aggression_ratio >= 0.65
+        else "defensive"
+    )
+
+    def usage_bucket(count: int) -> str:
+        ratio = count / total if total else 0.0
+        if count == 0:
+            return "none"
+        if ratio <= 0.10:
+            return "light"
+        if ratio <= 0.25:
+            return "moderate"
+        return "heavy"
+
+    offense_counts: dict[str, int] = {}
+    for decision in decisions:
+        if str(decision.get("target", "")).casefold() != "enemy":
+            continue
+        name = str(decision.get("skill_name") or "неизвестно").casefold()
+        offense_counts[name] = offense_counts.get(name, 0) + 1
+    if not offense_counts:
+        preference = "none"
+    else:
+        preference, preference_count = max(
+            offense_counts.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        if len(offense_counts) > 1 and preference_count * 2 <= offensive:
+            preference = "mixed"
+
+    key = ":".join(
+        (
+            aggression,
+            f"heal-{usage_bucket(self_heals)}",
+            f"renew-{usage_bucket(renewals)}",
+            f"offense-{preference}",
+        )
+    )
+    return CombatPolicySummary(key, total, offensive, self_heals, renewals)
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -107,6 +180,22 @@ class Storage:
             best_victory_rounds INTEGER,
             last_used_at TEXT NOT NULL,
             PRIMARY KEY(target_name, strategy_signature)
+        );
+
+        CREATE TABLE IF NOT EXISTS combat_policy_stats (
+            target_name TEXT NOT NULL,
+            policy_key TEXT NOT NULL,
+            battles INTEGER NOT NULL DEFAULT 0,
+            victories INTEGER NOT NULL DEFAULT 0,
+            defeats INTEGER NOT NULL DEFAULT 0,
+            total_rounds INTEGER NOT NULL DEFAULT 0,
+            best_victory_rounds INTEGER,
+            total_actions INTEGER NOT NULL DEFAULT 0,
+            total_offensive_actions INTEGER NOT NULL DEFAULT 0,
+            total_self_heals INTEGER NOT NULL DEFAULT 0,
+            total_renewals INTEGER NOT NULL DEFAULT 0,
+            last_used_at TEXT NOT NULL,
+            PRIMARY KEY(target_name, policy_key)
         );
 
         CREATE TABLE IF NOT EXISTS farmer_state (
@@ -577,6 +666,49 @@ class Storage:
                         utc_now(),
                     ),
                 )
+                policy = combat_policy_summary(decisions)
+                self.connection.execute(
+                    """
+                    INSERT INTO combat_policy_stats(
+                        target_name,policy_key,battles,victories,defeats,
+                        total_rounds,best_victory_rounds,total_actions,
+                        total_offensive_actions,total_self_heals,total_renewals,
+                        last_used_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(target_name,policy_key) DO UPDATE SET
+                        battles=battles+1,
+                        victories=victories+excluded.victories,
+                        defeats=defeats+excluded.defeats,
+                        total_rounds=total_rounds+excluded.total_rounds,
+                        best_victory_rounds=CASE
+                            WHEN excluded.best_victory_rounds IS NULL
+                                THEN best_victory_rounds
+                            WHEN best_victory_rounds IS NULL
+                                THEN excluded.best_victory_rounds
+                            ELSE MIN(best_victory_rounds, excluded.best_victory_rounds)
+                        END,
+                        total_actions=total_actions+excluded.total_actions,
+                        total_offensive_actions=total_offensive_actions
+                            +excluded.total_offensive_actions,
+                        total_self_heals=total_self_heals+excluded.total_self_heals,
+                        total_renewals=total_renewals+excluded.total_renewals,
+                        last_used_at=excluded.last_used_at
+                    """,
+                    (
+                        target_name,
+                        policy.key,
+                        1,
+                        int(result == "VICTORY"),
+                        int(result == "DEFEAT"),
+                        rounds,
+                        victory_rounds,
+                        policy.total_actions,
+                        policy.offensive_actions,
+                        policy.self_heals,
+                        policy.renewals,
+                        utc_now(),
+                    ),
+                )
             for item in items:
                 item_name, quantity = parse_item_stack(str(item))
                 n = item_name.casefold()
@@ -647,6 +779,33 @@ class Storage:
         query += " ORDER BY win_rate DESC, average_rounds ASC"
         async with self.lock:
             return [dict(row) for row in self.connection.execute(query, params).fetchall()]
+
+    async def get_combat_policy_stats(
+        self,
+        target_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT *,
+                   CASE WHEN battles > 0
+                       THEN CAST(victories AS REAL) / battles ELSE 0 END AS win_rate,
+                   CASE WHEN battles > 0
+                       THEN CAST(total_rounds AS REAL) / battles ELSE NULL END
+                       AS average_rounds,
+                   CASE WHEN total_actions > 0
+                       THEN CAST(total_offensive_actions AS REAL) / total_actions
+                       ELSE 0 END AS offensive_ratio
+            FROM combat_policy_stats
+        """
+        params: tuple[str, ...] = ()
+        if target_name is not None:
+            query += " WHERE target_name=?"
+            params = (target_name,)
+        query += " ORDER BY win_rate DESC, average_rounds ASC, battles DESC"
+        async with self.lock:
+            return [
+                dict(row)
+                for row in self.connection.execute(query, params).fetchall()
+            ]
 
     async def get_current_session(self) -> SessionSummary:
         async with self.lock:

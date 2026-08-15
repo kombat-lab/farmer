@@ -591,8 +591,15 @@ class Farmer:
             )
             if recovered:
                 self.context.move_count += 1
+                self.moves_in_cycle += 1
                 self.context.failed_move_attempts = 0
                 self.mark_progress("навигатор пересинхронизирован")
+                self.log(
+                    "Перемещение подтверждено по фактической позиции: "
+                    f"{plan.origin} → {current_position} "
+                    f"(ожидалось {plan.destination}). "
+                    f"Всего: {self.context.move_count}"
+                )
             else:
                 self.context.failed_move_attempts += 1
 
@@ -1600,6 +1607,31 @@ class Farmer:
             self.progress_persist_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self.progress_persist_task
+
+        # Отложенная запись прогресса могла быть отменена строками выше.
+        # Сохраняем фактические счётчики синхронно до завершения сессии.
+        await self.storage.update_state(
+            game_state=self.state.name,
+            position_x=(
+                self.context.current_position[0] if self.context.current_position else None
+            ),
+            position_y=(
+                self.context.current_position[1] if self.context.current_position else None
+            ),
+            current_hp=self.context.current_hp,
+            max_hp=self.context.max_hp,
+            active_target=self.context.active_target,
+            moves=self.context.move_count,
+            max_moves=self.settings.values.moves_per_cycle,
+            last_action=reason,
+            last_progress_at=utc_now(),
+            session_id=self.session_id,
+            current_cycle=self.current_cycle,
+            cycles_count=self.settings.values.cycles_count,
+            moves_in_cycle=self.moves_in_cycle,
+            moves_per_cycle=self.settings.values.moves_per_cycle,
+            pause_requested=0,
+        )
 
         logger.info(
             "\n%s",

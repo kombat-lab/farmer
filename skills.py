@@ -27,6 +27,16 @@ DEFAULT_MANA_COSTS: dict[str, int] = {
 HEALING_MANA_RESERVE = 4
 
 
+def enough_health_for_battle(
+    current_hp: int | None,
+    max_hp: int | None,
+    required_percent: int,
+) -> bool:
+    if current_hp is None or max_hp is None or max_hp <= 0:
+        return False
+    return current_hp * 100 >= max_hp * required_percent
+
+
 @dataclass(frozen=True)
 class SkillButton:
     raw_text: str

@@ -40,6 +40,7 @@ SETTINGS_ROWS = [
 ]
 CHARACTER_ROWS = [
     ["❤️ Порог лечения"],
+    ["🛡 Перед боем 50%", "🛡 Перед боем 100%"],
     ["✨ Благословение"],
     ["↩️ Настройки"],
 ]
@@ -391,7 +392,21 @@ class ControlBot:
                 message,
                 "❤️ Параметры персонажа\n\n"
                 f"Порог лечения: {values.heal_threshold} HP и ниже\n"
+                f"HP перед новым боем: {values.battle_start_hp_percent}%\n"
                 f"Благословение: {'включено' if values.blessing_enabled else 'выключено'}",
+                CHARACTER_ROWS,
+            )
+
+        @r.message(
+            StateFilter(None),
+            text_is("🛡 Перед боем 50%", "🛡 Перед боем 100%"),
+        )
+        async def battle_start_hp_handler(message: Message) -> None:
+            percent = 100 if "100%" in (message.text or "") else 50
+            await self.settings.set_value("battle_start_hp_percent", percent)
+            await self._send_text(
+                message,
+                f"✅ Новые бои разрешены при восстановлении HP до {percent}%.",
                 CHARACTER_ROWS,
             )
 

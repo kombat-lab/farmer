@@ -6,6 +6,7 @@ from typing import Any
 from config import (
     DEFAULT_ATTACK_DELAY_MAX,
     DEFAULT_ATTACK_DELAY_MIN,
+    DEFAULT_BATTLE_START_HP_PERCENT,
     DEFAULT_CYCLE_REST_MAX,
     DEFAULT_CYCLE_REST_MIN,
     DEFAULT_CYCLES_COUNT,
@@ -34,6 +35,7 @@ class FarmerSettings:
     enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
+    battle_start_hp_percent: int = DEFAULT_BATTLE_START_HP_PERCENT
     blessing_enabled: bool = False
 
     move_delay_min: float = DEFAULT_MOVE_DELAY_MIN
@@ -170,6 +172,14 @@ class SettingsService:
         except (TypeError, ValueError):
             threshold = 1
         self.values.heal_threshold = max(1, threshold)
+
+        try:
+            battle_start_hp = int(self.values.battle_start_hp_percent)
+        except (TypeError, ValueError):
+            battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
+        if battle_start_hp not in {50, 100}:
+            battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
+        self.values.battle_start_hp_percent = battle_start_hp
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:

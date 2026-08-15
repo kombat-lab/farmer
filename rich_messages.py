@@ -176,6 +176,7 @@ def settings_rich(settings: SettingsService) -> str:
             ("Количество циклов", s.cycles_count),
             ("Ходов в цикле", s.moves_per_cycle),
             ("Порог лечения", s.heal_threshold),
+            ("HP перед новым боем", f"{s.battle_start_hp_percent}%"),
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),
         ]
     )

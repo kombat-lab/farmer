@@ -6,14 +6,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from blessing import BlessingManager
-from config import DEFAULT_HEAL_THRESHOLD
+from config import DEFAULT_BATTLE_START_HP_PERCENT, DEFAULT_HEAL_THRESHOLD
 from event_cache import BoundedKeyCache
 from models import RuntimeContext
 from navigator import SnakeNavigator
 from parser import classify_message, parse_map
 from rewards import BattleReward, parse_item_stack
 from settings_service import SettingsService
-from skills import HEALING_MANA_RESERVE, choose_skill
+from skills import HEALING_MANA_RESERVE, choose_skill, enough_health_for_battle
 from storage import Storage
 from telegram_safety import (
     RollingAttemptGuard,
@@ -79,6 +79,12 @@ class ParserTests(unittest.TestCase):
 
 
 class SkillTests(unittest.TestCase):
+    def test_battle_health_requirement_supports_50_and_100_percent(self) -> None:
+        self.assertTrue(enough_health_for_battle(423, 845, 50))
+        self.assertFalse(enough_health_for_battle(422, 845, 50))
+        self.assertTrue(enough_health_for_battle(845, 845, 100))
+        self.assertFalse(enough_health_for_battle(844, 845, 100))
+
     def test_holy_light_keeps_healing_mana_reserve(self) -> None:
         message = FakeMessage(
             "Мана: 6/11",
@@ -280,6 +286,10 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await settings.load()
 
             self.assertEqual(settings.values.heal_threshold, DEFAULT_HEAL_THRESHOLD)
+            self.assertEqual(
+                settings.values.battle_start_hp_percent,
+                DEFAULT_BATTLE_START_HP_PERCENT,
+            )
             changes_after_first_load = storage.connection.total_changes
             await settings.load()
             self.assertEqual(storage.connection.total_changes, changes_after_first_load)

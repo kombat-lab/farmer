@@ -34,7 +34,6 @@ from config import (
     MAP_MIN_Y,
     MAX_RECOVERY_ATTEMPTS,
     MIN_HP_AFTER_DEATH,
-    MIN_HP_PERCENT_TO_START_BATTLE,
     MOVE_PROGRESS_TIMEOUT,
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
@@ -65,7 +64,7 @@ from parser import (
 )
 from rewards import parse_battle_reward
 from settings_service import SettingsService
-from skills import choose_skill, parse_current_mana
+from skills import choose_skill, enough_health_for_battle, parse_current_mana
 from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
@@ -458,11 +457,11 @@ class Farmer:
         return changed
 
     def has_battle_health(self) -> bool:
-        current_hp = self.context.current_hp
-        max_hp = self.context.max_hp
-        if current_hp is None or max_hp is None or max_hp <= 0:
-            return False
-        return current_hp * 100 >= max_hp * MIN_HP_PERCENT_TO_START_BATTLE
+        return enough_health_for_battle(
+            self.context.current_hp,
+            self.context.max_hp,
+            self.settings.values.battle_start_hp_percent,
+        )
 
     def battle_health_is_low(self) -> bool:
         return (
@@ -478,7 +477,8 @@ class Farmer:
         self.state = BotState.WAITING_FOR_HEALTH
         current_hp = self.context.current_hp or 0
         max_hp = self.context.max_hp or 0
-        threshold = (max_hp * MIN_HP_PERCENT_TO_START_BATTLE + 99) // 100
+        required_percent = self.settings.values.battle_start_hp_percent
+        threshold = (max_hp * required_percent + 99) // 100
         self.mark_progress("ожидание восстановления HP перед боем")
         await self.storage.add_event(
             "LOW_HP_WAIT_STARTED",

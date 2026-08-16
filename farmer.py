@@ -537,11 +537,6 @@ class Farmer:
             f"HP {current_hp}/{max_hp}; новые бои разрешены от {threshold}",
             level="INFO",
         )
-        await self.notifier.send(
-            "❤️ <b>Низкий запас HP</b>\n"
-            f"Сейчас: {current_hp}/{max_hp}\n"
-            f"Новые бои начнутся при HP не ниже {threshold}."
-        )
 
     async def finish_battle_health_wait(self) -> None:
         self.state = BotState.MAP
@@ -551,9 +546,6 @@ class Farmer:
         await self.storage.add_event(
             "LOW_HP_WAIT_FINISHED",
             f"HP восстановлено до {current_hp}/{max_hp}",
-        )
-        await self.notifier.send(
-            f"❤️ <b>Здоровье восстановлено</b>\nHP: {current_hp}/{max_hp}\nФармер продолжает работу."
         )
 
     def confirm_pending_move(

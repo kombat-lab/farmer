@@ -10,11 +10,13 @@ from types import SimpleNamespace
 from blessing import BlessingManager
 from combat_round import CombatSide, parse_combat_round
 from combat_strategy import (
+    CombatDecision,
     CombatMemory,
     ObservedRange,
     SkillTarget,
     build_decision_trace,
     choose_combat_action,
+    resolve_decision_trace,
 )
 from config import (
     ACTIVITY_PROFILE_FAST,
@@ -168,6 +170,7 @@ class CombatStrategyTests(unittest.TestCase):
     def test_available_treatment_attacks_enemy_when_safe(self) -> None:
         memory = CombatMemory()
         memory.begin("Фонарщик", "Фонарщик\n1025❤️ из 1025❤️")
+        memory.confirm_treatment_enemy()
         memory.enemy_current_hp = 552
         decision = choose_combat_action(
             FakeMessage("Мана: 8/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
@@ -181,6 +184,58 @@ class CombatStrategyTests(unittest.TestCase):
         assert decision is not None
         self.assertEqual(decision.skill_name, "лечение")
         self.assertIs(decision.target, SkillTarget.ENEMY)
+
+    def test_treatment_is_not_used_as_attack_for_unconfirmed_living_enemy(self) -> None:
+        memory = CombatMemory(
+            target_name="Черная мушка",
+            enemy_current_hp=88,
+            enemy_max_hp=475,
+            renewal_turns=1,
+        )
+        for value in (35, 38):
+            memory.incoming_damage.add(value)
+        for value in (2, 44):
+            memory.outgoing_damage.setdefault("атака аколита", ObservedRange()).add(
+                value
+            )
+        for value in (4, 67):
+            memory.outgoing_damage.setdefault("святое свечение", ObservedRange()).add(
+                value
+            )
+        memory.renewal_healing.add(40)
+        memory.direct_healing.add(124)
+
+        decision = choose_combat_action(
+            FakeMessage(
+                "Мана: 6/12",
+                [
+                    ["Лечение [Мана 4]"],
+                    ["Обновление [Мана 4] · CD: 1"],
+                    ["Святое свечение [Мана 3]"],
+                    ["Атака аколита"],
+                ],
+            ),
+            memory=memory,
+            current_hp=694,
+            max_hp=780,
+            heal_threshold=500,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "атака аколита")
+        self.assertIs(decision.target, SkillTarget.ENEMY)
+
+    def test_revoked_treatment_target_clears_stale_damage_capability(self) -> None:
+        memory = CombatMemory(target_name="Изменившийся моб")
+        memory.confirm_treatment_enemy()
+        memory.outgoing_damage["лечение"] = ObservedRange()
+        memory.outgoing_damage["лечение"].add(100)
+
+        memory.revoke_treatment_enemy()
+
+        self.assertFalse(memory.treatment_can_target_enemy())
+        self.assertNotIn("лечение", memory.outgoing_damage)
 
     def test_treatment_targets_player_when_next_hit_is_dangerous(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=552)
@@ -365,6 +420,46 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(memory.expected_incoming(), 69)
         self.assertEqual(memory.predicted_incoming(), 77)
 
+    def test_finishing_damage_does_not_lower_learned_skill_floor(self) -> None:
+        memory = CombatMemory(target_name="Черная мушка", enemy_current_hp=2)
+        memory.outgoing_damage["атака аколита"] = ObservedRange()
+        memory.outgoing_damage["атака аколита"].add(42)
+        memory.outgoing_damage["атака аколита"].add(44)
+        memory.pending_skill = "атака аколита"
+
+        memory.observe(
+            """⚔️ Раунд 18
+🪬🧍Kombat использует Атака аколита
+Черная мушка получает 2 урона
+Черная мушка
+❤️ 0/475""",
+            CHARACTER,
+        )
+
+        observed = memory.outgoing_damage["атака аколита"]
+        self.assertEqual((observed.minimum, observed.samples), (42, 2))
+
+    def test_capped_direct_heal_does_not_lower_known_healing_power(self) -> None:
+        memory = CombatMemory(target_name="Черная мушка")
+        memory.direct_healing.add(124)
+        memory.knowledge.add_direct_healing(124)
+
+        memory.observe(
+            """⚔️ Раунд 15
+Левая сторона
+🪬🧍Kombat восстанавливает 40 HP · renew
+🪬🧍Kombat использует Лечение
+🪬🧍Kombat восстанавливает 46 HP
+🪬🧍Kombat
+❤️ 780/780
+✦ Обновление · 1 ход""",
+            CHARACTER,
+        )
+
+        self.assertEqual(memory.renewal_tick(), 40)
+        self.assertEqual(memory.direct_heal(), 124)
+        self.assertEqual(memory.knowledge.direct_healing, [124])
+
     def test_unseen_monster_has_no_invented_damage(self) -> None:
         tier_one = CombatMemory(target_name="Слабый моб")
         tier_three = CombatMemory(target_name="Сильный моб")
@@ -399,6 +494,7 @@ class CombatStrategyTests(unittest.TestCase):
 
     def test_threshold_is_soft_when_damage_race_is_safe(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=300)
+        memory.confirm_treatment_enemy()
         decision = choose_combat_action(
             FakeMessage("Мана: 8/12", [["Лечение [Мана 4]"], ["Атака аколита"]]),
             memory=memory,
@@ -663,6 +759,48 @@ class CombatRoundModelTests(unittest.TestCase):
         self.assertEqual(payload["decision"]["skill_name"], decision.skill_name)
         self.assertIn("[COMBAT_PLAN]", trace.format_log())
         self.assertIn("причина:", trace.format_log())
+
+    def test_treatment_trace_records_actual_self_heal_without_losing_plan(self) -> None:
+        memory = CombatMemory(
+            target_name="Черная мушка",
+            enemy_current_hp=88,
+            enemy_max_hp=475,
+        )
+        round_state = parse_combat_round(
+            "🎯 Раунд 15\nХод Kombat\n🔷 Мана: 6/12",
+            ("Лечение [Мана 4]", "Атака аколита"),
+        )
+        assert round_state is not None
+        trace = build_decision_trace(
+            created_at="2026-08-16T09:31:17+00:00",
+            telegram_message_id=19,
+            memory=memory,
+            round_state=round_state,
+            current_hp=694,
+            max_hp=780,
+            decision=CombatDecision(
+                "лечение",
+                SkillTarget.ENEMY,
+                "ожидалась атака нежити",
+            ),
+        )
+        result = parse_combat_round(
+            """⚔️ Раунд 15
+🪬🧍Kombat восстанавливает 40 HP · renew
+🪬🧍Kombat использует Лечение
+🪬🧍Kombat восстанавливает 46 HP
+🪬🧍Kombat
+❤️ 780/780"""
+        )
+        assert result is not None
+
+        resolved = resolve_decision_trace(trace, result, CHARACTER)
+        payload = resolved.as_payload()
+
+        self.assertEqual(payload["decision"]["target"], "enemy")
+        self.assertEqual(payload["outcome"]["target"], "self")
+        self.assertEqual(payload["outcome"]["effect"], "healing")
+        self.assertEqual(payload["outcome"]["amount"], 46)
 
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(
@@ -1035,6 +1173,31 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 await loaded.set_activity_profile("unknown")
             await reopened.close()
 
+    async def test_treatment_enemy_targets_are_persisted_without_duplicates(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            storage = Storage(path)
+            settings = SettingsService(storage)
+            await settings.load()
+            self.assertTrue(await settings.add_treatment_enemy_target("Костяной заяц"))
+            self.assertFalse(await settings.add_treatment_enemy_target("костяной заяц"))
+            await settings.mark_treatment_targets_initialized()
+            await storage.close()
+
+            reopened = Storage(path)
+            loaded = SettingsService(reopened)
+            await loaded.load()
+            self.assertEqual(
+                loaded.values.treatment_enemy_targets,
+                ["Костяной заяц"],
+            )
+            self.assertTrue(loaded.values.treatment_targets_initialized)
+            self.assertTrue(
+                await loaded.remove_treatment_enemy_target("КОСТЯНОЙ ЗАЯЦ")
+            )
+            self.assertEqual(loaded.values.treatment_enemy_targets, [])
+            await reopened.close()
+
     async def test_activity_break_resumes_with_one_state_refresh(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
@@ -1143,6 +1306,87 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(strategies[0]["victories"], 2)
             self.assertEqual(strategies[0]["best_victory_rounds"], 6)
             self.assertEqual(strategies[0]["average_rounds"], 7.0)
+            await storage.close()
+
+    async def test_actual_treatment_target_drives_saved_policy(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+            trace = {
+                "model_version": 3,
+                "created_at": "2026-08-16T09:31:17+00:00",
+                "telegram_message_id": 20,
+                "target_name": "Черная мушка",
+                "round_number": 15,
+                "decision": {
+                    "skill_name": "лечение",
+                    "target": "enemy",
+                    "reason": "планировалась атака",
+                    "urgent": False,
+                },
+                "outcome": {
+                    "target": "self",
+                    "effect": "healing",
+                    "amount": 46,
+                },
+            }
+
+            await storage.record_battle(
+                telegram_message_id=21,
+                session_id=session_id,
+                target_name="Черная мушка",
+                result="VICTORY",
+                combat_decisions=(trace,),
+            )
+
+            decisions = await storage.get_combat_decisions("Черная мушка")
+            policies = await storage.get_combat_policy_stats("Черная мушка")
+            strategies = await storage.get_combat_strategy_stats("Черная мушка")
+            self.assertEqual(decisions[0]["chosen_target"], "self")
+            self.assertEqual(strategies[0]["strategy_signature"], "лечение→self")
+            self.assertEqual(policies[0]["total_self_heals"], 1)
+            self.assertEqual(policies[0]["total_offensive_actions"], 0)
+            await storage.close()
+
+    async def test_confirmed_treatment_targets_are_recovered_from_damage_history(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+            trace = {
+                "created_at": "2026-08-16T09:00:00+00:00",
+                "telegram_message_id": 30,
+                "target_name": "Костяной заяц",
+                "round_number": 5,
+                "outgoing_damage": [
+                    {
+                        "skill_name": "лечение",
+                        "minimum": 110,
+                        "maximum": 116,
+                        "average": 113.0,
+                        "samples": 2,
+                    }
+                ],
+                "decision": {
+                    "skill_name": "атака аколита",
+                    "target": "enemy",
+                    "reason": "test",
+                    "urgent": False,
+                },
+            }
+            await storage.record_battle(
+                telegram_message_id=31,
+                session_id=session_id,
+                target_name="Костяной заяц",
+                result="VICTORY",
+                combat_decisions=(trace,),
+            )
+
+            self.assertEqual(
+                await storage.get_confirmed_treatment_targets(),
+                {"Костяной заяц"},
+            )
             await storage.close()
 
     async def test_different_sequences_share_semantic_policy_stats(self) -> None:

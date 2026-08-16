@@ -21,6 +21,7 @@ from combat_strategy import (
     SkillTarget,
     build_decision_trace,
     choose_combat_action,
+    resolve_decision_trace,
 )
 from config import (
     ACTIVITY_BREAK_DURATION_MAX,
@@ -139,6 +140,8 @@ class Farmer:
 
         self.context = RuntimeContext()
         self.combat = CombatMemory()
+        for target in settings.values.treatment_enemy_targets:
+            self.combat.confirm_treatment_enemy(target)
         self.combat_decisions: list[CombatDecisionTrace] = []
         self.pending_combat_decision: CombatDecisionTrace | None = None
         self.delay_model = HumanDelayModel()
@@ -1099,6 +1102,32 @@ class Farmer:
         self.state = BotState.COMBAT
         self.mark_progress("получен список целей навыка")
 
+        if normalize(self.combat.pending_skill or "") == "лечение":
+            enemy_name, enemy_position = select_combat_target(
+                message,
+                self.settings.values.enabled_targets,
+                self.context.active_target,
+                preferred_target="enemy",
+                character_name=CHARACTER_NAME,
+            )
+            if enemy_position is not None:
+                confirmed_target = (
+                    self.combat.target_name
+                    or self.context.active_target
+                    or enemy_name
+                )
+                self.combat.confirm_treatment_enemy(confirmed_target)
+                if confirmed_target and await self.settings.add_treatment_enemy_target(
+                    confirmed_target
+                ):
+                    self.log(
+                        f"Подтверждено атакующее Лечение для цели «{confirmed_target}»."
+                    )
+                    await self.storage.add_event(
+                        "TREATMENT_ENEMY_CONFIRMED",
+                        f"Лечение может наносить урон цели «{confirmed_target}»",
+                    )
+
         target_name, position = select_combat_target(
             message,
             self.settings.values.enabled_targets,
@@ -1526,7 +1555,41 @@ class Farmer:
                 confirmed_skill = player_skills[-1].skill
                 expected_skill = self.pending_combat_decision.decision.skill_name
                 if normalize(expected_skill) == normalize(confirmed_skill):
-                    self.combat_decisions.append(self.pending_combat_decision)
+                    resolved_trace = resolve_decision_trace(
+                        self.pending_combat_decision,
+                        round_state,
+                        CHARACTER_NAME,
+                    )
+                    self.combat_decisions.append(resolved_trace)
+                    if normalize(expected_skill) == "лечение":
+                        planned_target = resolved_trace.decision.target
+                        actual_target = resolved_trace.actual_target
+                        actual_description = (
+                            actual_target.value if actual_target is not None else "unknown"
+                        )
+                        self.log(
+                            "Результат Лечения: "
+                            f"план={planned_target.value}, факт={actual_description}, "
+                            f"эффект={resolved_trace.actual_effect or 'не распознан'}, "
+                            f"значение={resolved_trace.actual_amount or 0}."
+                        )
+                        target_name = resolved_trace.target_name
+                        if actual_target is SkillTarget.ENEMY:
+                            self.combat.confirm_treatment_enemy(target_name)
+                            await self.settings.add_treatment_enemy_target(target_name)
+                        elif (
+                            planned_target is SkillTarget.ENEMY
+                            and actual_target is SkillTarget.SELF
+                        ):
+                            self.combat.revoke_treatment_enemy(target_name)
+                            removed = await self.settings.remove_treatment_enemy_target(
+                                target_name
+                            )
+                            if removed:
+                                await self.storage.add_event(
+                                    "TREATMENT_ENEMY_REVOKED",
+                                    f"Лечение недоступно как атака для «{target_name}»",
+                                )
                 else:
                     self.log(
                         "Игра подтвердила другой навык: "
@@ -1765,6 +1828,20 @@ class Farmer:
 
     async def run(self) -> None:
         self.validate_config()
+        if not self.settings.values.treatment_targets_initialized:
+            historical_treatment_targets = (
+                await self.storage.get_confirmed_treatment_targets()
+            )
+            for target in sorted(historical_treatment_targets):
+                await self.settings.add_treatment_enemy_target(target)
+            await self.settings.mark_treatment_targets_initialized()
+        for target in self.settings.values.treatment_enemy_targets:
+            self.combat.confirm_treatment_enemy(target)
+        if self.settings.values.treatment_enemy_targets:
+            self.log(
+                "Подтверждённые цели атакующего Лечения: "
+                f"{sorted(self.settings.values.treatment_enemy_targets)}"
+            )
         deleted_logs = self.cleanup_old_log_files()
         cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
         logger.info(

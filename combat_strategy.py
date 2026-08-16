@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -97,10 +97,13 @@ class CombatDecisionTrace:
     skills: tuple[SkillAvailability, ...]
     outgoing_damage: tuple[DamageEstimate, ...]
     decision: CombatDecision
+    actual_target: SkillTarget | None = None
+    actual_effect: str | None = None
+    actual_amount: int | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "model_version": 2,
+            "model_version": 3,
             "created_at": self.created_at,
             "telegram_message_id": self.telegram_message_id,
             "target_name": self.target_name,
@@ -142,6 +145,11 @@ class CombatDecisionTrace:
                 "target": self.decision.target.value,
                 "reason": self.decision.reason,
                 "urgent": self.decision.urgent,
+            },
+            "outcome": {
+                "target": self.actual_target.value if self.actual_target else None,
+                "effect": self.actual_effect,
+                "amount": self.actual_amount,
             },
         }
 
@@ -219,6 +227,7 @@ class RecentCombatKnowledge:
     skill_cooldowns: dict[str, int] = field(default_factory=dict)
     direct_healing: list[int] = field(default_factory=list)
     renewal_healing: list[int] = field(default_factory=list)
+    treatment_enemy_targets: set[str] = field(default_factory=set)
 
     def _append(self, samples: list[int], value: int) -> None:
         if value <= 0:
@@ -258,6 +267,22 @@ class RecentCombatKnowledge:
 
     def add_renewal_healing(self, value: int) -> None:
         self._append(self.renewal_healing, value)
+
+    def confirm_treatment_enemy(self, target_name: str | None) -> None:
+        target = normalize(target_name or "")
+        if target:
+            self.treatment_enemy_targets.add(target)
+
+    def revoke_treatment_enemy(self, target_name: str | None) -> None:
+        target = normalize(target_name or "")
+        self.treatment_enemy_targets.discard(target)
+        target_skills = self.outgoing.get(target)
+        if target_skills is not None:
+            target_skills.pop("лечение", None)
+
+    def treatment_can_target_enemy(self, target_name: str | None) -> bool:
+        target = normalize(target_name or "")
+        return bool(target and target in self.treatment_enemy_targets)
 
     def load_into(self, memory: CombatMemory) -> None:
         target = normalize(memory.target_name or "")
@@ -338,6 +363,7 @@ class CombatMemory:
         if parsed is None:
             return
 
+        previous_enemy_hp = self.enemy_current_hp
         self.latest_round = parsed
         self.round_history.append(parsed)
         character = normalize(character_name)
@@ -377,6 +403,20 @@ class CombatMemory:
                 and effect not in PERIODIC_EFFECTS
                 and not damage_event.critical
             ):
+                # The game reports only the remaining HP on a finishing hit.
+                # Such a value is a censored lower bound, not the real skill
+                # damage, and must not reduce the learned damage floor.
+                target_is_current_enemy = bool(
+                    self.target_name
+                    and normalize(self.target_name) in recipient
+                )
+                finishing_hit_is_capped = bool(
+                    target_is_current_enemy
+                    and previous_enemy_hp is not None
+                    and damage_event.amount >= previous_enemy_hp
+                )
+                if finishing_hit_is_capped:
+                    continue
                 self.outgoing_damage.setdefault(player_skill, ObservedRange()).add(
                     damage_event.amount
                 )
@@ -386,6 +426,7 @@ class CombatMemory:
                     damage_event.amount,
                 )
 
+        player = parsed.combatant(character_name)
         for healing_event in parsed.healing:
             if character not in normalize(healing_event.target):
                 continue
@@ -393,7 +434,12 @@ class CombatMemory:
             if effect in {"обновление", "renew"}:
                 self.renewal_healing.add(healing_event.amount)
                 self.knowledge.add_renewal_healing(healing_event.amount)
-            elif player_skill == "лечение":
+            elif player_skill == "лечение" and not (
+                player is not None and player.current_hp >= player.max_hp
+            ):
+                # A heal ending exactly at maximum HP may have been capped by
+                # the missing health. Its displayed amount is not a reliable
+                # measurement of the skill's full power.
                 self.direct_healing.add(healing_event.amount)
                 self.knowledge.add_direct_healing(healing_event.amount)
 
@@ -401,7 +447,6 @@ class CombatMemory:
             self.enemy_current_hp = target.current_hp
             self.enemy_max_hp = target.max_hp
 
-        player = parsed.combatant(character_name)
         effect_turns = (
             {normalize(effect.name): effect.turns for effect in player.effects}
             if player
@@ -477,6 +522,20 @@ class CombatMemory:
 
     def direct_heal(self) -> int | None:
         return self.direct_healing.minimum
+
+    def confirm_treatment_enemy(self, target_name: str | None = None) -> None:
+        self.knowledge.confirm_treatment_enemy(target_name or self.target_name)
+
+    def revoke_treatment_enemy(self, target_name: str | None = None) -> None:
+        self.knowledge.revoke_treatment_enemy(target_name or self.target_name)
+        self.outgoing_damage.pop("лечение", None)
+
+    def treatment_can_target_enemy(self) -> bool:
+        observed = self.outgoing_damage.get("лечение")
+        return bool(
+            (observed is not None and observed.samples > 0)
+            or self.knowledge.treatment_can_target_enemy(self.target_name)
+        )
 
     def critical_incoming_rate(self) -> float:
         total = self.incoming_damage.samples + self.critical_incoming_damage.samples
@@ -563,6 +622,66 @@ def build_decision_trace(
         skills=skills,
         outgoing_damage=outgoing,
         decision=decision,
+    )
+
+
+def resolve_decision_trace(
+    trace: CombatDecisionTrace,
+    round_state: CombatRoundState,
+    character_name: str,
+) -> CombatDecisionTrace:
+    """Adds the observed target and effect without overwriting the plan."""
+    character = normalize(character_name)
+    skill_name = normalize(trace.decision.skill_name)
+
+    if skill_name == "лечение":
+        direct_healing = [
+            event.amount
+            for event in round_state.healing
+            if character in normalize(event.target)
+            and normalize(event.effect or "") not in {"обновление", "renew"}
+        ]
+        if direct_healing:
+            return replace(
+                trace,
+                actual_target=SkillTarget.SELF,
+                actual_effect="healing",
+                actual_amount=sum(direct_healing),
+            )
+
+        enemy_damage = [
+            event.amount
+            for event in round_state.damage
+            if character not in normalize(event.target)
+            and normalize(event.effect or "") not in PERIODIC_EFFECTS
+        ]
+        if enemy_damage:
+            return replace(
+                trace,
+                actual_target=SkillTarget.ENEMY,
+                actual_effect="damage",
+                actual_amount=sum(enemy_damage),
+            )
+        return trace
+
+    if skill_name == "обновление":
+        return replace(
+            trace,
+            actual_target=SkillTarget.SELF,
+            actual_effect="effect",
+        )
+
+    enemy_damage = [
+        event.amount
+        for event in round_state.damage
+        if character not in normalize(event.target)
+        and normalize(event.effect or "") not in PERIODIC_EFFECTS
+    ]
+    return replace(
+        trace,
+        actual_target=trace.decision.target,
+        actual_effect="damage" if enemy_damage else "action",
+        actual_amount=sum(enemy_damage) if enemy_damage else None,
     )
 
 
@@ -819,7 +938,11 @@ def choose_combat_action(
             f"лучший обычный урон; {forecast}",
         )
 
-    if treatment is not None and can_survive_worst_hit is not False:
+    if (
+        treatment is not None
+        and memory.treatment_can_target_enemy()
+        and can_survive_worst_hit is not False
+    ):
         return CombatDecision(
             "лечение",
             SkillTarget.ENEMY,

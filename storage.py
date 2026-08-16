@@ -102,6 +102,19 @@ def combat_policy_summary(decisions: list[dict[str, Any]]) -> CombatPolicySummar
     return CombatPolicySummary(key, total, offensive, self_heals, renewals)
 
 
+def resolved_decision(trace: dict[str, Any]) -> dict[str, Any]:
+    raw_decision = trace.get("decision")
+    decision = (
+        {str(key): value for key, value in raw_decision.items()}
+        if isinstance(raw_decision, dict)
+        else {}
+    )
+    outcome = trace.get("outcome")
+    if isinstance(outcome, dict) and outcome.get("target") in {"self", "enemy"}:
+        decision["target"] = outcome["target"]
+    return decision
+
+
 class Storage:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -590,8 +603,7 @@ class Storage:
                 raise RuntimeError("SQLite не вернул ID нового боя")
             battle_id = int(cur.lastrowid)
             for sequence_number, trace in enumerate(combat_decisions, start=1):
-                decision = trace.get("decision")
-                decision_data = decision if isinstance(decision, dict) else {}
+                decision_data = resolved_decision(trace)
                 self.connection.execute(
                     """
                     INSERT INTO combat_decisions(
@@ -615,14 +627,7 @@ class Storage:
                     ),
                 )
             if combat_decisions:
-                decisions: list[dict[str, Any]] = []
-                for trace in combat_decisions:
-                    raw_decision = trace.get("decision")
-                    decisions.append(
-                        {str(key): value for key, value in raw_decision.items()}
-                        if isinstance(raw_decision, dict)
-                        else {}
-                    )
+                decisions = [resolved_decision(trace) for trace in combat_decisions]
                 strategy_signature = " > ".join(
                     f"{decision.get('skill_name', 'неизвестно')}→"
                     f"{decision.get('target', 'unknown')}"
@@ -759,6 +764,36 @@ class Storage:
                     item["trace"] = json.loads(str(item.pop("trace_json")))
                 result.append(item)
             return result
+
+    async def get_confirmed_treatment_targets(self) -> set[str]:
+        """Finds monsters that have actually taken damage from Treatment."""
+        async with self.lock:
+            rows = self.connection.execute(
+                "SELECT target_name,trace_json FROM combat_decisions"
+            ).fetchall()
+
+        confirmed: set[str] = set()
+        for row in rows:
+            try:
+                trace = json.loads(str(row["trace_json"]))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(trace, dict):
+                continue
+            outgoing = trace.get("outgoing_damage")
+            if not isinstance(outgoing, list):
+                continue
+            if any(
+                isinstance(estimate, dict)
+                and str(estimate.get("skill_name", "")).casefold() == "лечение"
+                and isinstance(samples := estimate.get("samples"), (int, float))
+                and samples > 0
+                for estimate in outgoing
+            ):
+                target = str(row["target_name"]).strip()
+                if target:
+                    confirmed.add(target)
+        return confirmed
 
     async def get_combat_strategy_stats(
         self,

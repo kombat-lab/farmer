@@ -37,6 +37,8 @@ class FarmerSettings:
     activity_profile: str = DEFAULT_ACTIVITY_PROFILE
 
     enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
+    treatment_enemy_targets: list[str] = field(default_factory=list)
+    treatment_targets_initialized: bool = False
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
     battle_start_hp_percent: int = DEFAULT_BATTLE_START_HP_PERCENT
@@ -75,10 +77,15 @@ class SettingsService:
                 setattr(self.values, key, value)
 
         self._normalize_enabled_targets()
+        self._normalize_treatment_enemy_targets()
         self._normalize_character()
         self._normalize_activity_profile()
         self.values.blessing_enabled = self._normalize_bool(
             self.values.blessing_enabled,
+            default=False,
+        )
+        self.values.treatment_targets_initialized = self._normalize_bool(
+            self.values.treatment_targets_initialized,
             default=False,
         )
         await self.storage.set_settings(asdict(self.values))
@@ -103,6 +110,35 @@ class SettingsService:
         self.values.activity_profile = normalized
         await self.storage.set_setting("activity_profile", normalized)
         return normalized
+
+    async def add_treatment_enemy_target(self, target: str) -> bool:
+        normalized = target.strip()
+        known = {item.casefold() for item in self.values.treatment_enemy_targets}
+        if not normalized or normalized.casefold() in known:
+            return False
+        self.values.treatment_enemy_targets.append(normalized)
+        await self.storage.set_setting(
+            "treatment_enemy_targets",
+            self.values.treatment_enemy_targets,
+        )
+        return True
+
+    async def remove_treatment_enemy_target(self, target: str) -> bool:
+        normalized = target.strip().casefold()
+        updated = [
+            item
+            for item in self.values.treatment_enemy_targets
+            if item.casefold() != normalized
+        ]
+        if len(updated) == len(self.values.treatment_enemy_targets):
+            return False
+        self.values.treatment_enemy_targets = updated
+        await self.storage.set_setting("treatment_enemy_targets", updated)
+        return True
+
+    async def mark_treatment_targets_initialized(self) -> None:
+        self.values.treatment_targets_initialized = True
+        await self.storage.set_setting("treatment_targets_initialized", True)
 
     async def toggle_target(self, target: str) -> bool:
         if target not in DEFAULT_TARGET_MONSTERS:
@@ -166,6 +202,22 @@ class SettingsService:
 
     def _normalize_enabled_targets(self) -> None:
         self.values.enabled_targets = self._coerce_enabled_targets(self.values.enabled_targets)
+
+    def _normalize_treatment_enemy_targets(self) -> None:
+        raw_targets: object = self.values.treatment_enemy_targets
+        if not isinstance(raw_targets, list):
+            self.values.treatment_enemy_targets = []
+            return
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in raw_targets:
+            target = str(value).strip()
+            key = target.casefold()
+            if not target or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(target)
+        self.values.treatment_enemy_targets = normalized
 
     @classmethod
     def _coerce_enabled_targets(cls, value: object) -> list[str]:

@@ -13,9 +13,11 @@ from combat_strategy import (
     CombatDecision,
     CombatMemory,
     ObservedRange,
+    RecentCombatKnowledge,
     SkillTarget,
     build_decision_trace,
     choose_combat_action,
+    is_periodic_effect,
     resolve_decision_trace,
 )
 from config import (
@@ -32,13 +34,14 @@ from navigator import SnakeNavigator
 from parser import classify_message, extract_player_hp, parse_map
 from rewards import BattleReward, parse_item_stack
 from settings_service import SettingsService
-from skills import HEALING_MANA_RESERVE, enough_health_for_battle
+from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_button
 from storage import Storage
 from targeting import select_combat_target
 from telegram_safety import (
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
+    TelegramActionTelemetry,
     message_revision_key,
     message_state_key,
 )
@@ -89,7 +92,8 @@ class ParserTests(unittest.TestCase):
         self.assertIsNone(navigator.location_name)
 
         text = (
-            "🗺️ Темный грот\nПозиция: (1, 0)\nМонстры на клетке: 1 (Черная мушка)\nKombat (845/845)"
+            "🗺️ Темный грот\nПозиция: (1, 0)\n"
+            "Монстры на клетке: 1 (Черная мушка)\nKombat (845/845)"
         )
         parsed = parse_map(text, TARGETS, CHARACTER)
 
@@ -103,6 +107,27 @@ class ParserTests(unittest.TestCase):
         )
         self.assertIsNone(navigator.location_name)
 
+    def test_map_size_is_parsed_from_game_message(self) -> None:
+        parsed = parse_map(
+            "🗺️ Темный грот\nПозиция: (12, 14)\nРазмер: 15x15\n"
+            "Монстры на клетке: 0\nKombat (845/845)",
+            TARGETS,
+            CHARACTER,
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual((parsed.width, parsed.height), (15, 15))
+
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            parsed.location_name or "Темный грот",
+            current_position=parsed.position,
+            width=parsed.width,
+            height=parsed.height,
+        )
+        self.assertEqual((navigator.max_x, navigator.max_y), (14, 14))
+        navigator.validate_position((12, 14))
+
     def test_blocked_movement_is_exposed_as_data(self) -> None:
         parsed = parse_map(
             "🗺️ Мертвый лес\nПозиция: (5, 0)\nМонстры на клетке: 0\nСтатус: Туда пройти нельзя",
@@ -115,6 +140,15 @@ class ParserTests(unittest.TestCase):
 
 
 class SkillTests(unittest.TestCase):
+    def test_magic_blocked_and_explicit_low_mana_buttons_are_unavailable(self) -> None:
+        blocked = parse_skill_button(
+            "⏳ Лечение [Мана 4] (магия заблокирована)"
+        )
+        low_mana = parse_skill_button("⏳ Обновление [Мана 4] (mana:3/4)")
+
+        self.assertFalse(blocked.available)
+        self.assertFalse(blocked.can_cast(12))
+        self.assertFalse(low_mana.available)
     def test_battle_health_requirement_supports_50_and_100_percent(self) -> None:
         self.assertTrue(enough_health_for_battle(423, 845, 50))
         self.assertFalse(enough_health_for_battle(422, 845, 50))
@@ -599,6 +633,36 @@ class CombatStrategyTests(unittest.TestCase):
 
 
 class CombatRoundModelTests(unittest.TestCase):
+    def test_failed_skill_is_parsed_and_clears_pending_action(self) -> None:
+        parsed = parse_combat_round(
+            "⚔️ Раунд 8\nKombat: Лечение (неудача: магия заблокирована)"
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.failed_skill_uses[0].skill, "Лечение")
+        self.assertEqual(parsed.failed_skill_uses[0].reason, "магия заблокирована")
+
+        memory = CombatMemory(target_name="Фонарщик", pending_skill="лечение")
+        memory.pending_target = SkillTarget.ENEMY
+        memory.observe("⚔️ Раунд 8\nKombat: Лечение (неудача: магия заблокирована)", CHARACTER)
+        self.assertIsNone(memory.pending_skill)
+        self.assertIsNone(memory.pending_target)
+
+    def test_named_poison_is_included_in_survival_forecast(self) -> None:
+        self.assertTrue(is_periodic_effect("Змеиный яд"))
+        self.assertTrue(is_periodic_effect("Раскаленное ядро [добивание]"))
+        memory = CombatMemory(target_name="Древесная змея")
+        memory.observe(
+            """⚔️ Раунд 6
+Правая сторона
+🪬🧍Kombat получает 24 урона · Змеиный яд
+🪬🧍Kombat
+❤️ 500/780
+🐍 Змеиный яд · 2 хода""",
+            CHARACTER,
+        )
+        self.assertEqual(memory.periodic_damage, 24)
+        self.assertEqual(memory.periodic_damage_turns, 2)
     def test_full_player_round_is_parsed_into_typed_state(self) -> None:
         parsed = parse_combat_round(
             """⚔️ Раунд 29
@@ -668,6 +732,15 @@ class CombatRoundModelTests(unittest.TestCase):
         self.assertEqual(parsed.applied_effects[0].target, "🪬🧍Kombat")
         self.assertEqual(parsed.dodged, ("Пепельник",))
         self.assertEqual(parsed.defeated, ("Фонарщик",))
+
+    def test_multi_hit_total_and_powerful_critical_are_parsed(self) -> None:
+        parsed = parse_combat_round(
+            "⚔️ Раунд 4\nФонарщик получает 61 / 29 / 29 = 119 урона ❗️Мощный крит"
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.damage[0].amount, 119)
+        self.assertTrue(parsed.damage[0].critical)
 
     def test_player_prompt_includes_cooldowns_costs_and_timer(self) -> None:
         parsed = parse_combat_round(
@@ -906,6 +979,19 @@ class MovementRecoveryTests(unittest.TestCase):
 
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
+        now = 100.0
+        telemetry = TelegramActionTelemetry(clock=lambda: now)
+        telemetry.record("inline_callback")
+        now = 150.0
+        snapshot = telemetry.record("map_message")
+
+        self.assertEqual(snapshot["total"], 2)
+        self.assertEqual(snapshot["last_minute"], 2)
+        self.assertEqual(
+            snapshot["by_kind"],
+            {"inline_callback": 1, "map_message": 1},
+        )
     def test_noop_edit_has_same_semantic_state(self) -> None:
         first = FakeMessage(
             "Ход игрока",
@@ -1130,7 +1216,37 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("combat_decisions", tables)
             self.assertIn("combat_strategy_stats", tables)
             self.assertIn("combat_policy_stats", tables)
+            self.assertIn("combat_knowledge", tables)
             await storage.close()
+
+    async def test_combat_knowledge_survives_restart_by_character_profile(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            knowledge = RecentCombatKnowledge()
+            knowledge.add_incoming("Фонарщик", 61)
+            knowledge.add_incoming("Фонарщик", 66, critical=True)
+            knowledge.add_outgoing("Фонарщик", "лечение", 94)
+            knowledge.add_direct_healing(124)
+            knowledge.add_renewal_healing(40)
+            knowledge.confirm_treatment_enemy("Фонарщик")
+
+            storage = Storage(path)
+            await storage.save_combat_knowledge(780, knowledge.as_payload())
+            await storage.close()
+
+            reopened = Storage(path)
+            profiles = await reopened.load_combat_knowledge()
+            restored = RecentCombatKnowledge.from_payload(profiles[780])
+            memory = CombatMemory(target_name="Фонарщик", knowledge=restored)
+            restored.load_into(memory)
+
+            self.assertEqual(memory.incoming_damage.minimum, 61)
+            self.assertEqual(memory.critical_incoming_damage.minimum, 66)
+            self.assertEqual(memory.damage_floor("лечение"), 0)
+            self.assertEqual(memory.direct_heal(), 124)
+            self.assertEqual(memory.renewal_tick(), 40)
+            self.assertTrue(memory.treatment_can_target_enemy())
+            await reopened.close()
 
     async def test_learned_map_obstacles_survive_restart(self) -> None:
         with TemporaryDirectory() as directory:

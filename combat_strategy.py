@@ -16,7 +16,18 @@ KNOWN_SKILLS = {
     "атака аколита",
 }
 
-PERIODIC_EFFECTS = {"горение", "кровотечение", "яд"}
+PERIODIC_EFFECT_MARKERS = (
+    "яд",
+    "горение",
+    "кровотечение",
+    "раскаленное ядро",
+)
+
+
+def is_periodic_effect(name: str | None) -> bool:
+    normalized = normalize(name or "")
+    normalized = normalized.removesuffix("[добивание]").strip()
+    return any(marker in normalized for marker in PERIODIC_EFFECT_MARKERS)
 
 
 class SkillTarget(Enum):
@@ -229,6 +240,79 @@ class RecentCombatKnowledge:
     renewal_healing: list[int] = field(default_factory=list)
     treatment_enemy_targets: set[str] = field(default_factory=set)
 
+    @staticmethod
+    def _sample_list(value: object, limit: int) -> list[int]:
+        if not isinstance(value, list):
+            return []
+        samples = [int(item) for item in value if isinstance(item, int) and item > 0]
+        return samples[-limit:]
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "sample_limit": self.sample_limit,
+            "incoming": self.incoming,
+            "critical_incoming": self.critical_incoming,
+            "outgoing": self.outgoing,
+            "skill_cooldowns": self.skill_cooldowns,
+            "direct_healing": self.direct_healing,
+            "renewal_healing": self.renewal_healing,
+            "treatment_enemy_targets": sorted(self.treatment_enemy_targets),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> RecentCombatKnowledge:
+        if not isinstance(payload, dict):
+            return cls()
+        raw_limit = payload.get("sample_limit", 12)
+        sample_limit = (
+            max(1, min(100, raw_limit)) if isinstance(raw_limit, int) else 12
+        )
+        knowledge = cls(sample_limit=sample_limit)
+
+        for field_name in ("incoming", "critical_incoming"):
+            raw_mapping = payload.get(field_name)
+            if not isinstance(raw_mapping, dict):
+                continue
+            parsed = {
+                normalize(str(target)): cls._sample_list(values, sample_limit)
+                for target, values in raw_mapping.items()
+            }
+            setattr(knowledge, field_name, {key: value for key, value in parsed.items() if value})
+
+        raw_outgoing = payload.get("outgoing")
+        if isinstance(raw_outgoing, dict):
+            for target, raw_skills in raw_outgoing.items():
+                if not isinstance(raw_skills, dict):
+                    continue
+                skills = {
+                    normalize(str(skill)): cls._sample_list(values, sample_limit)
+                    for skill, values in raw_skills.items()
+                }
+                skills = {key: value for key, value in skills.items() if value}
+                if skills:
+                    knowledge.outgoing[normalize(str(target))] = skills
+
+        raw_cooldowns = payload.get("skill_cooldowns")
+        if isinstance(raw_cooldowns, dict):
+            knowledge.skill_cooldowns = {
+                normalize(str(name)): max(0, int(value))
+                for name, value in raw_cooldowns.items()
+                if isinstance(value, int)
+            }
+        knowledge.direct_healing = cls._sample_list(
+            payload.get("direct_healing"), sample_limit
+        )
+        knowledge.renewal_healing = cls._sample_list(
+            payload.get("renewal_healing"), sample_limit
+        )
+        raw_targets = payload.get("treatment_enemy_targets")
+        if isinstance(raw_targets, list):
+            knowledge.treatment_enemy_targets = {
+                normalize(str(target)) for target in raw_targets if str(target).strip()
+            }
+        return knowledge
+
     def _append(self, samples: list[int], value: int) -> None:
         if value <= 0:
             return
@@ -372,7 +456,18 @@ class CombatMemory:
             for skill in parsed.skill_uses
             if character in normalize(skill.actor) and normalize(skill.skill) in KNOWN_SKILLS
         ]
-        player_skill = used_skills[-1] if used_skills else self.pending_skill
+        failed_player_skills = [
+            normalize(skill.skill)
+            for skill in parsed.failed_skill_uses
+            if character in normalize(skill.actor)
+        ]
+        player_skill = (
+            used_skills[-1]
+            if used_skills
+            else None
+            if failed_player_skills
+            else self.pending_skill
+        )
 
         for skill in parsed.available_skills:
             skill_name = normalize(skill.name)
@@ -386,7 +481,7 @@ class CombatMemory:
             recipient = normalize(damage_event.target)
             effect = normalize(damage_event.effect or "")
             if character in recipient:
-                if effect in PERIODIC_EFFECTS:
+                if is_periodic_effect(effect):
                     self.periodic_damage = damage_event.amount
                 elif damage_event.critical:
                     self.critical_incoming_damage.add(damage_event.amount)
@@ -400,7 +495,7 @@ class CombatMemory:
                     self.knowledge.add_incoming(self.target_name, damage_event.amount)
             elif (
                 player_skill is not None
-                and effect not in PERIODIC_EFFECTS
+                and not is_periodic_effect(effect)
                 and not damage_event.critical
             ):
                 # The game reports only the remaining HP on a finishing hit.
@@ -460,7 +555,7 @@ class CombatMemory:
         periodic_effects = [
             turns
             for name, turns in effect_turns.items()
-            if name in PERIODIC_EFFECTS
+            if is_periodic_effect(name)
         ]
         if periodic_effects:
             self.periodic_damage_turns = max(periodic_effects)
@@ -468,8 +563,10 @@ class CombatMemory:
             self.periodic_damage_turns = 0
             self.periodic_damage = 0
 
-        if used_skills:
+        if used_skills or failed_player_skills:
             self.pending_skill = None
+            self.pending_target = None
+            self.pending_urgent = False
 
     def damage_floor(self, skill_name: str) -> int:
         observed = self.outgoing_damage.get(skill_name)
@@ -653,7 +750,7 @@ def resolve_decision_trace(
             event.amount
             for event in round_state.damage
             if character not in normalize(event.target)
-            and normalize(event.effect or "") not in PERIODIC_EFFECTS
+            and not is_periodic_effect(event.effect)
         ]
         if enemy_damage:
             return replace(
@@ -675,7 +772,7 @@ def resolve_decision_trace(
         event.amount
         for event in round_state.damage
         if character not in normalize(event.target)
-        and normalize(event.effect or "") not in PERIODIC_EFFECTS
+        and not is_periodic_effect(event.effect)
     ]
     return replace(
         trace,

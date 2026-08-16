@@ -11,9 +11,14 @@ from skills import DEFAULT_MANA_COSTS, SkillButton, parse_skill_button
 ROUND_RE = re.compile(r"(?:⚔️|🎯)\s*Раунд\s*(\d+)", re.IGNORECASE)
 TURN_RE = re.compile(r"^Ход\s+(.+)$", re.IGNORECASE)
 USE_SKILL_RE = re.compile(r"^(.+?)\s+использует\s+(.+)$", re.IGNORECASE)
+FAILED_SKILL_RE = re.compile(
+    r"^(.+?):\s*(.+?)\s*\(неудача:\s*(.+?)\)$",
+    re.IGNORECASE,
+)
 ATTACK_RE = re.compile(r"^(.+?)\s+атакует\s+(.+)$", re.IGNORECASE)
 DAMAGE_RE = re.compile(
-    r"^(.+?)\s+получает\s+(\d+)\s+урона"
+    r"^(.+?)\s+получает\s+"
+    r"(?:(?:\d+\s*/\s*)+\d+\s*=\s*)?(\d+)\s+урона"
     r"(?:\s*·\s*(.+?)|\s+(.+?))?$",
     re.IGNORECASE,
 )
@@ -58,6 +63,13 @@ class CombatEffect:
 class SkillUse:
     actor: str
     skill: str
+
+
+@dataclass(frozen=True)
+class FailedSkillUse:
+    actor: str
+    skill: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -113,6 +125,7 @@ class CombatRoundState:
     selected_skill: str | None
     available_skills: tuple[SkillButton, ...]
     skill_uses: tuple[SkillUse, ...]
+    failed_skill_uses: tuple[FailedSkillUse, ...]
     attacks: tuple[AttackEvent, ...]
     damage: tuple[DamageEvent, ...]
     healing: tuple[HealingEvent, ...]
@@ -206,6 +219,7 @@ def parse_combat_round(
     lines = [line for line in raw_lines if line]
     round_match = ROUND_RE.search(text)
     skill_uses: list[SkillUse] = []
+    failed_skill_uses: list[FailedSkillUse] = []
     attacks: list[AttackEvent] = []
     damage: list[DamageEvent] = []
     healing: list[HealingEvent] = []
@@ -223,6 +237,14 @@ def parse_combat_round(
                 SkillUse(
                     actor=skill_match.group(1).strip(),
                     skill=skill_match.group(2).strip(),
+                )
+            )
+        if failed_match := FAILED_SKILL_RE.match(line):
+            failed_skill_uses.append(
+                FailedSkillUse(
+                    actor=failed_match.group(1).strip(),
+                    skill=failed_match.group(2).strip(),
+                    reason=failed_match.group(3).strip(),
                 )
             )
         if attack_match := ATTACK_RE.match(line):
@@ -271,6 +293,7 @@ def parse_combat_round(
         round_match
         or turn_actor
         or skill_uses
+        or failed_skill_uses
         or attacks
         or damage
         or healing
@@ -322,6 +345,7 @@ def parse_combat_round(
         selected_skill=selected_match.group(1).strip() if selected_match else None,
         available_skills=available_skills,
         skill_uses=tuple(skill_uses),
+        failed_skill_uses=tuple(failed_skill_uses),
         attacks=tuple(attacks),
         damage=tuple(damage),
         healing=tuple(healing),

@@ -17,6 +17,7 @@ from combat_round import parse_combat_round
 from combat_strategy import (
     CombatDecisionTrace,
     CombatMemory,
+    RecentCombatKnowledge,
     SkillTarget,
     build_decision_trace,
     choose_combat_action,
@@ -94,6 +95,7 @@ from telegram_safety import (
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
+    TelegramActionTelemetry,
     message_state_key,
 )
 from watchdog import ProgressWatchdog
@@ -144,6 +146,8 @@ class Farmer:
             self.combat.confirm_treatment_enemy(target)
         self.combat_decisions: list[CombatDecisionTrace] = []
         self.pending_combat_decision: CombatDecisionTrace | None = None
+        self.combat_knowledge_profiles: dict[int, RecentCombatKnowledge] = {}
+        self.active_combat_profile_max_hp: int | None = None
         self.delay_model = HumanDelayModel()
         self.activity_break_planner = ActivityBreakPlanner()
         self.statistics = FarmStatistics()
@@ -188,11 +192,68 @@ class Farmer:
             max_actions=TELEGRAM_ACTION_LIMIT,
             window_seconds=TELEGRAM_ACTION_WINDOW,
         )
+        self.telegram_action_telemetry = TelegramActionTelemetry()
 
         self.blessing = BlessingManager()
 
     def log(self, text: str) -> None:
         logger.info("[%s] %s", self.state.name, text)
+
+    def record_telegram_action(self, kind: str) -> None:
+        snapshot = self.telegram_action_telemetry.record(kind)
+        total_value = snapshot["total"]
+        total = total_value if isinstance(total_value, int) else 0
+        if total % 10 == 0:
+            self.log(
+                "[TELEGRAM_IO] исходящих действий: "
+                f"всего={total}, за 1 мин={snapshot['last_minute']}, "
+                f"за 10 мин={snapshot['last_ten_minutes']}, "
+                f"типы={snapshot['by_kind']}"
+            )
+
+    def _new_combat_knowledge(self) -> RecentCombatKnowledge:
+        knowledge = RecentCombatKnowledge()
+        for target in self.settings.values.treatment_enemy_targets:
+            knowledge.confirm_treatment_enemy(target)
+        return knowledge
+
+    async def load_combat_knowledge(self) -> None:
+        stored_profiles = await self.storage.load_combat_knowledge()
+        for max_hp, payload in stored_profiles.items():
+            knowledge = RecentCombatKnowledge.from_payload(payload)
+            for target in self.settings.values.treatment_enemy_targets:
+                knowledge.confirm_treatment_enemy(target)
+            self.combat_knowledge_profiles[max_hp] = knowledge
+        if stored_profiles:
+            self.log(
+                "Загружена долговременная боевая память: "
+                f"профилей персонажа — {len(stored_profiles)}."
+            )
+
+    def activate_combat_profile(self, max_hp: int | None) -> None:
+        if max_hp is None or max_hp <= 0:
+            return
+        if self.active_combat_profile_max_hp == max_hp:
+            return
+
+        knowledge = self.combat_knowledge_profiles.setdefault(
+            max_hp,
+            self._new_combat_knowledge(),
+        )
+        self.combat.knowledge = knowledge
+        self.active_combat_profile_max_hp = max_hp
+        if self.combat.target_name:
+            knowledge.load_into(self.combat)
+        self.log(f"Активирован боевой профиль для максимума HP {max_hp}.")
+
+    async def persist_combat_knowledge(self) -> None:
+        max_hp = getattr(self, "active_combat_profile_max_hp", None)
+        if max_hp is None:
+            return
+        await self.storage.save_combat_knowledge(
+            max_hp,
+            self.combat.knowledge.as_payload(),
+        )
 
     def mark_progress(self, reason: str) -> None:
         self.watchdog.mark_progress(reason)
@@ -425,6 +486,7 @@ class Farmer:
         self.attempted_actions.remember(action_key)
 
         try:
+            self.record_telegram_action("inline_callback")
             await message.click(row, column)
             self.callback_timeout_count = 0
             return True
@@ -842,12 +904,24 @@ class Farmer:
         )
 
     async def handle_map(self, message, map_info: MapInfo) -> None:
-        if map_info.location_name and map_info.location_name != self.navigator.location_name:
+        geometry_changed = bool(
+            map_info.width
+            and map_info.height
+            and (
+                self.navigator.max_x != map_info.width - 1
+                or self.navigator.max_y != map_info.height - 1
+            )
+        )
+        if map_info.location_name and (
+            map_info.location_name != self.navigator.location_name or geometry_changed
+        ):
             learned_obstacles = await self.storage.get_map_obstacles(map_info.location_name)
             self.navigator.use_location(
                 map_info.location_name,
                 learned_obstacles,
                 current_position=map_info.position,
+                width=map_info.width,
+                height=map_info.height,
             )
             self.context.pending_move = None
             self.context.failed_move_attempts = 0
@@ -1274,6 +1348,7 @@ class Farmer:
                 trace.as_payload() for trace in self.combat_decisions
             ),
         )
+        await self.persist_combat_knowledge()
 
         self.context.clear_combat()
         self.combat.reset()
@@ -1429,6 +1504,7 @@ class Farmer:
             if not self.running or self.inbound_generation != generation:
                 self.log("Запрос карты отменён: уже получено новое состояние.")
                 return False
+            self.record_telegram_action("map_message")
             await self.client.send_message(
                 self.game_bot,
                 MAP_COMMAND,
@@ -1541,6 +1617,11 @@ class Farmer:
         round_state = parse_combat_round(text, get_button_texts(message))
 
         if kind is MessageKind.COMBAT_STARTED:
+            self.activate_combat_profile(self.context.max_hp)
+        elif self.combat.target_name and self.active_combat_profile_max_hp is None:
+            self.activate_combat_profile(self.context.max_hp)
+
+        if kind is MessageKind.COMBAT_STARTED:
             observed_target = extract_combat_target(text)
             normalized_text = normalize(text)
             if "на помощь врагу присоединился" not in normalized_text:
@@ -1553,6 +1634,11 @@ class Farmer:
             player_skills = [
                 skill
                 for skill in round_state.skill_uses
+                if normalize(CHARACTER_NAME) in normalize(skill.actor)
+            ]
+            failed_player_skills = [
+                skill
+                for skill in round_state.failed_skill_uses
                 if normalize(CHARACTER_NAME) in normalize(skill.actor)
             ]
             if player_skills:
@@ -1600,6 +1686,13 @@ class Farmer:
                         f"ожидался «{expected_skill}», применён «{confirmed_skill}». "
                         "Решение исключено из статистики."
                     )
+                self.pending_combat_decision = None
+            elif failed_player_skills:
+                failed = failed_player_skills[-1]
+                self.log(
+                    f"Навык «{failed.skill}» не применён: {failed.reason}. "
+                    "Решение исключено из статистики."
+                )
                 self.pending_combat_decision = None
         self.combat.observe(text, CHARACTER_NAME, round_state)
 
@@ -1723,6 +1816,7 @@ class Farmer:
                         trace.as_payload() for trace in self.combat_decisions
                     ),
                 )
+                await self.persist_combat_knowledge()
                 for card in cards:
                     await self.storage.add_event(
                         "MOB_CARD_DROPPED",
@@ -1796,7 +1890,15 @@ class Farmer:
         await self.storage.add_event(
             "FARMER_STOPPED",
             reason,
+            payload={
+                "telegram_actions": (
+                    self.telegram_action_telemetry.snapshot()
+                    if hasattr(self, "telegram_action_telemetry")
+                    else {}
+                )
+            },
         )
+        await self.persist_combat_knowledge()
         await self.storage.checkpoint()
         for task in (
             self.worker_task,
@@ -1814,6 +1916,7 @@ class Farmer:
 
     async def run(self) -> None:
         self.validate_config()
+        await self.load_combat_knowledge()
         if not self.settings.values.treatment_targets_initialized:
             historical_treatment_targets = (
                 await self.storage.get_confirmed_treatment_targets()
@@ -1823,6 +1926,8 @@ class Farmer:
             await self.settings.mark_treatment_targets_initialized()
         for target in self.settings.values.treatment_enemy_targets:
             self.combat.confirm_treatment_enemy(target)
+            for knowledge in self.combat_knowledge_profiles.values():
+                knowledge.confirm_treatment_enemy(target)
         if self.settings.values.treatment_enemy_targets:
             self.log(
                 "Подтверждённые цели атакующего Лечения: "

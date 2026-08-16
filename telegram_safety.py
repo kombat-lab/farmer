@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Awaitable, Callable
 
 from telegram_buttons import get_button_texts
@@ -65,6 +65,35 @@ class RollingAttemptGuard:
             return False
         self._timestamps.append(now)
         return True
+
+
+class TelegramActionTelemetry:
+    """Counts outgoing user actions locally without making Telegram requests."""
+
+    def __init__(self, *, clock: Clock = time.monotonic) -> None:
+        self.clock = clock
+        self.total = 0
+        self.by_kind: Counter[str] = Counter()
+        self._timestamps: deque[float] = deque()
+
+    def record(self, kind: str) -> dict[str, object]:
+        now = self.clock()
+        self.total += 1
+        self.by_kind[kind] += 1
+        self._timestamps.append(now)
+        cutoff = now - 600.0
+        while self._timestamps and self._timestamps[0] <= cutoff:
+            self._timestamps.popleft()
+        return self.snapshot(now=now)
+
+    def snapshot(self, *, now: float | None = None) -> dict[str, object]:
+        current = self.clock() if now is None else now
+        return {
+            "total": self.total,
+            "last_minute": sum(stamp > current - 60.0 for stamp in self._timestamps),
+            "last_ten_minutes": len(self._timestamps),
+            "by_kind": dict(self.by_kind),
+        }
 
 
 class TelegramActionLimiter:

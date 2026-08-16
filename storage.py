@@ -210,6 +210,12 @@ class Storage:
             PRIMARY KEY(target_name, policy_key)
         );
 
+        CREATE TABLE IF NOT EXISTS combat_knowledge (
+            profile_max_hp INTEGER PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            knowledge_json TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS farmer_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             process_status TEXT NOT NULL DEFAULT 'STOPPED',
@@ -835,6 +841,46 @@ class Storage:
                 dict(row)
                 for row in self.connection.execute(query, params).fetchall()
             ]
+
+    async def load_combat_knowledge(self) -> dict[int, dict[str, Any]]:
+        async with self.lock:
+            rows = self.connection.execute(
+                "SELECT profile_max_hp,knowledge_json FROM combat_knowledge"
+            ).fetchall()
+
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["knowledge_json"]))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                result[int(row["profile_max_hp"])] = payload
+        return result
+
+    async def save_combat_knowledge(
+        self,
+        profile_max_hp: int,
+        payload: dict[str, Any],
+    ) -> None:
+        if profile_max_hp <= 0:
+            return
+        async with self.lock:
+            self.connection.execute(
+                """
+                INSERT INTO combat_knowledge(profile_max_hp,updated_at,knowledge_json)
+                VALUES (?,?,?)
+                ON CONFLICT(profile_max_hp) DO UPDATE SET
+                    updated_at=excluded.updated_at,
+                    knowledge_json=excluded.knowledge_json
+                """,
+                (
+                    profile_max_hp,
+                    utc_now(),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            self.connection.commit()
 
     async def get_current_session(self) -> SessionSummary:
         async with self.lock:

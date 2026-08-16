@@ -29,6 +29,10 @@ STATUS_RE = re.compile(
     r"Статус:\s*([^\n\r]+)",
     re.IGNORECASE,
 )
+SIZE_RE = re.compile(
+    r"Размер:\s*(\d+)\s*[xх×]\s*(\d+)",
+    re.IGNORECASE,
+)
 
 
 def normalize(value: str) -> str:
@@ -149,6 +153,7 @@ def parse_map(
     hp = extract_player_hp(text, character_name)
     location_match = LOCATION_RE.search(text)
     status_match = STATUS_RE.search(text)
+    size_match = SIZE_RE.search(text)
 
     location_name = location_match.group(1).strip() if location_match else None
     status = status_match.group(1).strip() if status_match else None
@@ -166,6 +171,8 @@ def parse_map(
         movement_finished=("Переход между клетками завершён" in text),
         location_name=location_name,
         status=status,
+        width=int(size_match.group(1)) if size_match else None,
+        height=int(size_match.group(2)) if size_match else None,
     )
 
 

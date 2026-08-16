@@ -15,6 +15,10 @@ CURRENT_MANA_RE = re.compile(
     r"(?:🔷\s*)?Мана\s*:\s*(\d+)(?:\s*/\s*(\d+))?",
     re.IGNORECASE,
 )
+UNAVAILABLE_RE = re.compile(
+    r"\((?:магия\s+заблокирована|mana\s*:\s*\d+\s*/\s*\d+)\)",
+    re.IGNORECASE,
+)
 
 # Запасные стоимости применяются только когда игра не указала стоимость
 # прямо на кнопке навыка.
@@ -43,10 +47,11 @@ class SkillButton:
     name: str
     cooldown: int
     mana_cost: int
+    unavailable_reason: str | None = None
 
     @property
     def available(self) -> bool:
-        return self.cooldown == 0
+        return self.cooldown == 0 and self.unavailable_reason is None
 
     def can_cast(self, current_mana: int | None) -> bool:
         if not self.available:
@@ -82,12 +87,16 @@ def parse_skill_button(text: str) -> SkillButton:
     mana_cost = (
         int(mana_match.group(1)) if mana_match else DEFAULT_MANA_COSTS.get(normalize(name), 0)
     )
+    unavailable_match = UNAVAILABLE_RE.search(text)
 
     return SkillButton(
         raw_text=text,
         name=name,
         cooldown=cooldown,
         mana_cost=mana_cost,
+        unavailable_reason=(
+            unavailable_match.group(0).strip("()") if unavailable_match else None
+        ),
     )
 
 

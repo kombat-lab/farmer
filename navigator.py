@@ -61,17 +61,22 @@ class SnakeNavigator:
         location_name: str,
         learned_obstacles: Iterable[Position] = (),
         current_position: Position | None = None,
+        *,
+        width: int | None = None,
+        height: int | None = None,
     ) -> None:
         from locations import get_location_geometry
 
         geometry = get_location_geometry(location_name)
+        max_x = width - 1 if width is not None and width > 0 else geometry.max_x
+        max_y = height - 1 if height is not None and height > 0 else geometry.max_y
 
         self.location_name = location_name
         learned = {
             position
             for position in learned_obstacles
-            if geometry.min_x <= position[0] <= geometry.max_x
-            and geometry.min_y <= position[1] <= geometry.max_y
+            if geometry.min_x <= position[0] <= max_x
+            and geometry.min_y <= position[1] <= max_y
             and position not in geometry.blocked_cells
         }
         self.runtime_blocked = learned
@@ -81,9 +86,9 @@ class SnakeNavigator:
 
         self._configure(
             min_x=geometry.min_x,
-            max_x=geometry.max_x,
+            max_x=max_x,
             min_y=geometry.min_y,
-            max_y=geometry.max_y,
+            max_y=max_y,
             start_position=current_position or geometry.start_position,
             blocked_cells=geometry.blocked_cells,
             obstacle_mode=bool(geometry.blocked_cells or learned),

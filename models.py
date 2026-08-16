@@ -57,6 +57,8 @@ class MapInfo:
     movement_finished: bool
     location_name: str | None = None
     status: str | None = None
+    width: int | None = None
+    height: int | None = None
 
     @property
     def displayed_monster_count(self) -> int:

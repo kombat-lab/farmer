@@ -144,11 +144,6 @@ class FarmerSupervisor:
                         await self.task
             return True, "Фармер остановлен."
 
-    async def restart(self):
-        if self.is_running():
-            await self.stop()
-        return await self.start()
-
     async def status(self):
         state = await self.storage.get_state()
         state["task_running"] = self.is_running()

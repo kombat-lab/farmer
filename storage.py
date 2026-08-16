@@ -20,7 +20,6 @@ def utc_now() -> str:
 class SessionSummary:
     session_id: int | None
     started_at: str | None
-    ended_at: str | None
     status: str
     wins: int
     defeats: int
@@ -221,7 +220,6 @@ class Storage:
             max_hp INTEGER,
             active_target TEXT,
             moves INTEGER NOT NULL DEFAULT 0,
-            max_moves INTEGER NOT NULL DEFAULT 0,
             last_action TEXT,
             last_progress_at TEXT,
             last_error TEXT,
@@ -241,8 +239,7 @@ class Storage:
             level TEXT NOT NULL,
             event_type TEXT NOT NULL,
             message TEXT NOT NULL,
-            payload_json TEXT,
-            notified INTEGER NOT NULL DEFAULT 0
+            payload_json TEXT
         );
 
         CREATE TABLE IF NOT EXISTS settings (
@@ -433,7 +430,6 @@ class Storage:
             "max_hp",
             "active_target",
             "moves",
-            "max_moves",
             "last_action",
             "last_progress_at",
             "last_error",
@@ -717,9 +713,7 @@ class Storage:
             for item in items:
                 item_name, quantity = parse_item_stack(str(item))
                 n = item_name.casefold()
-                is_card = int(
-                    n.startswith("карта ") or n.startswith("🃏карта ") or n.startswith("🃏 карта ")
-                )
+                is_card = int(n.startswith(("карта ", "🃏карта ", "🃏 карта ")))
                 if is_card:
                     cards.append(item_name)
                 self.connection.execute(
@@ -849,11 +843,10 @@ class Storage:
                 ON f.session_id=s.id WHERE f.singleton=1
             """).fetchone()
             if not row:
-                return SessionSummary(None, None, None, "STOPPED", 0, 0, 0, 0, 0)
+                return SessionSummary(None, None, "STOPPED", 0, 0, 0, 0, 0)
             return SessionSummary(
                 row["id"],
                 row["started_at"],
-                row["ended_at"],
                 row["status"],
                 row["wins"],
                 row["defeats"],

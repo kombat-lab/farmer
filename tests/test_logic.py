@@ -860,17 +860,20 @@ class MovementRecoveryTests(unittest.TestCase):
         self.assertEqual(len(buttons), len(set(buttons)))
         self.assertTrue(exhausted)
 
-    def test_unknown_obstacle_is_learned_on_burned_field(self) -> None:
-        navigator = SnakeNavigator(0, 8, 0, 8)
-        navigator.use_location("Выжженное поле")
+    def test_unknown_obstacle_is_learned_on_large_maps(self) -> None:
+        for location_name in ("Мертвый лес", "Выжженное поле"):
+            with self.subTest(location=location_name):
+                navigator = SnakeNavigator(0, 8, 0, 8)
+                navigator.use_location(location_name)
 
-        self.assertEqual((navigator.max_x, navigator.max_y), (11, 11))
-        plan = navigator.plan((11, 0))
-        navigator.reject_last_plan((11, 0), mark_destination_blocked=True)
+                self.assertEqual((navigator.max_x, navigator.max_y), (11, 11))
+                self.assertEqual(navigator.blocked_cells, frozenset())
+                plan = navigator.plan((11, 0))
+                navigator.reject_last_plan((11, 0), mark_destination_blocked=True)
 
-        self.assertIn(plan.destination, navigator.runtime_blocked)
-        self.assertTrue(navigator.obstacle_mode)
-        self.assertNotIn(plan.destination, navigator.position_to_indices)
+                self.assertIn(plan.destination, navigator.runtime_blocked)
+                self.assertTrue(navigator.obstacle_mode)
+                self.assertNotIn(plan.destination, navigator.position_to_indices)
 
     def test_route_stays_in_reachable_component_after_learned_wall(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
@@ -1110,6 +1113,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "pause_requested",
                 }.issubset(columns)
             )
+            self.assertNotIn("max_moves", columns)
+            event_columns = {
+                str(row["name"])
+                for row in storage.connection.execute(
+                    "PRAGMA table_info(events)"
+                ).fetchall()
+            }
+            self.assertNotIn("notified", event_columns)
             tables = {
                 str(row["name"])
                 for row in storage.connection.execute(

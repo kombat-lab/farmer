@@ -173,15 +173,12 @@ def classify_message(
     text: str,
     configured_targets: Iterable[str],
     character_name: str,
+    *,
+    is_map: bool | None = None,
 ) -> MessageKind:
-    if (
-        parse_map(
-            text,
-            configured_targets,
-            character_name,
-        )
-        is not None
-    ):
+    if is_map is None:
+        is_map = parse_map(text, configured_targets, character_name) is not None
+    if is_map:
         return MessageKind.MAP
 
     if "Шаг начат" in text:

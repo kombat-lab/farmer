@@ -13,7 +13,6 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 
 from blessing import BlessingManager
-from combat_events import parse_combat_round_events
 from combat_round import parse_combat_round
 from combat_strategy import (
     CombatDecisionTrace,
@@ -72,6 +71,7 @@ from logger_setup import setup_logging
 from models import (
     ActionType,
     BotState,
+    MapInfo,
     MessageKind,
     RuntimeContext,
 )
@@ -202,6 +202,33 @@ class Farmer:
         ):
             self.progress_persist_task = asyncio.create_task(self._persist_progress())
 
+    def _state_snapshot(
+        self,
+        reason: str,
+        *,
+        pause_requested: bool | None = None,
+    ) -> dict[str, Any]:
+        position = self.context.current_position
+        return {
+            "game_state": self.state.name,
+            "position_x": position[0] if position else None,
+            "position_y": position[1] if position else None,
+            "current_hp": self.context.current_hp,
+            "max_hp": self.context.max_hp,
+            "active_target": self.context.active_target,
+            "moves": self.context.move_count,
+            "last_action": reason,
+            "last_progress_at": utc_now(),
+            "session_id": self.session_id,
+            "current_cycle": self.current_cycle,
+            "cycles_count": self.settings.values.cycles_count,
+            "moves_in_cycle": self.moves_in_cycle,
+            "moves_per_cycle": self.settings.values.moves_per_cycle,
+            "pause_requested": int(
+                self.pause_requested if pause_requested is None else pause_requested
+            ),
+        }
+
     async def _persist_progress(self) -> None:
         # Coalesce bursts into one writer. The most recent state is what the
         # control bot needs; spawning one SQLite task per update can otherwise
@@ -209,28 +236,7 @@ class Farmer:
         while self.running and self.pending_progress_reason is not None:
             reason = self.pending_progress_reason
             self.pending_progress_reason = None
-            await self.storage.update_state(
-                game_state=self.state.name,
-                position_x=(
-                    self.context.current_position[0] if self.context.current_position else None
-                ),
-                position_y=(
-                    self.context.current_position[1] if self.context.current_position else None
-                ),
-                current_hp=self.context.current_hp,
-                max_hp=self.context.max_hp,
-                active_target=self.context.active_target,
-                moves=self.context.move_count,
-                max_moves=self.settings.values.moves_per_cycle,
-                last_action=reason,
-                last_progress_at=utc_now(),
-                session_id=self.session_id,
-                current_cycle=self.current_cycle,
-                cycles_count=self.settings.values.cycles_count,
-                moves_in_cycle=self.moves_in_cycle,
-                moves_per_cycle=self.settings.values.moves_per_cycle,
-                pause_requested=int(self.pause_requested),
-            )
+            await self.storage.update_state(**self._state_snapshot(reason))
 
     def validate_config(self) -> None:
         if not isinstance(API_ID, int) or API_ID <= 0:
@@ -835,15 +841,7 @@ class Farmer:
             mark_progress=self.mark_progress,
         )
 
-    async def handle_map(self, message, text: str) -> None:
-        map_info = parse_map(
-            text,
-            self.settings.values.enabled_targets,
-            CHARACTER_NAME,
-        )
-        if map_info is None:
-            return
-
+    async def handle_map(self, message, map_info: MapInfo) -> None:
         if map_info.location_name and map_info.location_name != self.navigator.location_name:
             learned_obstacles = await self.storage.get_map_obstacles(map_info.location_name)
             self.navigator.use_location(
@@ -1368,7 +1366,7 @@ class Farmer:
                 self.recovery_task.cancel()
                 self.recovery_task = None
 
-            await self.handle_map(message, message.raw_text or "")
+            await self.handle_map(message, map_info)
         else:
             # The map can be newer than the preceding HP notification. Wait
             # for another inbound health update instead of polling Telegram.
@@ -1529,10 +1527,16 @@ class Farmer:
         hp_changed = self.update_hp(text)
         self.confirm_blessing_from_text(text)
 
+        map_info = parse_map(
+            text,
+            self.settings.values.enabled_targets,
+            CHARACTER_NAME,
+        )
         kind = classify_message(
             text,
             self.settings.values.enabled_targets,
             CHARACTER_NAME,
+            is_map=map_info is not None,
         )
         round_state = parse_combat_round(text, get_button_texts(message))
 
@@ -1623,8 +1627,8 @@ class Farmer:
         if await self.handle_blessing_menu(message):
             return
 
-        round_events = parse_combat_round_events(text, round_state)
-        for defeated_enemy in round_events.defeated_enemies:
+        defeated_enemies = round_state.defeated if round_state is not None else ()
+        for defeated_enemy in defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")
             if normalize(self.combat.target_name or "") == normalize(defeated_enemy):
@@ -1634,7 +1638,8 @@ class Farmer:
                     self.combat.reset()
 
         if kind is MessageKind.MAP:
-            await self.handle_map(message, text)
+            assert map_info is not None
+            await self.handle_map(message, map_info)
             return
 
         if kind is MessageKind.MOVE_STARTED:
@@ -1705,7 +1710,7 @@ class Farmer:
                     message.id,
                     reward,
                 )
-                db_added, cards = await self.storage.record_battle(
+                _, cards = await self.storage.record_battle(
                     telegram_message_id=message.id,
                     session_id=self.session_id,
                     target_name=target_name,
@@ -1772,26 +1777,7 @@ class Farmer:
         # Отложенная запись прогресса могла быть отменена строками выше.
         # Сохраняем фактические счётчики синхронно до завершения сессии.
         await self.storage.update_state(
-            game_state=self.state.name,
-            position_x=(
-                self.context.current_position[0] if self.context.current_position else None
-            ),
-            position_y=(
-                self.context.current_position[1] if self.context.current_position else None
-            ),
-            current_hp=self.context.current_hp,
-            max_hp=self.context.max_hp,
-            active_target=self.context.active_target,
-            moves=self.context.move_count,
-            max_moves=self.settings.values.moves_per_cycle,
-            last_action=reason,
-            last_progress_at=utc_now(),
-            session_id=self.session_id,
-            current_cycle=self.current_cycle,
-            cycles_count=self.settings.values.cycles_count,
-            moves_in_cycle=self.moves_in_cycle,
-            moves_per_cycle=self.settings.values.moves_per_cycle,
-            pause_requested=0,
+            **self._state_snapshot(reason, pause_requested=False)
         )
 
         logger.info(

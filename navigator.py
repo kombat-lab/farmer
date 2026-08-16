@@ -20,7 +20,6 @@ class SnakeNavigator:
     соответствии диагональных кнопок координатам.
     """
 
-    HORIZONTAL_BUTTONS = ("⬅️", "➡️")
     DIAGONAL_BUTTONS = ("↖️", "↗️", "↙️", "↘️")
     ALL_MOVE_BUTTONS = (
         "⬅️",
@@ -400,12 +399,11 @@ class SnakeNavigator:
                 destination_index = self.route_index - 1
             else:
                 destination_index = self.route_index + 1
+        elif self.route_index == 0:
+            direction_after = RouteDirection.DOWN
+            destination_index = self.route_index + 1
         else:
-            if self.route_index == 0:
-                direction_after = RouteDirection.DOWN
-                destination_index = self.route_index + 1
-            else:
-                destination_index = self.route_index - 1
+            destination_index = self.route_index - 1
 
         destination = self.route[destination_index]
 

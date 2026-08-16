@@ -132,9 +132,6 @@ class CombatRoundState:
                 return combatant
         return None
 
-    def skills_by_name(self) -> dict[str, SkillButton]:
-        return {normalize(skill.name): skill for skill in self.available_skills}
-
     def castable_skills(self) -> dict[str, SkillButton]:
         return {
             normalize(skill.name): skill

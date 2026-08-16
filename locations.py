@@ -24,34 +24,20 @@ _DEFAULT_GEOMETRY = LocationGeometry(
     blocked_cells=frozenset(),
 )
 
+_TWELVE_BY_TWELVE_GEOMETRY = LocationGeometry(
+    min_x=0,
+    max_x=11,
+    min_y=0,
+    max_y=11,
+    start_position=(0, 0),
+    blocked_cells=frozenset(),
+)
+
 _LOCATION_GEOMETRY: dict[str, LocationGeometry] = {
-    "Мертвый лес": LocationGeometry(
-        min_x=0,
-        max_x=11,
-        min_y=0,
-        max_y=11,
-        start_position=(0, 0),
-        blocked_cells=frozenset(
-            {
-                (5, 1),
-                (9, 1),
-                (9, 2),
-                (10, 2),
-                (1, 9),
-                (2, 10),
-                (4, 11),
-            }
-        ),
-    ),
-    "Выжженное поле": LocationGeometry(
-        min_x=0,
-        max_x=11,
-        min_y=0,
-        max_y=11,
-        start_position=(0, 0),
-        blocked_cells=frozenset(),
-    ),
+    "Мертвый лес": _TWELVE_BY_TWELVE_GEOMETRY,
+    "Выжженное поле": _TWELVE_BY_TWELVE_GEOMETRY,
 }
+
 
 def get_location_geometry(name: str) -> LocationGeometry:
     # Для новых локаций без отдельной геометрии используется безопасная карта 9×9.

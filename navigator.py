@@ -80,8 +80,14 @@ class SnakeNavigator:
             and geometry.min_y <= position[1] <= max_y
             and position not in geometry.blocked_cells
         }
+        confirmed_accessible = (
+            {current_position}
+            if current_position is not None and current_position in learned
+            else set()
+        )
+        learned.difference_update(confirmed_accessible)
         self.runtime_blocked = learned
-        self.recovery_discarded_obstacles.clear()
+        self.recovery_discarded_obstacles = confirmed_accessible
         self.failed_buttons.clear()
         self.direction = RouteDirection.DOWN
         self.last_plan = None

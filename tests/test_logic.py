@@ -928,6 +928,23 @@ class MovementRecoveryTests(unittest.TestCase):
         self.assertEqual(navigator.take_recovery_discarded_obstacles(), false_wall)
         self.assertEqual(navigator.plan((11, 10)).origin, (11, 10))
 
+    def test_current_position_cannot_remain_a_learned_obstacle(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            "Мертвый лес",
+            {(11, 10)},
+            current_position=(11, 10),
+            width=12,
+            height=12,
+        )
+
+        self.assertIn((11, 10), navigator.position_to_indices)
+        self.assertNotIn((11, 10), navigator.runtime_blocked)
+        self.assertEqual(
+            navigator.take_recovery_discarded_obstacles(),
+            {(11, 10)},
+        )
+
     def test_fallback_button_does_not_create_an_ambiguous_obstacle(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
         navigator.use_location(

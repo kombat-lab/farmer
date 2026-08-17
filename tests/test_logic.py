@@ -908,6 +908,21 @@ class ModelTests(unittest.TestCase):
 
 
 class MovementRecoveryTests(unittest.TestCase):
+    def test_obstacle_route_leaves_top_left_entrance_down_right_first(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            "Выжженное поле",
+            {(7, 7)},
+            current_position=(0, 0),
+            width=12,
+            height=12,
+        )
+
+        plan = navigator.plan((0, 0))
+
+        self.assertEqual(plan.destination, (0, 1))
+        self.assertEqual(plan.button, "↘️")
+
     def test_real_position_outside_stale_component_rebuilds_route(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
         false_wall = {(5, y) for y in range(12)}

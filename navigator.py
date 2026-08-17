@@ -150,16 +150,16 @@ class SnakeNavigator:
 
         if (y - self.min_y) % 2 == 0:
             candidates = (
-                (x + 1, y),
-                (x, y + 1),
                 (x - 1, y),
+                (x, y + 1),
+                (x + 1, y),
                 (x, y - 1),
             )
         else:
             candidates = (
-                (x - 1, y),
-                (x, y + 1),
                 (x + 1, y),
+                (x, y + 1),
+                (x - 1, y),
                 (x, y - 1),
             )
 

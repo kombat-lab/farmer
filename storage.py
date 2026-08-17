@@ -541,6 +541,24 @@ class Storage:
             ).fetchall()
             return {(int(row["position_x"]), int(row["position_y"])) for row in rows}
 
+    async def forget_map_obstacles(
+        self,
+        location_name: str,
+        positions: set[tuple[int, int]],
+    ) -> int:
+        if not positions:
+            return 0
+        async with self.lock:
+            deleted = self.connection.executemany(
+                """
+                DELETE FROM map_obstacles
+                WHERE location_name=? AND position_x=? AND position_y=?
+                """,
+                [(location_name, x, y) for x, y in positions],
+            ).rowcount
+            self.connection.commit()
+            return max(0, deleted)
+
     async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
         async with self.lock:
             cur = self.connection.execute(

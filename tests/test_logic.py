@@ -908,6 +908,43 @@ class ModelTests(unittest.TestCase):
 
 
 class MovementRecoveryTests(unittest.TestCase):
+    def test_real_position_outside_stale_component_rebuilds_route(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        false_wall = {(5, y) for y in range(12)}
+        navigator.use_location(
+            "Мертвый лес",
+            false_wall,
+            current_position=(0, 0),
+            width=12,
+            height=12,
+        )
+        self.assertNotIn((11, 10), navigator.position_to_indices)
+
+        recovered = navigator.recover_from_actual_transition((4, 10), (11, 10))
+
+        self.assertTrue(recovered)
+        self.assertIn((11, 10), navigator.position_to_indices)
+        self.assertEqual(navigator.runtime_blocked, set())
+        self.assertEqual(navigator.take_recovery_discarded_obstacles(), false_wall)
+        self.assertEqual(navigator.plan((11, 10)).origin, (11, 10))
+
+    def test_fallback_button_does_not_create_an_ambiguous_obstacle(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            "Мертвый лес",
+            current_position=(11, 0),
+            width=12,
+            height=12,
+        )
+        first = navigator.plan((11, 0))
+        navigator.reject_last_plan((11, 0), mark_destination_blocked=False)
+        fallback = navigator.plan((11, 0))
+        self.assertNotEqual(first.button, fallback.button)
+
+        navigator.reject_last_plan((11, 0), mark_destination_blocked=True)
+
+        self.assertNotIn(fallback.destination, navigator.runtime_blocked)
+
     def test_failed_move_is_replanned_locally_with_another_button(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
         origin = (8, 0)
@@ -1262,6 +1299,21 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 {(4, 7)},
             )
             await reopened.close()
+
+    async def test_inconsistent_map_obstacles_can_be_forgotten(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.remember_map_obstacle("Мертвый лес", (5, 3))
+            await storage.remember_map_obstacle("Мертвый лес", (5, 4))
+
+            deleted = await storage.forget_map_obstacles(
+                "Мертвый лес",
+                {(5, 3), (5, 4)},
+            )
+
+            self.assertEqual(deleted, 2)
+            self.assertEqual(await storage.get_map_obstacles("Мертвый лес"), set())
+            await storage.close()
 
     async def test_unknown_setting_is_ignored_without_extra_writes(self) -> None:
         with TemporaryDirectory() as directory:

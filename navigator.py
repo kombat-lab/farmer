@@ -41,6 +41,7 @@ class SnakeNavigator:
         self.route_index = 0
         self.last_plan: MovePlan | None = None
         self.runtime_blocked: set[Position] = set()
+        self.recovery_discarded_obstacles: set[Position] = set()
         self.location_name: str | None = None
 
         # Кнопки, которые уже оставили персонажа на той же координате.
@@ -80,6 +81,7 @@ class SnakeNavigator:
             and position not in geometry.blocked_cells
         }
         self.runtime_blocked = learned
+        self.recovery_discarded_obstacles.clear()
         self.failed_buttons.clear()
         self.direction = RouteDirection.DOWN
         self.last_plan = None
@@ -252,6 +254,36 @@ class SnakeNavigator:
         if position not in self.position_to_indices:
             raise ValueError(f"Координаты {position} отсутствуют в маршруте.")
 
+    def ensure_position(self, position: Position) -> bool:
+        """Rebuilds a stale route around the position confirmed by the game."""
+        if position in self.position_to_indices and len(self.route) > 1:
+            return False
+
+        x, y = position
+        if x < self.min_x or y < self.min_y:
+            raise ValueError(f"Координаты {position} выходят за границы карты.")
+
+        # A real position outside the route proves that the locally learned
+        # obstacle graph is inconsistent. Forget only runtime observations;
+        # predefined geometry remains intact.
+        self.recovery_discarded_obstacles.update(self.runtime_blocked)
+        self.runtime_blocked.clear()
+        self.failed_buttons.clear()
+        self.last_plan = None
+        self.max_x = max(self.max_x, x)
+        self.max_y = max(self.max_y, y)
+        self.start = position
+        self.obstacle_mode = bool(self.blocked_cells)
+        self.route = self._build_route()
+        self.position_to_indices = self._index_route(self.route)
+        self.route_index = self._nearest_index(position)
+        return True
+
+    def take_recovery_discarded_obstacles(self) -> set[Position]:
+        discarded = set(self.recovery_discarded_obstacles)
+        self.recovery_discarded_obstacles.clear()
+        return discarded
+
     @staticmethod
     def _primary_button_between(
         origin: Position,
@@ -387,6 +419,7 @@ class SnakeNavigator:
         self,
         position: Position,
     ) -> MovePlan:
+        self.ensure_position(position)
         self.validate_position(position)
 
         # Если предыдущая попытка оставила нас на той же клетке, её кнопка
@@ -480,6 +513,8 @@ class SnakeNavigator:
             mark_destination_blocked
             and self._inside(plan.destination)
             and plan.destination not in self.blocked_cells
+            and plan.button
+            == self._primary_button_between(plan.origin, plan.destination)
         ):
             self.runtime_blocked.add(plan.destination)
             self.obstacle_mode = True
@@ -508,7 +543,8 @@ class SnakeNavigator:
         current: Position,
     ) -> bool:
         if previous not in self.position_to_indices or current not in self.position_to_indices:
-            return False
+            self.ensure_position(current)
+            return current in self.position_to_indices
 
         previous_indices = self.position_to_indices[previous]
         current_indices = self.position_to_indices[current]

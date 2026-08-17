@@ -935,6 +935,24 @@ class Farmer:
             map_info.position,
             movement_blocked=map_info.movement_blocked,
         )
+        route_rebuilt = self.navigator.ensure_position(map_info.position)
+        discarded_obstacles = self.navigator.take_recovery_discarded_obstacles()
+        if discarded_obstacles and self.navigator.location_name:
+            deleted = await self.storage.forget_map_obstacles(
+                self.navigator.location_name,
+                discarded_obstacles,
+            )
+            self.log(
+                "Маршрут не соответствовал фактической позиции. "
+                f"Удалено сомнительных препятствий: {deleted}; "
+                f"маршрут перестроен от {map_info.position}."
+            )
+            self.context.failed_move_attempts = 0
+        elif route_rebuilt:
+            self.log(
+                f"Маршрут пересинхронизирован по фактической позиции {map_info.position}."
+            )
+            self.context.failed_move_attempts = 0
         if learned_obstacle is not None and self.navigator.location_name:
             inserted = await self.storage.remember_map_obstacle(
                 self.navigator.location_name,

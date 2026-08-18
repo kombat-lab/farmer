@@ -86,6 +86,7 @@ TARGET_MONSTER_CATEGORIES: dict[str, list[str]] = {
     ],
     "Выжженное поле": [
         "Фонарщик",
+        "Пепельник",
     ],
 }
 

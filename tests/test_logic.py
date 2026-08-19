@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from blessing import BlessingManager
+from combat_learning import build_shadow_plan
 from combat_round import CombatSide, parse_combat_round
 from combat_strategy import (
     CombatDecision,
@@ -430,6 +431,48 @@ class CombatStrategyTests(unittest.TestCase):
         assert basic_only is not None and with_holy is not None
         self.assertIn("до победы≈14 ход.", basic_only.reason)
         self.assertIn("до победы≈14 ход.", with_holy.reason)
+
+    def test_shadow_planner_rejects_partial_self_heal_when_enemy_is_lethal(self) -> None:
+        memory = CombatMemory(
+            target_name="Черная мушка",
+            enemy_current_hp=88,
+            enemy_max_hp=475,
+        )
+        for value in (35, 38, 36, 39):
+            memory.incoming_damage.add(value)
+        for value in (43, 44, 45):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        for value in (94, 97, 96):
+            memory.outgoing_damage.setdefault("лечение", ObservedRange()).add(value)
+        memory.direct_healing.add(130)
+        memory.confirm_treatment_enemy("Черная мушка")
+        message = FakeMessage(
+            "🎯 Раунд 15\nХод Kombat\n🔷 Мана: 6/12\n⏳ Осталось: 23 сек",
+            [["Лечение [Мана 4]"], ["Атака аколита"]],
+        )
+        round_state = parse_combat_round(
+            message.raw_text,
+            [button.text for row in message.buttons for button in row],
+        )
+        self.assertIsNotNone(round_state)
+        plan = build_shadow_plan(
+            message,
+            memory=memory,
+            current_hp=694,
+            max_hp=780,
+            executed=CombatDecision("лечение", SkillTarget.SELF, "старое решение"),
+            round_state=round_state,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan.confident)
+        self.assertFalse(plan.agrees)
+        self.assertEqual(plan.recommendation.skill_name, "лечение")
+        self.assertIs(plan.recommendation.target, SkillTarget.ENEMY)
+        self.assertEqual(plan.candidates[0].projected_enemy_hp, 0)
 
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
@@ -1283,9 +1326,10 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchall()
             }
             self.assertIn("combat_decisions", tables)
-            self.assertIn("combat_strategy_stats", tables)
-            self.assertIn("combat_policy_stats", tables)
             self.assertIn("combat_knowledge", tables)
+            self.assertIn("combat_battle_analysis", tables)
+            self.assertNotIn("combat_strategy_stats", tables)
+            self.assertNotIn("combat_policy_stats", tables)
             await storage.close()
 
     async def test_combat_knowledge_survives_restart_by_character_profile(self) -> None:
@@ -1511,12 +1555,10 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 result="VICTORY",
                 combat_decisions=(faster_trace,),
             )
-            strategies = await storage.get_combat_strategy_stats("Фонарщик")
-            self.assertEqual(len(strategies), 1)
-            self.assertEqual(strategies[0]["strategy_signature"], "Лечение→enemy")
-            self.assertEqual(strategies[0]["victories"], 2)
-            self.assertEqual(strategies[0]["best_victory_rounds"], 6)
-            self.assertEqual(strategies[0]["average_rounds"], 7.0)
+            learning = await storage.get_combat_learning_stats(
+                target_name="Фонарщик"
+            )
+            self.assertEqual([row["rounds"] for row in learning], [8, 6])
             await storage.close()
 
     async def test_actual_treatment_target_drives_saved_policy(self) -> None:
@@ -1551,12 +1593,138 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             )
 
             decisions = await storage.get_combat_decisions("Черная мушка")
-            policies = await storage.get_combat_policy_stats("Черная мушка")
-            strategies = await storage.get_combat_strategy_stats("Черная мушка")
+            policies = await storage.get_combat_learning_overview(
+                target_name="Черная мушка"
+            )
             self.assertEqual(decisions[0]["chosen_target"], "self")
-            self.assertEqual(strategies[0]["strategy_signature"], "лечение→self")
-            self.assertEqual(policies[0]["total_self_heals"], 1)
-            self.assertEqual(policies[0]["total_offensive_actions"], 0)
+            self.assertEqual(policies[0]["self_heals"], 1)
+            self.assertEqual(policies[0]["offensive_ratio"], 0)
+            await storage.close()
+
+    async def test_profiled_battle_analysis_records_shadow_training_metrics(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+            traces = (
+                {
+                    "model_version": 4,
+                    "created_at": "2026-08-19T20:00:00+00:00",
+                    "telegram_message_id": 41,
+                    "target_name": "Фонарщик",
+                    "round_number": 4,
+                    "player": {"current_hp": 600, "max_hp": 880},
+                    "mana": {"current": 8, "maximum": 12},
+                    "incoming_damage": {"worst_next_hit": 110},
+                    "direct_heal_estimate": 135,
+                    "decision": {
+                        "skill_name": "лечение",
+                        "target": "self",
+                        "reason": "test",
+                        "urgent": False,
+                    },
+                    "outcome": {
+                        "target": "self",
+                        "effect": "healing",
+                        "amount": 100,
+                    },
+                    "shadow_plan": {
+                        "confident": True,
+                        "agrees": False,
+                    },
+                },
+                {
+                    "model_version": 4,
+                    "created_at": "2026-08-19T20:00:10+00:00",
+                    "telegram_message_id": 42,
+                    "target_name": "Фонарщик",
+                    "round_number": 5,
+                    "player": {"current_hp": 120, "max_hp": 880},
+                    "mana": {"current": 4, "maximum": 12},
+                    "incoming_damage": {"worst_next_hit": 105},
+                    "decision": {
+                        "skill_name": "атака аколита",
+                        "target": "enemy",
+                        "reason": "test",
+                        "urgent": False,
+                    },
+                    "outcome": {
+                        "target": "enemy",
+                        "effect": "damage",
+                        "amount": 35,
+                    },
+                    "shadow_plan": {
+                        "confident": True,
+                        "agrees": True,
+                    },
+                },
+            )
+            await storage.record_battle(
+                telegram_message_id=43,
+                session_id=session_id,
+                target_name="Фонарщик",
+                result="VICTORY",
+                combat_decisions=traces,
+            )
+
+            rows = await storage.get_combat_learning_stats(
+                target_name="Фонарщик",
+                profile_max_hp=880,
+            )
+            self.assertEqual(len(rows), 1)
+            analysis = rows[0]
+            self.assertEqual(analysis["model_version"], 4)
+            self.assertEqual(analysis["minimum_hp"], 120)
+            self.assertAlmostEqual(analysis["minimum_hp_percent"], 12000 / 880)
+            self.assertEqual(analysis["minimum_mana"], 4)
+            self.assertEqual(analysis["lost_healing_potential"], 35)
+            self.assertEqual(analysis["dangerous_turns"], 1)
+            self.assertEqual(analysis["shadow_confident"], 2)
+            self.assertEqual(analysis["shadow_agreements"], 1)
+            overview = await storage.get_combat_learning_overview(
+                target_name="Фонарщик",
+                profile_max_hp=880,
+            )
+            self.assertEqual(overview[0]["battles"], 1)
+            self.assertEqual(overview[0]["shadow_agreement_rate"], 0.5)
+
+            storage.connection.execute("DELETE FROM combat_battle_analysis")
+            storage.connection.commit()
+            self.assertEqual(await storage.backfill_combat_battle_analysis(), 1)
+            self.assertEqual(await storage.backfill_combat_battle_analysis(), 0)
+            storage.connection.execute(
+                "UPDATE battles SET happened_at='2020-01-01T00:00:00+00:00'"
+            )
+            storage.connection.commit()
+            await storage.cleanup_old_data(retention_days=1)
+            self.assertEqual(
+                storage.connection.execute("SELECT COUNT(*) FROM battles").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                len(
+                    await storage.get_combat_learning_stats(
+                        target_name="Фонарщик",
+                        profile_max_hp=880,
+                    )
+                ),
+                1,
+            )
+            await storage.close()
+
+    async def test_legacy_character_settings_are_removed_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.set_settings(
+                {"max_hp": 400, "max_mana": 11, "heal_amount": 141}
+            )
+            settings = SettingsService(storage)
+
+            await settings.load()
+
+            stored = await storage.get_settings()
+            self.assertNotIn("max_hp", stored)
+            self.assertNotIn("max_mana", stored)
+            self.assertNotIn("heal_amount", stored)
             await storage.close()
 
     async def test_confirmed_treatment_targets_are_recovered_from_damage_history(
@@ -1641,12 +1809,11 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 combat_decisions=second,
             )
 
-            exact = await storage.get_combat_strategy_stats("Фонарщик")
-            policies = await storage.get_combat_policy_stats("Фонарщик")
-            self.assertEqual(len(exact), 2)
+            policies = await storage.get_combat_learning_overview(
+                target_name="Фонарщик"
+            )
             self.assertEqual(len(policies), 1)
             self.assertEqual(policies[0]["battles"], 2)
-            self.assertEqual(policies[0]["total_actions"], 8)
             self.assertEqual(policies[0]["offensive_ratio"], 0.5)
             await storage.close()
 

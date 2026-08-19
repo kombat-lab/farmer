@@ -13,6 +13,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 
 from blessing import BlessingManager
+from combat_learning import build_shadow_plan
 from combat_round import parse_combat_round
 from combat_strategy import (
     CombatDecisionTrace,
@@ -1293,6 +1294,16 @@ class Farmer:
         self.combat.pending_skill = skill_name
         self.combat.pending_target = decision.target
         self.combat.pending_urgent = decision.urgent
+        shadow_plan = build_shadow_plan(
+            message,
+            memory=self.combat,
+            current_hp=self.context.current_hp,
+            max_hp=self.context.max_hp,
+            executed=decision,
+            round_state=round_state,
+        )
+        if shadow_plan is not None:
+            self.log(shadow_plan.format_log())
         decision_trace = build_decision_trace(
             created_at=utc_now(),
             telegram_message_id=int(message.id),
@@ -1301,6 +1312,7 @@ class Farmer:
             current_hp=self.context.current_hp,
             max_hp=self.context.max_hp,
             decision=decision,
+            shadow_plan=(shadow_plan.as_payload() if shadow_plan is not None else None),
         )
         self.log(decision_trace.format_log())
 
@@ -1535,19 +1547,19 @@ class Farmer:
     async def recover_latest_state(
         self,
         reason: str,
-    ) -> None:
+    ) -> bool:
         if not self.event_queue.empty():
             self.log(
                 f"Восстановление «{reason}» не требуется: новое состояние уже в локальной очереди."
             )
-            return
+            return False
 
         if not self.recovery_attempt_guard.allow():
             await self.stop(
                 f"более {TELEGRAM_RECOVERY_LIMIT} аварийных восстановлений "
                 f"за {int(TELEGRAM_RECOVERY_WINDOW // 60)} минут; остановлено для защиты от флуда"
             )
-            return
+            return False
 
         attempt = self.watchdog.begin_recovery_attempt()
 
@@ -1555,11 +1567,49 @@ class Farmer:
 
         if attempt > MAX_RECOVERY_ATTEMPTS:
             await self.stop(f"исчерпаны попытки восстановления: {reason}")
-            return
+            return False
 
         # Telethon already delivered the newest state to the local cache.
         # Reading history here adds an RPC and risks replaying an old inline UI.
-        await self.request_map_refresh()
+        return await self.request_map_refresh()
+
+    def watchdog_diagnostic_payload(
+        self,
+        *,
+        elapsed: float,
+        timeout: float,
+    ) -> dict[str, Any]:
+        pending_move = self.context.pending_move
+        latest_message = self.latest_received_message
+        return {
+            "state": self.state.name,
+            "elapsed_seconds": round(elapsed, 2),
+            "timeout_seconds": round(timeout, 2),
+            "last_progress_reason": self.watchdog.reason,
+            "recovery_attempts_before": self.watchdog.recovery_attempts,
+            "position": self.context.current_position,
+            "hp": {
+                "current": self.context.current_hp,
+                "maximum": self.context.max_hp,
+            },
+            "active_target": self.context.active_target,
+            "battle_target": self.context.battle_target,
+            "pending_move": (
+                {
+                    "origin": pending_move.origin,
+                    "destination": pending_move.destination,
+                    "button": pending_move.button,
+                }
+                if pending_move is not None
+                else None
+            ),
+            "event_queue_size": self.event_queue.qsize(),
+            "latest_message_id": (
+                int(latest_message.id) if latest_message is not None else None
+            ),
+            "inbound_generation": self.inbound_generation,
+            "telegram_actions": self.telegram_action_telemetry.snapshot(),
+        }
 
     async def watchdog_loop(self) -> None:
         while self.running:
@@ -1584,7 +1634,7 @@ class Farmer:
             if self.intentional_waits or self.telegram_action_limiter.pending:
                 continue
 
-            should_recover = self.watchdog.should_recover(
+            timeout = self.watchdog.timeout_for_state(
                 self.state,
                 move_timeout=MOVE_PROGRESS_TIMEOUT,
                 target_timeout=TARGET_SELECTION_TIMEOUT,
@@ -1592,25 +1642,31 @@ class Farmer:
                 general_timeout=GENERAL_PROGRESS_TIMEOUT,
                 recovery_timeout=RECOVERY_WATCHDOG_TIMEOUT,
             )
+            elapsed = self.watchdog.elapsed()
+            should_recover = elapsed >= timeout
 
             if not should_recover:
                 continue
 
-            # Обычное срабатывание watchdog — внутренний механизм
-            # самовосстановления. Сохраняем его для диагностики в SQLite
-            # и журнале, но не отправляем тревожное сообщение в Telegram.
-            await self.storage.add_event(
-                "WATCHDOG_TRIGGERED",
-                f"Нет прогресса в состоянии {self.state.name}",
-                level="INFO",
+            diagnostic = self.watchdog_diagnostic_payload(
+                elapsed=elapsed,
+                timeout=timeout,
             )
             self.log(
                 "Watchdog обнаружил отсутствие прогресса. "
                 "Пробую восстановить состояние без уведомления."
             )
 
-            await self.recover_latest_state(
+            refresh_requested = await self.recover_latest_state(
                 f"watchdog: нет прогресса в состоянии {self.state.name}"
+            )
+            diagnostic["refresh_requested"] = refresh_requested
+            diagnostic["recovery_attempts_after"] = self.watchdog.recovery_attempts
+            await self.storage.add_event(
+                "WATCHDOG_TRIGGERED",
+                f"Нет прогресса в состоянии {diagnostic['state']}",
+                level="INFO",
+                payload=diagnostic,
             )
 
     async def handle_message(self, message) -> None:
@@ -1953,6 +2009,7 @@ class Farmer:
             )
         deleted_logs = self.cleanup_old_log_files()
         cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
+        learning_rows = await self.storage.backfill_combat_battle_analysis()
         logger.info(
             "Очистка хранения: срок %s дн.; events=%s, battles=%s, "
             "drops=%s, sessions=%s, logs=%s",
@@ -1963,6 +2020,11 @@ class Farmer:
             cleanup["sessions"],
             deleted_logs,
         )
+        if learning_rows:
+            logger.info(
+                "Подготовлены профильные итоги прошлых боёв: %s.",
+                learning_rows,
+            )
         self.session_id = await self.storage.start_session(
             cycles_count=self.settings.values.cycles_count,
             moves_per_cycle=self.settings.values.moves_per_cycle,

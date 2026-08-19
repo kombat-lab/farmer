@@ -29,6 +29,8 @@ from config import (
 )
 from storage import Storage
 
+LEGACY_SETTING_KEYS = frozenset({"max_hp", "max_mana", "heal_amount"})
+
 
 @dataclass
 class FarmerSettings:
@@ -89,6 +91,7 @@ class SettingsService:
             default=False,
         )
         await self.storage.set_settings(asdict(self.values))
+        await self.storage.delete_settings(LEGACY_SETTING_KEYS)
 
     async def set_value(self, key: str, value: Any) -> None:
         if not hasattr(self.values, key):

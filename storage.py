@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from combat_learning import battle_learning_summary, resolved_decision
 from rewards import parse_item_stack
 
 
@@ -26,92 +27,6 @@ class SessionSummary:
     xp: int
     dust: int
     runtime_seconds: int
-
-
-@dataclass(frozen=True)
-class CombatPolicySummary:
-    key: str
-    total_actions: int
-    offensive_actions: int
-    self_heals: int
-    renewals: int
-
-
-def combat_policy_summary(decisions: list[dict[str, Any]]) -> CombatPolicySummary:
-    """Groups different button sequences by their meaningful battle style."""
-    total = len(decisions)
-    offensive = sum(
-        str(decision.get("target", "")).casefold() == "enemy"
-        for decision in decisions
-    )
-    self_heals = sum(
-        str(decision.get("skill_name", "")).casefold() == "лечение"
-        and str(decision.get("target", "")).casefold() == "self"
-        for decision in decisions
-    )
-    renewals = sum(
-        str(decision.get("skill_name", "")).casefold() == "обновление"
-        and str(decision.get("target", "")).casefold() == "self"
-        for decision in decisions
-    )
-
-    aggression_ratio = offensive / total if total else 0.0
-    aggression = (
-        "aggressive"
-        if aggression_ratio >= 0.80
-        else "balanced"
-        if aggression_ratio >= 0.65
-        else "defensive"
-    )
-
-    def usage_bucket(count: int) -> str:
-        ratio = count / total if total else 0.0
-        if count == 0:
-            return "none"
-        if ratio <= 0.10:
-            return "light"
-        if ratio <= 0.25:
-            return "moderate"
-        return "heavy"
-
-    offense_counts: dict[str, int] = {}
-    for decision in decisions:
-        if str(decision.get("target", "")).casefold() != "enemy":
-            continue
-        name = str(decision.get("skill_name") or "неизвестно").casefold()
-        offense_counts[name] = offense_counts.get(name, 0) + 1
-    if not offense_counts:
-        preference = "none"
-    else:
-        preference, preference_count = max(
-            offense_counts.items(),
-            key=lambda item: (item[1], item[0]),
-        )
-        if len(offense_counts) > 1 and preference_count * 2 <= offensive:
-            preference = "mixed"
-
-    key = ":".join(
-        (
-            aggression,
-            f"heal-{usage_bucket(self_heals)}",
-            f"renew-{usage_bucket(renewals)}",
-            f"offense-{preference}",
-        )
-    )
-    return CombatPolicySummary(key, total, offensive, self_heals, renewals)
-
-
-def resolved_decision(trace: dict[str, Any]) -> dict[str, Any]:
-    raw_decision = trace.get("decision")
-    decision = (
-        {str(key): value for key, value in raw_decision.items()}
-        if isinstance(raw_decision, dict)
-        else {}
-    )
-    outcome = trace.get("outcome")
-    if isinstance(outcome, dict) and outcome.get("target") in {"self", "enemy"}:
-        decision["target"] = outcome["target"]
-    return decision
 
 
 class Storage:
@@ -182,39 +97,40 @@ class Storage:
         CREATE INDEX IF NOT EXISTS idx_combat_decisions_target
             ON combat_decisions(target_name, chosen_skill);
 
-        CREATE TABLE IF NOT EXISTS combat_strategy_stats (
-            target_name TEXT NOT NULL,
-            strategy_signature TEXT NOT NULL,
-            battles INTEGER NOT NULL DEFAULT 0,
-            victories INTEGER NOT NULL DEFAULT 0,
-            defeats INTEGER NOT NULL DEFAULT 0,
-            total_rounds INTEGER NOT NULL DEFAULT 0,
-            best_victory_rounds INTEGER,
-            last_used_at TEXT NOT NULL,
-            PRIMARY KEY(target_name, strategy_signature)
-        );
-
-        CREATE TABLE IF NOT EXISTS combat_policy_stats (
-            target_name TEXT NOT NULL,
-            policy_key TEXT NOT NULL,
-            battles INTEGER NOT NULL DEFAULT 0,
-            victories INTEGER NOT NULL DEFAULT 0,
-            defeats INTEGER NOT NULL DEFAULT 0,
-            total_rounds INTEGER NOT NULL DEFAULT 0,
-            best_victory_rounds INTEGER,
-            total_actions INTEGER NOT NULL DEFAULT 0,
-            total_offensive_actions INTEGER NOT NULL DEFAULT 0,
-            total_self_heals INTEGER NOT NULL DEFAULT 0,
-            total_renewals INTEGER NOT NULL DEFAULT 0,
-            last_used_at TEXT NOT NULL,
-            PRIMARY KEY(target_name, policy_key)
-        );
-
         CREATE TABLE IF NOT EXISTS combat_knowledge (
             profile_max_hp INTEGER PRIMARY KEY,
             updated_at TEXT NOT NULL,
             knowledge_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS combat_battle_analysis (
+            battle_id INTEGER PRIMARY KEY,
+            target_name TEXT NOT NULL,
+            result TEXT NOT NULL,
+            happened_at TEXT NOT NULL,
+            profile_max_hp INTEGER NOT NULL DEFAULT 0,
+            model_version INTEGER NOT NULL DEFAULT 0,
+            rounds INTEGER NOT NULL DEFAULT 0,
+            total_actions INTEGER NOT NULL DEFAULT 0,
+            offensive_actions INTEGER NOT NULL DEFAULT 0,
+            self_heals INTEGER NOT NULL DEFAULT 0,
+            renewals INTEGER NOT NULL DEFAULT 0,
+            minimum_hp INTEGER,
+            minimum_hp_percent REAL,
+            last_decision_hp INTEGER,
+            minimum_mana INTEGER,
+            last_decision_mana INTEGER,
+            effective_self_healing INTEGER NOT NULL DEFAULT 0,
+            lost_healing_potential INTEGER NOT NULL DEFAULT 0,
+            dangerous_turns INTEGER NOT NULL DEFAULT 0,
+            shadow_decisions INTEGER NOT NULL DEFAULT 0,
+            shadow_confident INTEGER NOT NULL DEFAULT 0,
+            shadow_agreements INTEGER NOT NULL DEFAULT 0,
+            policy_key TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_combat_analysis_profile_target
+            ON combat_battle_analysis(profile_max_hp, target_name);
 
         CREATE TABLE IF NOT EXISTS farmer_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -488,6 +404,18 @@ class Storage:
             )
             self.connection.commit()
 
+    async def delete_settings(self, keys: set[str] | frozenset[str]) -> int:
+        if not keys:
+            return 0
+        placeholders = ",".join("?" for _ in keys)
+        async with self.lock:
+            cursor = self.connection.execute(
+                f"DELETE FROM settings WHERE key IN ({placeholders})",
+                tuple(sorted(keys)),
+            )
+            self.connection.commit()
+            return max(0, cursor.rowcount)
+
     async def get_settings(self) -> dict:
         async with self.lock:
             rows = self.connection.execute("SELECT key,value_json FROM settings").fetchall()
@@ -579,6 +507,104 @@ class Storage:
                 raise RuntimeError("SQLite не вернул ID нового события")
             return int(cur.lastrowid)
 
+    def _write_battle_analysis(
+        self,
+        *,
+        battle_id: int,
+        target_name: str,
+        result: str,
+        happened_at: str,
+        traces: list[dict[str, Any]],
+    ) -> None:
+        if not traces:
+            return
+        summary = battle_learning_summary(traces)
+        self.connection.execute(
+            """
+            INSERT INTO combat_battle_analysis(
+                battle_id,target_name,result,happened_at,profile_max_hp,
+                model_version,rounds,total_actions,offensive_actions,self_heals,
+                renewals,minimum_hp,minimum_hp_percent,last_decision_hp,
+                minimum_mana,last_decision_mana,effective_self_healing,
+                lost_healing_potential,dangerous_turns,shadow_decisions,
+                shadow_confident,shadow_agreements,policy_key,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(battle_id) DO NOTHING
+            """,
+            (
+                battle_id,
+                target_name,
+                result,
+                happened_at,
+                summary.profile_max_hp,
+                summary.model_version,
+                summary.rounds,
+                summary.total_actions,
+                summary.offensive_actions,
+                summary.self_heals,
+                summary.renewals,
+                summary.minimum_hp,
+                summary.minimum_hp_percent,
+                summary.last_decision_hp,
+                summary.minimum_mana,
+                summary.last_decision_mana,
+                summary.effective_self_healing,
+                summary.lost_healing_potential,
+                summary.dangerous_turns,
+                summary.shadow_decisions,
+                summary.shadow_confident,
+                summary.shadow_agreements,
+                summary.policy_key,
+                utc_now(),
+            ),
+        )
+
+    async def backfill_combat_battle_analysis(self) -> int:
+        """Builds compact learning rows from retained decision traces."""
+        async with self.lock:
+            battles = self.connection.execute(
+                """
+                SELECT b.id,b.target_name,b.result,b.happened_at
+                FROM battles b
+                LEFT JOIN combat_battle_analysis a ON a.battle_id=b.id
+                WHERE a.battle_id IS NULL
+                  AND EXISTS(
+                      SELECT 1 FROM combat_decisions cd WHERE cd.battle_id=b.id
+                  )
+                ORDER BY b.id
+                """
+            ).fetchall()
+            written = 0
+            for battle in battles:
+                rows = self.connection.execute(
+                    """
+                    SELECT trace_json FROM combat_decisions
+                    WHERE battle_id=? ORDER BY sequence_number
+                    """,
+                    (int(battle["id"]),),
+                ).fetchall()
+                traces: list[dict[str, Any]] = []
+                for row in rows:
+                    try:
+                        trace = json.loads(str(row["trace_json"]))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(trace, dict):
+                        traces.append(trace)
+                if not traces:
+                    continue
+                self._write_battle_analysis(
+                    battle_id=int(battle["id"]),
+                    target_name=str(battle["target_name"]),
+                    result=str(battle["result"]),
+                    happened_at=str(battle["happened_at"]),
+                    traces=traces,
+                )
+                written += 1
+            if written:
+                self.connection.commit()
+            return written
+
     async def record_battle(
         self,
         *,
@@ -600,6 +626,7 @@ class Storage:
             ).fetchone():
                 return False, cards
             px, py = position if position else (None, None)
+            happened_at = utc_now()
             cur = self.connection.execute(
                 """
                 INSERT INTO battles(
@@ -610,7 +637,7 @@ class Storage:
                 (
                     telegram_message_id,
                     session_id,
-                    utc_now(),
+                    happened_at,
                     target_name,
                     result,
                     xp,
@@ -647,92 +674,13 @@ class Storage:
                     ),
                 )
             if combat_decisions:
-                decisions = [resolved_decision(trace) for trace in combat_decisions]
-                strategy_signature = " > ".join(
-                    f"{decision.get('skill_name', 'неизвестно')}→"
-                    f"{decision.get('target', 'unknown')}"
-                    for decision in decisions
-                )
-                round_numbers = [
-                    int(trace["round_number"])
-                    for trace in combat_decisions
-                    if isinstance(trace.get("round_number"), int)
-                ]
-                rounds = max(round_numbers, default=len(combat_decisions))
-                victory_rounds = rounds if result == "VICTORY" else None
-                self.connection.execute(
-                    """
-                    INSERT INTO combat_strategy_stats(
-                        target_name,strategy_signature,battles,victories,defeats,
-                        total_rounds,best_victory_rounds,last_used_at
-                    ) VALUES (?,?,?,?,?,?,?,?)
-                    ON CONFLICT(target_name,strategy_signature) DO UPDATE SET
-                        battles=battles+1,
-                        victories=victories+excluded.victories,
-                        defeats=defeats+excluded.defeats,
-                        total_rounds=total_rounds+excluded.total_rounds,
-                        best_victory_rounds=CASE
-                            WHEN excluded.best_victory_rounds IS NULL
-                                THEN best_victory_rounds
-                            WHEN best_victory_rounds IS NULL
-                                THEN excluded.best_victory_rounds
-                            ELSE MIN(best_victory_rounds, excluded.best_victory_rounds)
-                        END,
-                        last_used_at=excluded.last_used_at
-                    """,
-                    (
-                        target_name,
-                        strategy_signature,
-                        1,
-                        int(result == "VICTORY"),
-                        int(result == "DEFEAT"),
-                        rounds,
-                        victory_rounds,
-                        utc_now(),
-                    ),
-                )
-                policy = combat_policy_summary(decisions)
-                self.connection.execute(
-                    """
-                    INSERT INTO combat_policy_stats(
-                        target_name,policy_key,battles,victories,defeats,
-                        total_rounds,best_victory_rounds,total_actions,
-                        total_offensive_actions,total_self_heals,total_renewals,
-                        last_used_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(target_name,policy_key) DO UPDATE SET
-                        battles=battles+1,
-                        victories=victories+excluded.victories,
-                        defeats=defeats+excluded.defeats,
-                        total_rounds=total_rounds+excluded.total_rounds,
-                        best_victory_rounds=CASE
-                            WHEN excluded.best_victory_rounds IS NULL
-                                THEN best_victory_rounds
-                            WHEN best_victory_rounds IS NULL
-                                THEN excluded.best_victory_rounds
-                            ELSE MIN(best_victory_rounds, excluded.best_victory_rounds)
-                        END,
-                        total_actions=total_actions+excluded.total_actions,
-                        total_offensive_actions=total_offensive_actions
-                            +excluded.total_offensive_actions,
-                        total_self_heals=total_self_heals+excluded.total_self_heals,
-                        total_renewals=total_renewals+excluded.total_renewals,
-                        last_used_at=excluded.last_used_at
-                    """,
-                    (
-                        target_name,
-                        policy.key,
-                        1,
-                        int(result == "VICTORY"),
-                        int(result == "DEFEAT"),
-                        rounds,
-                        victory_rounds,
-                        policy.total_actions,
-                        policy.offensive_actions,
-                        policy.self_heals,
-                        policy.renewals,
-                        utc_now(),
-                    ),
+                trace_list = list(combat_decisions)
+                self._write_battle_analysis(
+                    battle_id=battle_id,
+                    target_name=target_name,
+                    result=result,
+                    happened_at=happened_at,
+                    traces=trace_list,
                 )
             for item in items:
                 item_name, quantity = parse_item_stack(str(item))
@@ -813,51 +761,81 @@ class Storage:
                     confirmed.add(target)
         return confirmed
 
-    async def get_combat_strategy_stats(
+    async def get_combat_learning_stats(
         self,
+        *,
         target_name: str | None = None,
-    ) -> list[dict]:
-        query = """
-            SELECT *,
-                   CASE WHEN battles > 0
-                       THEN CAST(victories AS REAL) / battles ELSE 0 END AS win_rate,
-                   CASE WHEN battles > 0
-                       THEN CAST(total_rounds AS REAL) / battles ELSE NULL END AS average_rounds
-            FROM combat_strategy_stats
-        """
-        params: tuple = ()
-        if target_name is not None:
-            query += " WHERE target_name=?"
-            params = (target_name,)
-        query += " ORDER BY win_rate DESC, average_rounds ASC"
-        async with self.lock:
-            return [dict(row) for row in self.connection.execute(query, params).fetchall()]
-
-    async def get_combat_policy_stats(
-        self,
-        target_name: str | None = None,
+        profile_max_hp: int | None = None,
     ) -> list[dict[str, Any]]:
-        query = """
-            SELECT *,
-                   CASE WHEN battles > 0
-                       THEN CAST(victories AS REAL) / battles ELSE 0 END AS win_rate,
-                   CASE WHEN battles > 0
-                       THEN CAST(total_rounds AS REAL) / battles ELSE NULL END
-                       AS average_rounds,
-                   CASE WHEN total_actions > 0
-                       THEN CAST(total_offensive_actions AS REAL) / total_actions
-                       ELSE 0 END AS offensive_ratio
-            FROM combat_policy_stats
-        """
-        params: tuple[str, ...] = ()
+        conditions: list[str] = []
+        params: list[Any] = []
         if target_name is not None:
-            query += " WHERE target_name=?"
-            params = (target_name,)
-        query += " ORDER BY win_rate DESC, average_rounds ASC, battles DESC"
+            conditions.append("a.target_name=?")
+            params.append(target_name)
+        if profile_max_hp is not None:
+            conditions.append("a.profile_max_hp=?")
+            params.append(profile_max_hp)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT a.*
+            FROM combat_battle_analysis a
+            {where}
+            ORDER BY a.happened_at,a.battle_id
+        """
         async with self.lock:
             return [
                 dict(row)
-                for row in self.connection.execute(query, params).fetchall()
+                for row in self.connection.execute(query, tuple(params)).fetchall()
+            ]
+
+    async def get_combat_learning_overview(
+        self,
+        *,
+        target_name: str | None = None,
+        profile_max_hp: int | None = None,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if target_name is not None:
+            conditions.append("a.target_name=?")
+            params.append(target_name)
+        if profile_max_hp is not None:
+            conditions.append("a.profile_max_hp=?")
+            params.append(profile_max_hp)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT a.profile_max_hp,a.target_name,a.policy_key,
+                   COUNT(*) AS battles,
+                   SUM(CASE WHEN a.result='VICTORY' THEN 1 ELSE 0 END) AS victories,
+                   SUM(CASE WHEN a.result='DEFEAT' THEN 1 ELSE 0 END) AS defeats,
+                   AVG(a.rounds) AS average_rounds,
+                   MIN(CASE WHEN a.result='VICTORY' THEN a.rounds END)
+                       AS best_victory_rounds,
+                   AVG(a.minimum_hp_percent) AS average_minimum_hp_percent,
+                   MIN(a.minimum_hp_percent) AS minimum_hp_percent,
+                   CASE WHEN SUM(a.total_actions)>0
+                       THEN CAST(SUM(a.offensive_actions) AS REAL)
+                            / SUM(a.total_actions)
+                       ELSE 0 END AS offensive_ratio,
+                   SUM(a.self_heals) AS self_heals,
+                   SUM(a.renewals) AS renewals,
+                   SUM(a.lost_healing_potential) AS lost_healing_potential,
+                   SUM(a.dangerous_turns) AS dangerous_turns,
+                   SUM(a.shadow_confident) AS shadow_confident,
+                   SUM(a.shadow_agreements) AS shadow_agreements,
+                   CASE WHEN SUM(a.shadow_confident)>0
+                       THEN CAST(SUM(a.shadow_agreements) AS REAL)
+                            / SUM(a.shadow_confident)
+                       ELSE NULL END AS shadow_agreement_rate
+            FROM combat_battle_analysis a
+            {where}
+            GROUP BY a.profile_max_hp,a.target_name,a.policy_key
+            ORDER BY victories DESC,average_rounds ASC,battles DESC
+        """
+        async with self.lock:
+            return [
+                dict(row)
+                for row in self.connection.execute(query, tuple(params)).fetchall()
             ]
 
     async def load_combat_knowledge(self) -> dict[int, dict[str, Any]]:

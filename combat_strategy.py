@@ -105,16 +105,18 @@ class CombatDecisionTrace:
     expected_next_hit: int | None
     worst_next_hit: int | None
     sustainable_damage_per_turn: int | None
+    direct_heal_estimate: int | None
     skills: tuple[SkillAvailability, ...]
     outgoing_damage: tuple[DamageEstimate, ...]
     decision: CombatDecision
+    shadow_plan: dict[str, Any] | None = None
     actual_target: SkillTarget | None = None
     actual_effect: str | None = None
     actual_amount: int | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "model_version": 3,
+            "model_version": 4,
             "created_at": self.created_at,
             "telegram_message_id": self.telegram_message_id,
             "target_name": self.target_name,
@@ -149,6 +151,7 @@ class CombatDecisionTrace:
                 },
             },
             "sustainable_damage_per_turn": self.sustainable_damage_per_turn,
+            "direct_heal_estimate": self.direct_heal_estimate,
             "skills": [skill.as_payload() for skill in self.skills],
             "outgoing_damage": [estimate.as_payload() for estimate in self.outgoing_damage],
             "decision": {
@@ -162,6 +165,7 @@ class CombatDecisionTrace:
                 "effect": self.actual_effect,
                 "amount": self.actual_amount,
             },
+            "shadow_plan": self.shadow_plan,
         }
 
     def format_log(self) -> str:
@@ -663,6 +667,7 @@ def build_decision_trace(
     current_hp: int | None,
     max_hp: int | None,
     decision: CombatDecision,
+    shadow_plan: dict[str, Any] | None = None,
 ) -> CombatDecisionTrace:
     current_mana = round_state.current_mana if round_state is not None else None
     maximum_mana = round_state.max_mana if round_state is not None else None
@@ -716,9 +721,11 @@ def build_decision_trace(
         expected_next_hit=memory.expected_incoming(after_current_tick=True),
         worst_next_hit=memory.predicted_incoming(after_current_tick=True),
         sustainable_damage_per_turn=memory.sustainable_damage_floor() or None,
+        direct_heal_estimate=memory.direct_heal(),
         skills=skills,
         outgoing_damage=outgoing,
         decision=decision,
+        shadow_plan=shadow_plan,
     )
 
 

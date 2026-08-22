@@ -261,11 +261,16 @@ class ShadowCombatPlan:
             and self.recommendation.target is self.executed.target
         )
 
+    @property
+    def has_safe_candidate(self) -> bool:
+        return any(not candidate.unsafe for candidate in self.candidates)
+
     def as_payload(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "horizon": self.horizon,
             "confident": self.confident,
+            "has_safe_candidate": self.has_safe_candidate,
             "agrees": self.agrees,
             "recommendation": {
                 "skill_name": self.recommendation.skill_name,
@@ -281,7 +286,10 @@ class ShadowCombatPlan:
 
     def format_log(self) -> str:
         comparison = "совпадает" if self.agrees else "отличается"
-        confidence = "достаточно данных" if self.confident else "данные ещё копятся"
+        if not self.has_safe_candidate:
+            confidence = "безопасного плана на горизонте нет"
+        else:
+            confidence = "достаточно данных" if self.confident else "данные ещё копятся"
         candidates = "; ".join(
             f"{candidate.skill_name}→{candidate.target.value}="
             f"{candidate.score:.1f}{' опасно' if candidate.unsafe else ''}"
@@ -367,13 +375,17 @@ def build_shadow_plan(
         new_renewal = 0
         if target is SkillTarget.ENEMY:
             damage, effect_samples = _observed_damage(memory, skill_name)
-            all_effects_known = all_effects_known and effect_samples > 0
+            all_effects_known = all_effects_known and effect_samples >= 2
         elif skill_name == "лечение":
             immediate_healing = direct_heal
-            all_effects_known = all_effects_known and direct_heal > 0
+            all_effects_known = (
+                all_effects_known and memory.direct_healing.samples >= 2
+            )
         elif skill_name == "обновление":
             new_renewal = renewal_tick
-            all_effects_known = all_effects_known and renewal_tick > 0
+            all_effects_known = (
+                all_effects_known and memory.renewal_healing.samples >= 2
+            )
 
         lethal = bool(enemy_hp is not None and damage >= enemy_hp > 0)
         mana_after = (
@@ -416,11 +428,17 @@ def build_shadow_plan(
         first_hit_hp = healed_now
         if memory.renewal_turns > 0:
             first_hit_hp = min(max_hp, first_hit_hp + renewal_tick)
-        unsafe = bool(
+        immediate_unsafe = bool(
             expected_enemy_hits
             and worst_incoming is not None
             and first_hit_hp <= worst_incoming + margin
         )
+        horizon_unsafe = bool(
+            expected_enemy_hits
+            and expected_incoming is not None
+            and projected_hp <= margin
+        )
+        unsafe = immediate_unsafe or horizon_unsafe
 
         score = float(projected_hp)
         score += damage * 4.0
@@ -467,14 +485,15 @@ def build_shadow_plan(
     if not projections:
         return None
 
-    projections.sort(key=lambda item: (item.score, not item.unsafe), reverse=True)
-    confident = incoming_samples >= 4 and all_effects_known
-    best = projections[0]
+    projections.sort(key=lambda item: (not item.unsafe, item.score), reverse=True)
+    safe_projections = [projection for projection in projections if not projection.unsafe]
+    confident = incoming_samples >= 4 and all_effects_known and bool(safe_projections)
+    best = safe_projections[0] if safe_projections else projections[0]
     recommendation = CombatDecision(
         skill_name=best.skill_name,
         target=best.target,
         reason=f"теневой прогноз: {best.reason}",
-        urgent=best.unsafe,
+        urgent=False,
     )
     if not confident:
         recommendation = executed

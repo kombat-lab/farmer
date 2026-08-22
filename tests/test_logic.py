@@ -361,6 +361,41 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertIs(decision.target, SkillTarget.ENEMY)
         self.assertTrue(decision.urgent)
 
+    def test_delayed_renewal_is_not_used_when_the_next_hit_is_lethal(self) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=9,
+            enemy_max_hp=920,
+        )
+        for value in (37, 51, 55, 61):
+            memory.incoming_damage.add(value)
+        memory.outgoing_damage.setdefault("атака аколита", ObservedRange()).add(42)
+        memory.renewal_healing.add(48)
+        memory.renewal_healing.add(48)
+
+        decision = choose_combat_action(
+            FakeMessage(
+                "Мана: 4/13",
+                [
+                    ["Атака аколита"],
+                    ["Святое свечение [Мана 3] (CD: 1)"],
+                    ["Лечение [Мана 4] (CD: 2)"],
+                    ["Обновление [Мана 4]"],
+                ],
+            ),
+            memory=memory,
+            current_hp=48,
+            max_hp=830,
+            heal_threshold=415,
+        )
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.skill_name, "атака аколита")
+        self.assertIs(decision.target, SkillTarget.ENEMY)
+        self.assertTrue(decision.urgent)
+        self.assertIn("отложенное лечение не успеет", decision.reason)
+
     def test_critical_hit_does_not_raise_guaranteed_damage(self) -> None:
         memory = CombatMemory(target_name="Фонарщик", enemy_current_hp=120)
         memory.observe(
@@ -447,6 +482,7 @@ class CombatStrategyTests(unittest.TestCase):
         for value in (94, 97, 96):
             memory.outgoing_damage.setdefault("лечение", ObservedRange()).add(value)
         memory.direct_healing.add(130)
+        memory.direct_healing.add(130)
         memory.confirm_treatment_enemy("Черная мушка")
         message = FakeMessage(
             "🎯 Раунд 15\nХод Kombat\n🔷 Мана: 6/12\n⏳ Осталось: 23 сек",
@@ -473,6 +509,86 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(plan.recommendation.skill_name, "лечение")
         self.assertIs(plan.recommendation.target, SkillTarget.ENEMY)
         self.assertEqual(plan.candidates[0].projected_enemy_hp, 0)
+
+    def test_shadow_planner_prefers_the_only_safe_three_turn_action(self) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=500,
+            enemy_max_hp=920,
+        )
+        for _ in range(4):
+            memory.incoming_damage.add(100)
+        for value in (40, 42):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        memory.direct_healing.add(200)
+        memory.direct_healing.add(200)
+        message = FakeMessage(
+            "Мана: 4/13",
+            [["Лечение [Мана 4]"], ["Атака аколита"]],
+        )
+
+        plan = build_shadow_plan(
+            message,
+            memory=memory,
+            current_hp=250,
+            max_hp=830,
+            executed=CombatDecision(
+                "атака аколита", SkillTarget.ENEMY, "старое решение"
+            ),
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan.confident)
+        self.assertEqual(plan.recommendation.skill_name, "лечение")
+        self.assertIs(plan.recommendation.target, SkillTarget.SELF)
+        self.assertFalse(plan.candidates[0].unsafe)
+        self.assertTrue(
+            next(
+                candidate
+                for candidate in plan.candidates
+                if candidate.skill_name == "атака аколита"
+            ).unsafe
+        )
+
+    def test_shadow_planner_is_not_confident_when_every_action_projects_death(
+        self,
+    ) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=500,
+            enemy_max_hp=920,
+        )
+        for _ in range(4):
+            memory.incoming_damage.add(100)
+        for value in (40, 42):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        memory.direct_healing.add(20)
+        memory.direct_healing.add(20)
+        executed = CombatDecision("лечение", SkillTarget.SELF, "старое решение")
+
+        plan = build_shadow_plan(
+            FakeMessage(
+                "Мана: 4/13",
+                [["Лечение [Мана 4]"], ["Атака аколита"]],
+            ),
+            memory=memory,
+            current_hp=80,
+            max_hp=830,
+            executed=executed,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertFalse(plan.confident)
+        self.assertIs(plan.recommendation, executed)
+        self.assertTrue(all(candidate.unsafe for candidate in plan.candidates))
+        self.assertFalse(plan.as_payload()["has_safe_candidate"])
+        self.assertIn("безопасного плана", plan.format_log())
 
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
@@ -917,6 +1033,69 @@ class CombatRoundModelTests(unittest.TestCase):
         self.assertEqual(payload["outcome"]["target"], "self")
         self.assertEqual(payload["outcome"]["effect"], "healing")
         self.assertEqual(payload["outcome"]["amount"], 46)
+
+    def test_trace_records_an_enemy_dodge_as_a_resolved_attack(self) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=116,
+            enemy_max_hp=920,
+        )
+        trace = build_decision_trace(
+            created_at="2026-08-22T10:00:27+00:00",
+            telegram_message_id=2949780,
+            memory=memory,
+            round_state=None,
+            current_hp=154,
+            max_hp=830,
+            decision=CombatDecision(
+                "лечение",
+                SkillTarget.ENEMY,
+                "атака нежити",
+            ),
+        )
+        result = parse_combat_round(
+            """⚔️ Раунд 10
+🪬🧍Kombat использует Лечение
+⚡️ Пепельник увернулся"""
+        )
+        assert result is not None
+
+        resolved = resolve_decision_trace(trace, result, CHARACTER)
+
+        self.assertIs(resolved.actual_target, SkillTarget.ENEMY)
+        self.assertEqual(resolved.actual_effect, "dodged")
+        self.assertEqual(resolved.actual_amount, 0)
+
+    def test_confirmed_enemy_treatment_without_damage_keeps_its_target(self) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=116,
+            enemy_max_hp=920,
+        )
+        trace = build_decision_trace(
+            created_at="2026-08-22T10:00:27+00:00",
+            telegram_message_id=2949780,
+            memory=memory,
+            round_state=None,
+            current_hp=154,
+            max_hp=830,
+            decision=CombatDecision(
+                "лечение",
+                SkillTarget.ENEMY,
+                "атака нежити",
+            ),
+        )
+        result = parse_combat_round(
+            """⚔️ Раунд 10
+🪬🧍Kombat использует Лечение"""
+        )
+        assert result is not None
+
+        resolved = resolve_decision_trace(trace, result, CHARACTER)
+
+        self.assertIs(resolved.actual_target, SkillTarget.ENEMY)
+        self.assertEqual(resolved.actual_effect, "no_effect")
+        self.assertEqual(resolved.actual_amount, 0)
 
     def test_target_selector_obeys_skill_intent(self) -> None:
         message = FakeMessage(

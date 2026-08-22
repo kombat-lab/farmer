@@ -737,6 +737,22 @@ def resolve_decision_trace(
     """Adds the observed target and effect without overwriting the plan."""
     character = normalize(character_name)
     skill_name = normalize(trace.decision.skill_name)
+    enemy = normalize(trace.target_name)
+
+    if any(enemy and enemy in normalize(target) for target in round_state.dodged):
+        return replace(
+            trace,
+            actual_target=SkillTarget.ENEMY,
+            actual_effect="dodged",
+            actual_amount=0,
+        )
+    if any(enemy and enemy in normalize(target) for target in round_state.blocked):
+        return replace(
+            trace,
+            actual_target=SkillTarget.ENEMY,
+            actual_effect="blocked",
+            actual_amount=0,
+        )
 
     if skill_name == "лечение":
         direct_healing = [
@@ -766,6 +782,13 @@ def resolve_decision_trace(
                 actual_effect="damage",
                 actual_amount=sum(enemy_damage),
             )
+        if trace.decision.target is SkillTarget.ENEMY:
+            return replace(
+                trace,
+                actual_target=SkillTarget.ENEMY,
+                actual_effect="no_effect",
+                actual_amount=0,
+            )
         return trace
 
     if skill_name == "обновление":
@@ -784,8 +807,8 @@ def resolve_decision_trace(
     return replace(
         trace,
         actual_target=trace.decision.target,
-        actual_effect="damage" if enemy_damage else "action",
-        actual_amount=sum(enemy_damage) if enemy_damage else None,
+        actual_effect="damage" if enemy_damage else "no_effect",
+        actual_amount=sum(enemy_damage) if enemy_damage else 0,
     )
 
 
@@ -806,6 +829,32 @@ def _lethal_skill(
             candidates.append((skill.mana_cost, priority[skill_name], skill_name))
 
     return min(candidates)[2] if candidates else None
+
+
+def _best_emergency_offense(
+    available: dict[str, SkillButton],
+    memory: CombatMemory,
+) -> str | None:
+    """Pick the strongest attack when delayed healing cannot save this turn."""
+    candidates: list[tuple[float, int, int, str]] = []
+    fallback_priority = {
+        "атака аколита": 1,
+        "лечение": 2,
+        "святое свечение": 3,
+    }
+    for skill_name, priority in fallback_priority.items():
+        skill = available.get(skill_name)
+        if skill is None:
+            continue
+        if skill_name == "лечение" and not memory.treatment_can_target_enemy():
+            continue
+        observed = memory.outgoing_damage.get(skill_name)
+        expected_damage = (
+            observed.average(0.0) if observed is not None and observed.samples else 0.0
+        )
+        candidates.append((expected_damage, priority, -skill.mana_cost, skill_name))
+
+    return max(candidates)[3] if candidates else None
 
 
 def _estimated_enemy_turns(
@@ -915,6 +964,17 @@ def choose_combat_action(
             f"следующий максимальный удар может быть смертельным; {forecast}",
             urgent=True,
         )
+
+    if can_survive_worst_hit is False:
+        emergency_offense = _best_emergency_offense(available, memory)
+        if emergency_offense is not None:
+            return CombatDecision(
+                emergency_offense,
+                SkillTarget.ENEMY,
+                "отложенное лечение не успеет до смертельного ответа; "
+                f"последняя попытка завершить бой; {forecast}",
+                urgent=True,
+            )
 
     renewed_survival_turns = (
         max(

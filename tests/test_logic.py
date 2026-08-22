@@ -30,6 +30,7 @@ from config import (
 )
 from event_cache import BoundedKeyCache
 from farmer import Farmer
+from game_catalog import ALL_MONSTER_NAMES, get_location, get_monster_names
 from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
 from models import ActionType, BotState, RuntimeContext
 from navigator import SnakeNavigator
@@ -138,6 +139,32 @@ class ParserTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertTrue(parsed.movement_blocked)
+
+
+class GameCatalogTests(unittest.TestCase):
+    def test_desert_plain_and_targets_are_registered(self) -> None:
+        location = get_location("Пустынная равнина")
+
+        self.assertIsNotNone(location)
+        self.assertEqual(
+            get_monster_names("Пустынная равнина"),
+            (
+                "Хранитель дюн",
+                "Камнешкурый варан",
+                "Скорпион",
+                "Кактус",
+                "Стервятник",
+                "Гремучая змея",
+                "Пыльник",
+            ),
+        )
+        self.assertIn("Пыльник", ALL_MONSTER_NAMES)
+
+    def test_known_large_location_keeps_fallback_geometry(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location("Выжженное поле")
+
+        self.assertEqual((navigator.max_x, navigator.max_y), (11, 11))
 
 
 class SkillTests(unittest.TestCase):

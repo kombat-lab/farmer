@@ -24,9 +24,8 @@ from config import (
     DEFAULT_SKILL_DELAY_MIN,
     DEFAULT_TARGET_DELAY_MAX,
     DEFAULT_TARGET_DELAY_MIN,
-    DEFAULT_TARGET_MONSTERS,
-    TARGET_MONSTER_CATEGORIES,
 )
+from game_catalog import ALL_MONSTER_NAMES, get_monster_names
 from storage import Storage
 
 NON_UI_SETTING_KEYS = frozenset({"farmer_stop_requested"})
@@ -38,7 +37,7 @@ class FarmerSettings:
     moves_per_cycle: int = DEFAULT_MOVES_PER_CYCLE
     activity_profile: str = DEFAULT_ACTIVITY_PROFILE
 
-    enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
+    enabled_targets: list[str] = field(default_factory=lambda: list(ALL_MONSTER_NAMES))
     treatment_enemy_targets: list[str] = field(default_factory=list)
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
@@ -138,7 +137,7 @@ class SettingsService:
         return True
 
     async def toggle_target(self, target: str) -> bool:
-        if target not in DEFAULT_TARGET_MONSTERS:
+        if target not in ALL_MONSTER_NAMES:
             raise ValueError(f"Неизвестный моб: {target}")
 
         targets = list(self.values.enabled_targets or [])
@@ -162,9 +161,9 @@ class SettingsService:
         category: str,
         enabled: bool,
     ) -> list[str]:
-        category_targets = TARGET_MONSTER_CATEGORIES.get(category)
+        category_targets = get_monster_names(category)
 
-        if category_targets is None:
+        if not category_targets:
             raise ValueError(f"Неизвестная категория мобов: {category}")
 
         current_targets = list(self.values.enabled_targets or [])
@@ -190,7 +189,7 @@ class SettingsService:
         return current_targets
 
     def get_category_enabled_count(self, category: str) -> tuple[int, int]:
-        category_targets = TARGET_MONSTER_CATEGORIES.get(category, [])
+        category_targets = get_monster_names(category)
         selected = set(self.values.enabled_targets or [])
 
         enabled_count = sum(target in selected for target in category_targets)
@@ -219,14 +218,14 @@ class SettingsService:
     @classmethod
     def _coerce_enabled_targets(cls, value: object) -> list[str]:
         if not isinstance(value, list):
-            return list(DEFAULT_TARGET_MONSTERS)
+            return list(ALL_MONSTER_NAMES)
         return cls._sort_targets([target for target in value if isinstance(target, str)])
 
     @staticmethod
     def _sort_targets(targets: list[str]) -> list[str]:
         selected = set(targets)
 
-        return [target for target in DEFAULT_TARGET_MONSTERS if target in selected]
+        return [target for target in ALL_MONSTER_NAMES if target in selected]
 
     def _normalize_character(self) -> None:
         try:

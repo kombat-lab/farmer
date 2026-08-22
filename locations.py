@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from game_catalog import get_location
 from models import Position
 
 
@@ -24,21 +25,15 @@ _DEFAULT_GEOMETRY = LocationGeometry(
     blocked_cells=frozenset(),
 )
 
-_TWELVE_BY_TWELVE_GEOMETRY = LocationGeometry(
-    min_x=0,
-    max_x=11,
-    min_y=0,
-    max_y=11,
-    start_position=(0, 0),
-    blocked_cells=frozenset(),
-)
-
-_LOCATION_GEOMETRY: dict[str, LocationGeometry] = {
-    "Мертвый лес": _TWELVE_BY_TWELVE_GEOMETRY,
-    "Выжженное поле": _TWELVE_BY_TWELVE_GEOMETRY,
-}
-
-
 def get_location_geometry(name: str) -> LocationGeometry:
-    # Для новых локаций без отдельной геометрии используется безопасная карта 9×9.
-    return _LOCATION_GEOMETRY.get(name, _DEFAULT_GEOMETRY)
+    location = get_location(name)
+    if location is None:
+        return _DEFAULT_GEOMETRY
+    return LocationGeometry(
+        min_x=0,
+        max_x=location.fallback_width - 1,
+        min_y=0,
+        max_y=location.fallback_height - 1,
+        start_position=location.fallback_start,
+        blocked_cells=frozenset(),
+    )

@@ -16,7 +16,12 @@ from config import (
     ACTIVITY_PROFILE_FAST,
     ACTIVITY_PROFILE_NORMAL,
     ADMIN_TELEGRAM_ID,
-    TARGET_MONSTER_CATEGORIES,
+)
+from game_catalog import (
+    LOCATION_CATALOG,
+    LOCATION_NAMES,
+    get_monster_location,
+    get_monster_names,
 )
 from middlewares import AdminOnlyMiddleware
 from rich_messages import (
@@ -109,27 +114,23 @@ def category_from_location_button(text: str | None) -> str | None:
         return None
     normalized = normalize_button_text(normalized[len(marker) :])
 
-    for category in TARGET_MONSTER_CATEGORIES:
+    for category in LOCATION_NAMES:
         if normalize_button_text(category) == normalized:
             return category
     return None
 
 
 def category_for_target(target: str | None) -> str | None:
-    normalized_target = normalize_button_text(target)
-    for category, targets in TARGET_MONSTER_CATEGORIES.items():
-        for configured_target in targets:
-            if normalize_button_text(configured_target) == normalized_target:
-                return category
-    return None
+    canonical_target = canonical_target_name(target)
+    return get_monster_location(canonical_target) if canonical_target else None
 
 
 def canonical_target_name(target: str | None) -> str | None:
     normalized_target = normalize_button_text(target)
-    for targets in TARGET_MONSTER_CATEGORIES.values():
-        for configured_target in targets:
-            if normalize_button_text(configured_target) == normalized_target:
-                return configured_target
+    for location in LOCATION_CATALOG:
+        for monster in location.monsters:
+            if normalize_button_text(monster.name) == normalized_target:
+                return monster.name
     return None
 
 
@@ -140,7 +141,7 @@ def category_from_toggle_button(text: str | None) -> str | None:
         return None
 
     normalized_category = normalize_button_text(category_text)
-    for category in TARGET_MONSTER_CATEGORIES:
+    for category in LOCATION_NAMES:
         if normalize_button_text(category) == normalized_category:
             return category
     return None
@@ -160,7 +161,7 @@ def starts_with_normalized(text: str | None, prefix: str) -> bool:
 
 def get_locations_text(settings: SettingsService) -> str:
     lines = ["📍 Выбор локации", "", "Выберите локацию для настройки мобов:"]
-    for category in TARGET_MONSTER_CATEGORIES:
+    for category in LOCATION_NAMES:
         enabled_count, total_count = settings.get_category_enabled_count(category)
         if total_count > 0 and enabled_count == total_count:
             icon = "✅"
@@ -173,13 +174,13 @@ def get_locations_text(settings: SettingsService) -> str:
 
 
 def get_locations_keyboard() -> list[list[str]]:
-    rows = [[location_button(category)] for category in TARGET_MONSTER_CATEGORIES]
+    rows = [[location_button(category)] for category in LOCATION_NAMES]
     rows.append(["↩️ Настройки"])
     return rows
 
 
 def get_category_toggle_button(category: str, settings: SettingsService) -> str:
-    targets = TARGET_MONSTER_CATEGORIES.get(category, [])
+    targets = get_monster_names(category)
     selected = set(settings.values.enabled_targets or [])
     enabled = bool(targets) and all(target in selected for target in targets)
     prefix = TARGETS_DISABLE_ALL_PREFIX if enabled else TARGETS_ENABLE_ALL_PREFIX
@@ -187,7 +188,7 @@ def get_category_toggle_button(category: str, settings: SettingsService) -> str:
 
 
 def get_targets_text(category: str, settings: SettingsService) -> str:
-    targets = TARGET_MONSTER_CATEGORIES[category]
+    targets = get_monster_names(category)
     selected = set(settings.values.enabled_targets or [])
     enabled_count, total_count = settings.get_category_enabled_count(category)
     icon = "✅" if total_count and enabled_count == total_count else "☑️" if enabled_count else "❌"
@@ -198,7 +199,7 @@ def get_targets_text(category: str, settings: SettingsService) -> str:
 
 def get_targets_keyboard(category: str, settings: SettingsService) -> list[list[str]]:
     rows = [[get_category_toggle_button(category, settings)]]
-    rows.extend([[target] for target in TARGET_MONSTER_CATEGORIES[category]])
+    rows.extend([[target] for target in get_monster_names(category)])
     rows.append([BACK_TO_LOCATIONS_BUTTON])
     return rows
 

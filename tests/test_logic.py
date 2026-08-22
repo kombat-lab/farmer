@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import sqlite3
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,7 +44,6 @@ from telegram_safety import (
     StateRefreshGate,
     TelegramActionLimiter,
     TelegramActionTelemetry,
-    message_revision_key,
     message_state_key,
 )
 
@@ -1296,7 +1296,6 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(message_state_key(first), message_state_key(second))
-        self.assertNotEqual(message_revision_key(first), message_revision_key(second))
 
     def test_state_refresh_is_reserved_once_per_inbound_generation(self) -> None:
         gate = StateRefreshGate()
@@ -1511,6 +1510,122 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("combat_policy_stats", tables)
             await storage.close()
 
+    async def test_opening_database_removes_obsolete_combat_tables(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                CREATE TABLE combat_strategy_stats(id INTEGER PRIMARY KEY);
+                CREATE TABLE combat_policy_stats(id INTEGER PRIMARY KEY);
+                """
+            )
+            connection.close()
+
+            storage = Storage(path)
+            tables = {
+                str(row["name"])
+                for row in storage.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+            self.assertNotIn("combat_strategy_stats", tables)
+            self.assertNotIn("combat_policy_stats", tables)
+            await storage.close()
+
+    async def test_cleanup_keeps_current_traces_and_compact_analysis(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+
+            def trace(version: int, message_id: int) -> dict[str, object]:
+                return {
+                    "model_version": version,
+                    "created_at": "2026-08-22T10:00:00+00:00",
+                    "telegram_message_id": message_id,
+                    "target_name": "Пепельник",
+                    "round_number": 1,
+                    "player": {"current_hp": 700, "max_hp": 830},
+                    "mana": {"current": 13, "maximum": 13},
+                    "decision": {
+                        "skill_name": "атака аколита",
+                        "target": "enemy",
+                        "reason": "test",
+                        "urgent": False,
+                    },
+                    "outcome": {
+                        "target": "enemy",
+                        "effect": "damage",
+                        "amount": 42,
+                    },
+                }
+
+            await storage.record_battle(
+                telegram_message_id=100,
+                session_id=session_id,
+                target_name="Пепельник",
+                result="VICTORY",
+                combat_decisions=(trace(3, 101),),
+            )
+            await storage.record_battle(
+                telegram_message_id=200,
+                session_id=session_id,
+                target_name="Пепельник",
+                result="VICTORY",
+                combat_decisions=(trace(4, 201),),
+            )
+            await storage.add_event("LOW_HP_WAIT_STARTED", "noise")
+            await storage.add_event("WATCHDOG_TRIGGERED", "keep")
+
+            cleanup = await storage.cleanup_old_data(retention_days=3650)
+
+            versions = [
+                int(row[0])
+                for row in storage.connection.execute(
+                    "SELECT json_extract(trace_json, '$.model_version') "
+                    "FROM combat_decisions"
+                ).fetchall()
+            ]
+            self.assertEqual(versions, [4])
+            self.assertEqual(cleanup["combat_decisions"], 1)
+            self.assertEqual(cleanup["events"], 1)
+            self.assertEqual(
+                storage.connection.execute(
+                    "SELECT COUNT(*) FROM combat_battle_analysis"
+                ).fetchone()[0],
+                2,
+            )
+            await storage.close()
+
+    async def test_compaction_reclaims_pages_after_bulk_cleanup(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            payload = {"padding": "x" * 2000}
+            for index in range(400):
+                await storage.add_event(
+                    "LOW_HP_WAIT_STARTED",
+                    f"noise {index}",
+                    payload=payload,
+                )
+            await storage.cleanup_old_data(retention_days=3650)
+            free_before = int(
+                storage.connection.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+
+            compacted = await storage.compact_if_needed(
+                min_free_pages=1,
+                min_free_ratio=0,
+            )
+
+            self.assertGreater(free_before, 0)
+            self.assertTrue(compacted)
+            self.assertEqual(
+                storage.connection.execute("PRAGMA freelist_count").fetchone()[0],
+                0,
+            )
+            await storage.close()
+
     async def test_combat_knowledge_survives_restart_by_character_profile(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "test.sqlite3"
@@ -1584,9 +1699,20 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 DEFAULT_BATTLE_START_HP_PERCENT,
             )
             self.assertEqual(settings.values.activity_profile, ACTIVITY_PROFILE_NORMAL)
+            self.assertNotIn("removed_setting", await storage.get_settings())
             changes_after_first_load = storage.connection.total_changes
             await settings.load()
             self.assertEqual(storage.connection.total_changes, changes_after_first_load)
+            await storage.close()
+
+    async def test_runtime_control_setting_is_not_removed_by_ui_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.set_setting("farmer_stop_requested", True)
+
+            await SettingsService(storage).load()
+
+            self.assertTrue(await storage.get_setting("farmer_stop_requested"))
             await storage.close()
 
     async def test_activity_profile_is_validated_and_persisted(self) -> None:
@@ -1615,7 +1741,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await settings.load()
             self.assertTrue(await settings.add_treatment_enemy_target("Костяной заяц"))
             self.assertFalse(await settings.add_treatment_enemy_target("костяной заяц"))
-            await settings.mark_treatment_targets_initialized()
             await storage.close()
 
             reopened = Storage(path)
@@ -1625,7 +1750,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 loaded.values.treatment_enemy_targets,
                 ["Костяной заяц"],
             )
-            self.assertTrue(loaded.values.treatment_targets_initialized)
             self.assertTrue(
                 await loaded.remove_treatment_enemy_target("КОСТЯНОЙ ЗАЯЦ")
             )
@@ -1890,7 +2014,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             )
             await storage.close()
 
-    async def test_legacy_character_settings_are_removed_once(self) -> None:
+    async def test_unknown_settings_are_removed_once(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             await storage.set_settings(
@@ -1904,47 +2028,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("max_hp", stored)
             self.assertNotIn("max_mana", stored)
             self.assertNotIn("heal_amount", stored)
-            await storage.close()
-
-    async def test_confirmed_treatment_targets_are_recovered_from_damage_history(
-        self,
-    ) -> None:
-        with TemporaryDirectory() as directory:
-            storage = Storage(Path(directory) / "test.sqlite3")
-            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
-            trace = {
-                "created_at": "2026-08-16T09:00:00+00:00",
-                "telegram_message_id": 30,
-                "target_name": "Костяной заяц",
-                "round_number": 5,
-                "outgoing_damage": [
-                    {
-                        "skill_name": "лечение",
-                        "minimum": 110,
-                        "maximum": 116,
-                        "average": 113.0,
-                        "samples": 2,
-                    }
-                ],
-                "decision": {
-                    "skill_name": "атака аколита",
-                    "target": "enemy",
-                    "reason": "test",
-                    "urgent": False,
-                },
-            }
-            await storage.record_battle(
-                telegram_message_id=31,
-                session_id=session_id,
-                target_name="Костяной заяц",
-                result="VICTORY",
-                combat_decisions=(trace,),
-            )
-
-            self.assertEqual(
-                await storage.get_confirmed_treatment_targets(),
-                {"Костяной заяц"},
-            )
             await storage.close()
 
     async def test_different_sequences_share_semantic_policy_stats(self) -> None:

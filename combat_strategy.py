@@ -16,6 +16,8 @@ KNOWN_SKILLS = {
     "атака аколита",
 }
 
+COMBAT_MODEL_VERSION = 4
+
 PERIODIC_EFFECT_MARKERS = (
     "яд",
     "горение",
@@ -116,7 +118,7 @@ class CombatDecisionTrace:
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "model_version": 4,
+            "model_version": COMBAT_MODEL_VERSION,
             "created_at": self.created_at,
             "telegram_message_id": self.telegram_message_id,
             "target_name": self.target_name,

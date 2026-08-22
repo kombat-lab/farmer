@@ -29,7 +29,7 @@ from config import (
 )
 from storage import Storage
 
-LEGACY_SETTING_KEYS = frozenset({"max_hp", "max_mana", "heal_amount"})
+NON_UI_SETTING_KEYS = frozenset({"farmer_stop_requested"})
 
 
 @dataclass
@@ -40,7 +40,6 @@ class FarmerSettings:
 
     enabled_targets: list[str] = field(default_factory=lambda: list(DEFAULT_TARGET_MONSTERS))
     treatment_enemy_targets: list[str] = field(default_factory=list)
-    treatment_targets_initialized: bool = False
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
     battle_start_hp_percent: int = DEFAULT_BATTLE_START_HP_PERCENT
@@ -86,12 +85,11 @@ class SettingsService:
             self.values.blessing_enabled,
             default=False,
         )
-        self.values.treatment_targets_initialized = self._normalize_bool(
-            self.values.treatment_targets_initialized,
-            default=False,
+        normalized = asdict(self.values)
+        await self.storage.set_settings(normalized)
+        await self.storage.delete_settings(
+            set(stored) - set(normalized) - NON_UI_SETTING_KEYS
         )
-        await self.storage.set_settings(asdict(self.values))
-        await self.storage.delete_settings(LEGACY_SETTING_KEYS)
 
     async def set_value(self, key: str, value: Any) -> None:
         if not hasattr(self.values, key):
@@ -138,10 +136,6 @@ class SettingsService:
         self.values.treatment_enemy_targets = updated
         await self.storage.set_setting("treatment_enemy_targets", updated)
         return True
-
-    async def mark_treatment_targets_initialized(self) -> None:
-        self.values.treatment_targets_initialized = True
-        await self.storage.set_setting("treatment_targets_initialized", True)
 
     async def toggle_target(self, target: str) -> bool:
         if target not in DEFAULT_TARGET_MONSTERS:

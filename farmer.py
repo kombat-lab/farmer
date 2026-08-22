@@ -595,30 +595,15 @@ class Farmer:
             and not self.has_battle_health()
         )
 
-    async def wait_for_battle_health(self) -> None:
+    def wait_for_battle_health(self) -> None:
         if self.state is BotState.WAITING_FOR_HEALTH:
             return
         self.state = BotState.WAITING_FOR_HEALTH
-        current_hp = self.context.current_hp or 0
-        max_hp = self.context.max_hp or 0
-        required_percent = self.settings.values.battle_start_hp_percent
-        threshold = (max_hp * required_percent + 99) // 100
         self.mark_progress("ожидание восстановления HP перед боем")
-        await self.storage.add_event(
-            "LOW_HP_WAIT_STARTED",
-            f"HP {current_hp}/{max_hp}; новые бои разрешены от {threshold}",
-            level="INFO",
-        )
 
-    async def finish_battle_health_wait(self) -> None:
+    def finish_battle_health_wait(self) -> None:
         self.state = BotState.MAP
-        current_hp = self.context.current_hp or 0
-        max_hp = self.context.max_hp or 0
         self.mark_progress("HP восстановлено для новых боёв")
-        await self.storage.add_event(
-            "LOW_HP_WAIT_FINISHED",
-            f"HP восстановлено до {current_hp}/{max_hp}",
-        )
 
     def confirm_pending_move(
         self,
@@ -998,7 +983,7 @@ class Farmer:
         )
 
         if self.battle_health_is_low():
-            await self.wait_for_battle_health()
+            self.wait_for_battle_health()
             return
 
         if await self.try_refresh_blessing_from_map(message):
@@ -1106,7 +1091,7 @@ class Farmer:
                 description=BACK_TO_MAP_BUTTON,
             )
             if clicked:
-                await self.wait_for_battle_health()
+                self.wait_for_battle_health()
             elif self.running:
                 await self.recover_latest_state("низкий HP: не удалось вернуться на карту")
             return
@@ -1786,7 +1771,7 @@ class Farmer:
             if kind not in active_battle_kinds:
                 if not self.has_battle_health():
                     return
-                await self.finish_battle_health_wait()
+                self.finish_battle_health_wait()
                 if kind is not MessageKind.MAP:
                     await self.request_map_refresh()
                     return
@@ -1991,13 +1976,6 @@ class Farmer:
     async def run(self) -> None:
         self.validate_config()
         await self.load_combat_knowledge()
-        if not self.settings.values.treatment_targets_initialized:
-            historical_treatment_targets = (
-                await self.storage.get_confirmed_treatment_targets()
-            )
-            for target in sorted(historical_treatment_targets):
-                await self.settings.add_treatment_enemy_target(target)
-            await self.settings.mark_treatment_targets_initialized()
         for target in self.settings.values.treatment_enemy_targets:
             self.combat.confirm_treatment_enemy(target)
             for knowledge in self.combat_knowledge_profiles.values():
@@ -2008,17 +1986,20 @@ class Farmer:
                 f"{sorted(self.settings.values.treatment_enemy_targets)}"
             )
         deleted_logs = self.cleanup_old_log_files()
-        cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
         learning_rows = await self.storage.backfill_combat_battle_analysis()
+        cleanup = await self.storage.cleanup_old_data(DATA_RETENTION_DAYS)
+        compacted = await self.storage.compact_if_needed()
         logger.info(
-            "Очистка хранения: срок %s дн.; events=%s, battles=%s, "
-            "drops=%s, sessions=%s, logs=%s",
+            "Очистка хранения: срок %s дн.; events=%s, decisions=%s, "
+            "battles=%s, drops=%s, sessions=%s, logs=%s, compacted=%s",
             DATA_RETENTION_DAYS,
             cleanup["events"],
+            cleanup["combat_decisions"],
             cleanup["battles"],
             cleanup["drops"],
             cleanup["sessions"],
             deleted_logs,
+            compacted,
         )
         if learning_rows:
             logger.info(
@@ -2074,13 +2055,8 @@ class Farmer:
         logger.info("=" * 72)
 
         @self.client.on(events.NewMessage(chats=self.game_bot))
-        async def on_new_message(event) -> None:
-            if event.message.out:
-                return
-            await self.enqueue_message(event.message)
-
         @self.client.on(events.MessageEdited(chats=self.game_bot))
-        async def on_edited_message(event) -> None:
+        async def on_game_message(event) -> None:
             if event.message.out:
                 return
             await self.enqueue_message(event.message)

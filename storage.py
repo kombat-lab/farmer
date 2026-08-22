@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from combat_learning import battle_learning_summary, resolved_decision
+from combat_strategy import COMBAT_MODEL_VERSION
 from rewards import parse_item_stack
 
 
@@ -177,6 +178,9 @@ class Storage:
             discovered_at TEXT NOT NULL,
             PRIMARY KEY(location_name, position_x, position_y)
         );
+
+        DROP TABLE IF EXISTS combat_policy_stats;
+        DROP TABLE IF EXISTS combat_strategy_stats;
         """)
         self.connection.commit()
 
@@ -229,7 +233,20 @@ class Storage:
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, retention_days))).isoformat()
         async with self.lock:
             deleted_events = self.connection.execute(
-                "DELETE FROM events WHERE created_at < ?", (cutoff,)
+                """DELETE FROM events
+                   WHERE created_at < ?
+                      OR event_type IN ('LOW_HP_WAIT_STARTED', 'LOW_HP_WAIT_FINISHED')""",
+                (cutoff,),
+            ).rowcount
+            deleted_decisions = self.connection.execute(
+                """DELETE FROM combat_decisions
+                   WHERE battle_id IN (
+                       SELECT battle_id FROM combat_battle_analysis
+                   )
+                     AND CAST(COALESCE(
+                         json_extract(trace_json, '$.model_version'), 0
+                     ) AS INTEGER) < ?""",
+                (COMBAT_MODEL_VERSION,),
             ).rowcount
             old_battle_ids = [
                 int(row["id"])
@@ -268,10 +285,33 @@ class Storage:
             self.connection.execute("PRAGMA optimize")
             return {
                 "events": max(0, deleted_events),
+                "combat_decisions": max(0, deleted_decisions),
                 "drops": max(0, deleted_drops),
                 "battles": max(0, deleted_battles),
                 "sessions": max(0, deleted_sessions),
             }
+
+    async def compact_if_needed(
+        self,
+        *,
+        min_free_pages: int = 256,
+        min_free_ratio: float = 0.20,
+    ) -> bool:
+        """Rebuilds SQLite only when cleanup left a meaningful amount of free space."""
+        async with self.lock:
+            page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
+            free_pages = int(
+                self.connection.execute("PRAGMA freelist_count").fetchone()[0]
+            )
+            if page_count <= 0 or free_pages < max(1, min_free_pages):
+                return False
+            if free_pages / page_count < max(0.0, min(1.0, min_free_ratio)):
+                return False
+
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.connection.execute("VACUUM")
+            self.connection.execute("PRAGMA optimize")
+            return True
 
     async def start_session(
         self,
@@ -730,36 +770,6 @@ class Storage:
                     item["trace"] = json.loads(str(item.pop("trace_json")))
                 result.append(item)
             return result
-
-    async def get_confirmed_treatment_targets(self) -> set[str]:
-        """Finds monsters that have actually taken damage from Treatment."""
-        async with self.lock:
-            rows = self.connection.execute(
-                "SELECT target_name,trace_json FROM combat_decisions"
-            ).fetchall()
-
-        confirmed: set[str] = set()
-        for row in rows:
-            try:
-                trace = json.loads(str(row["trace_json"]))
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(trace, dict):
-                continue
-            outgoing = trace.get("outgoing_damage")
-            if not isinstance(outgoing, list):
-                continue
-            if any(
-                isinstance(estimate, dict)
-                and str(estimate.get("skill_name", "")).casefold() == "лечение"
-                and isinstance(samples := estimate.get("samples"), (int, float))
-                and samples > 0
-                for estimate in outgoing
-            ):
-                target = str(row["target_name"]).strip()
-                if target:
-                    confirmed.add(target)
-        return confirmed
 
     async def get_combat_learning_stats(
         self,

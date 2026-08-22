@@ -20,12 +20,6 @@ def message_state_key(message) -> tuple:
     )
 
 
-def message_revision_key(message) -> tuple:
-    """Exact Telegram revision used only to reject genuinely older updates."""
-    edit_timestamp = message.edit_date.timestamp() if message.edit_date else None
-    return (*message_state_key(message), edit_timestamp)
-
-
 class StateRefreshGate:
     """Allows at most one state-refresh request per received semantic state."""
 

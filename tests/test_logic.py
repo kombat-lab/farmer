@@ -166,6 +166,21 @@ class GameCatalogTests(unittest.TestCase):
 
         self.assertEqual((navigator.max_x, navigator.max_y), (11, 11))
 
+    def test_scorched_field_target_priority_is_registered(self) -> None:
+        self.assertEqual(
+            get_monster_names("Выжженное поле"),
+            (
+                "Колокол пепла",
+                "Пожиратель золы",
+                "Фонарщик",
+                "Пепельник",
+                "Огненный птенец",
+                "Саламандра",
+                "Хрустящий",
+                "Корень крематория",
+            ),
+        )
+
 
 class SkillTests(unittest.TestCase):
     def test_magic_blocked_and_explicit_low_mana_buttons_are_unavailable(self) -> None:

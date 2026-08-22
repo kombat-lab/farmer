@@ -4,11 +4,37 @@ import asyncio
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from telegram_buttons import get_button_texts
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class FloodWaitDecision:
+    retry: bool
+    server_wait_seconds: int
+    pause_seconds: float
+
+
+def decide_flood_wait(
+    seconds: int,
+    *,
+    retries_used: int,
+    short_wait_max: int,
+    safety_buffer: float,
+    max_retries: int,
+) -> FloodWaitDecision:
+    """Returns a bounded recovery decision for a Telegram FLOOD_WAIT."""
+    server_wait = max(1, int(seconds))
+    can_retry = server_wait <= short_wait_max and retries_used < max_retries
+    return FloodWaitDecision(
+        retry=can_retry,
+        server_wait_seconds=server_wait,
+        pause_seconds=server_wait + max(0.0, safety_buffer) if can_retry else 0.0,
+    )
 
 
 def message_state_key(message) -> tuple:

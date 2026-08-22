@@ -8,6 +8,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+from telethon.errors import FloodWaitError
+
 from blessing import BlessingManager
 from combat_learning import build_shadow_plan
 from combat_round import CombatSide, parse_combat_round
@@ -45,6 +47,7 @@ from telegram_safety import (
     StateRefreshGate,
     TelegramActionLimiter,
     TelegramActionTelemetry,
+    decide_flood_wait,
     message_state_key,
 )
 
@@ -1312,6 +1315,86 @@ class MovementRecoveryTests(unittest.TestCase):
 
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inline_action_retries_once_after_recoverable_flood_wait(self) -> None:
+        message = FakeMessage("Выберите цель", [["Kombat"]])
+        click_count = 0
+
+        async def click(_row: int, _column: int) -> None:
+            nonlocal click_count
+            click_count += 1
+            if click_count == 1:
+                raise FloodWaitError(request=None, capture=3)
+
+        message.click = click
+        farmer = Farmer.__new__(Farmer)
+        farmer.running = True
+        farmer.latest_messages = {message.id: message}
+        farmer.latest_received_message = message
+        farmer.attempted_actions = BoundedKeyCache()
+        farmer.telegram_cooldown_until = 0.0
+        farmer.telegram_action_limiter = TelegramActionLimiter(
+            min_interval=0.0,
+            max_actions=10,
+            window_seconds=60.0,
+        )
+        farmer.telegram_action_telemetry = TelegramActionTelemetry()
+        farmer.callback_timeout_count = 0
+        farmer.log = lambda _message: None
+        recovery_attempts: list[int] = []
+
+        async def recover(
+            _error: FloodWaitError,
+            _action: str,
+            *,
+            retries_used: int,
+        ) -> bool:
+            recovery_attempts.append(retries_used)
+            return True
+
+        farmer.recover_from_flood_wait = recover
+
+        clicked = await farmer.press_button(message, 0, 0, "тестовая цель")
+
+        self.assertTrue(clicked)
+        self.assertEqual(click_count, 2)
+        self.assertEqual(recovery_attempts, [0])
+
+    def test_short_flood_wait_gets_one_buffered_retry(self) -> None:
+        decision = decide_flood_wait(
+            3,
+            retries_used=0,
+            short_wait_max=10,
+            safety_buffer=2.0,
+            max_retries=1,
+        )
+
+        self.assertTrue(decision.retry)
+        self.assertEqual(decision.server_wait_seconds, 3)
+        self.assertEqual(decision.pause_seconds, 5.0)
+
+    def test_same_action_cannot_retry_twice_after_flood_wait(self) -> None:
+        decision = decide_flood_wait(
+            3,
+            retries_used=1,
+            short_wait_max=10,
+            safety_buffer=2.0,
+            max_retries=1,
+        )
+
+        self.assertFalse(decision.retry)
+        self.assertEqual(decision.pause_seconds, 0.0)
+
+    def test_long_flood_wait_still_requires_stop(self) -> None:
+        decision = decide_flood_wait(
+            11,
+            retries_used=0,
+            short_wait_max=10,
+            safety_buffer=2.0,
+            max_retries=1,
+        )
+
+        self.assertFalse(decision.retry)
+
     def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
         now = 100.0
         telemetry = TelegramActionTelemetry(clock=lambda: now)

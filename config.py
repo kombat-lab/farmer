@@ -95,6 +95,15 @@ TELEGRAM_ACTION_WINDOW = 60.0
 TELEGRAM_RECOVERY_LIMIT = 3
 TELEGRAM_RECOVERY_WINDOW = 10 * 60.0
 
+# A short server cooldown is recoverable once per action. Repeated cooldowns
+# remain bounded across the whole farmer session so external Telegram activity
+# cannot turn recovery into an endless retry loop.
+TELEGRAM_SHORT_FLOOD_WAIT_MAX = 10
+TELEGRAM_FLOOD_WAIT_BUFFER = 2.0
+TELEGRAM_FLOOD_ACTION_RETRIES = 1
+TELEGRAM_FLOOD_RECOVERY_LIMIT = 3
+TELEGRAM_FLOOD_RECOVERY_WINDOW = 10 * 60.0
+
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 DATA_RETENTION_DAYS = 7

@@ -44,7 +44,7 @@ from parser import (
     is_passive_health_notification,
     parse_map,
 )
-from rewards import BattleReward, parse_item_stack
+from rewards import BattleReward, parse_battle_reward, parse_item_stack
 from settings_service import SettingsService
 from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_button
 from storage import Storage
@@ -1823,6 +1823,32 @@ class RewardTests(unittest.TestCase):
         self.assertEqual(parse_item_stack("Осколок х3"), ("Осколок", 3))
         self.assertEqual(parse_item_stack("Обычный предмет"), ("Обычный предмет", 1))
 
+    def test_mist_crystals_are_parsed_as_currency(self) -> None:
+        reward = parse_battle_reward(
+            """Бой завершён
+
+🏆 Победа
+• + 7 ед. (🪬 1) Туманной пыли✨
+• + 14 XP (🪬 3)
+💎Туманные кристаллы: 1"""
+        )
+
+        self.assertEqual(reward.dust, 7)
+        self.assertEqual(reward.xp, 14)
+        self.assertEqual(reward.crystals, 1)
+        self.assertEqual(reward.items, ())
+
+    def test_crystal_line_after_items_header_is_not_an_item(self) -> None:
+        reward = parse_battle_reward(
+            """🏆 Победа
+Предметы:
+◼️ Кучка пепла
+💎 Туманные кристаллы: 2"""
+        )
+
+        self.assertEqual(reward.crystals, 2)
+        self.assertEqual(reward.items, ("◼️ Кучка пепла",))
+
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_database_uses_current_schema_directly(self) -> None:
@@ -1862,6 +1888,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("combat_decisions", tables)
             self.assertIn("combat_knowledge", tables)
             self.assertIn("combat_battle_analysis", tables)
+            self.assertIn("battle_currencies", tables)
             self.assertNotIn("combat_strategy_stats", tables)
             self.assertNotIn("combat_policy_stats", tables)
             await storage.close()
@@ -2225,6 +2252,26 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(drops[0]["quantity"], 3)
             await storage.close()
 
+    async def test_record_battle_aggregates_crystals_as_currency(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
+            await storage.record_battle(
+                telegram_message_id=2,
+                session_id=session_id,
+                target_name="Цель",
+                result="VICTORY",
+                xp=14,
+                dust=7,
+                crystals=2,
+            )
+
+            dashboard = await storage.get_statistics_dashboard()
+            self.assertEqual(dashboard["battle"]["crystals"], 2)
+            self.assertEqual(dashboard["targets"][0]["crystals"], 2)
+            self.assertEqual(await storage.get_drops(session_id), [])
+            await storage.close()
+
     async def test_combat_decisions_are_linked_to_battle_result(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
@@ -2540,6 +2587,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         reward = BattleReward(dust=0, xp=0, items=("Осколок x3",))
         stats.add_victory(1, reward)
         self.assertEqual(stats.session_report().drops, {"Осколок": 3})
+
+    def test_runtime_statistics_count_crystals(self) -> None:
+        from statistics import FarmStatistics
+
+        stats = FarmStatistics()
+        stats.add_victory(1, BattleReward(dust=0, xp=0, items=(), crystals=3))
+
+        self.assertEqual(stats.session_report().crystals, 3)
 
 
 if __name__ == "__main__":

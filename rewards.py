@@ -16,6 +16,12 @@ XP_RE = re.compile(
     re.IGNORECASE,
 )
 
+MIST_CRYSTALS_RE = re.compile(
+    r"(?:[•·]\s*)?(?:💎\s*)?Туманн(?:ые|ых)\s+кристалл(?:ы|ов)\s*:\s*(\d+)",
+    re.IGNORECASE,
+)
+MIST_CRYSTAL_CODE = "mist_crystals"
+
 ITEMS_HEADER = "Предметы:"
 ITEM_STACK_RE = re.compile(
     r"^(?P<name>.+?)\s+[xх×]\s*(?P<quantity>\d+)\s*$",
@@ -28,6 +34,7 @@ class BattleReward:
     dust: int
     xp: int
     items: tuple[str, ...]
+    crystals: int = 0
 
 
 def parse_item_stack(item: str) -> tuple[str, int]:
@@ -51,6 +58,7 @@ def parse_battle_reward(text: str) -> BattleReward:
     """
     dust_match = DUST_RE.search(text)
     xp_match = XP_RE.search(text)
+    crystals_match = MIST_CRYSTALS_RE.search(text)
 
     items: list[str] = []
 
@@ -60,11 +68,12 @@ def parse_battle_reward(text: str) -> BattleReward:
         for line in raw_items.splitlines():
             item = line.strip()
 
-            if item:
+            if item and MIST_CRYSTALS_RE.fullmatch(item) is None:
                 items.append(item)
 
     return BattleReward(
         dust=int(dust_match.group(1)) if dust_match else 0,
         xp=int(xp_match.group(1)) if xp_match else 0,
         items=tuple(items),
+        crystals=int(crystals_match.group(1)) if crystals_match else 0,
     )

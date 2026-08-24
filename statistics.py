@@ -14,6 +14,7 @@ class SessionReport:
     defeats: int
     xp: int
     dust: int
+    crystals: int
     drops: dict[str, int]
 
 
@@ -29,6 +30,7 @@ class FarmStatistics:
         self.session_defeats = 0
         self.session_xp = 0
         self.session_dust = 0
+        self.session_crystals = 0
         self.session_drops: Counter[str] = Counter()
         self._battle_ids: set[int] = set()
 
@@ -42,6 +44,7 @@ class FarmStatistics:
         self.session_wins += 1
         self.session_xp += reward.xp
         self.session_dust += reward.dust
+        self.session_crystals += reward.crystals
         for item in reward.items:
             name, quantity = parse_item_stack(item)
             self.session_drops[name] += quantity
@@ -61,6 +64,7 @@ class FarmStatistics:
             self.session_defeats,
             self.session_xp,
             self.session_dust,
+            self.session_crystals,
             dict(self.session_drops),
         )
 
@@ -79,6 +83,7 @@ def format_report(title: str, report: SessionReport) -> str:
         f"Поражений: {report.defeats}",
         f"Получено опыта: {report.xp}",
         f"Получено Туманной пыли: {report.dust}",
+        f"Получено Туманных кристаллов: {report.crystals}",
         "Дроп:",
     ]
     if report.drops:

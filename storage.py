@@ -11,7 +11,7 @@ from typing import Any
 
 from combat_learning import battle_learning_summary, resolved_decision
 from combat_strategy import COMBAT_MODEL_VERSION
-from rewards import parse_item_stack
+from rewards import MIST_CRYSTAL_CODE, parse_item_stack
 
 
 def utc_now() -> str:
@@ -78,6 +78,16 @@ class Storage:
             is_card INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS battle_currencies (
+            battle_id INTEGER NOT NULL,
+            currency_code TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0 CHECK(amount >= 0),
+            PRIMARY KEY(battle_id, currency_code),
+            FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_battle_currencies_code
+            ON battle_currencies(currency_code, battle_id);
 
         CREATE TABLE IF NOT EXISTS combat_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,6 +664,7 @@ class Storage:
         result,
         xp=0,
         dust=0,
+        crystals=0,
         items=(),
         position=None,
         combat_decisions: tuple[dict[str, Any], ...] = (),
@@ -721,6 +732,14 @@ class Storage:
                     result=result,
                     happened_at=happened_at,
                     traces=trace_list,
+                )
+            if crystals > 0:
+                self.connection.execute(
+                    """
+                    INSERT INTO battle_currencies(battle_id,currency_code,amount)
+                    VALUES (?,?,?)
+                    """,
+                    (battle_id, MIST_CRYSTAL_CODE, int(crystals)),
                 )
             for item in items:
                 item_name, quantity = parse_item_stack(str(item))
@@ -936,16 +955,27 @@ class Storage:
         async with self.lock:
             sid = session.session_id
             if sid is None:
-                battle = {"battles": 0, "wins": 0, "defeats": 0, "xp": 0, "dust": 0}
+                battle = {
+                    "battles": 0,
+                    "wins": 0,
+                    "defeats": 0,
+                    "xp": 0,
+                    "dust": 0,
+                    "crystals": 0,
+                }
                 drops = {"items": 0, "cards": 0}
                 targets = []
             else:
                 row = self.connection.execute(
                     """SELECT COUNT(*) battles,
-                    SUM(result='VICTORY') wins, SUM(result='DEFEAT') defeats,
-                    COALESCE(SUM(xp),0) xp, COALESCE(SUM(dust),0) dust
-                    FROM battles WHERE session_id=?""",
-                    (sid,),
+                    SUM(b.result='VICTORY') wins, SUM(b.result='DEFEAT') defeats,
+                    COALESCE(SUM(b.xp),0) xp, COALESCE(SUM(b.dust),0) dust,
+                    COALESCE(SUM(c.amount),0) crystals
+                    FROM battles b
+                    LEFT JOIN battle_currencies c
+                      ON c.battle_id=b.id AND c.currency_code=?
+                    WHERE b.session_id=?""",
+                    (MIST_CRYSTAL_CODE, sid),
                 ).fetchone()
                 battle = dict(row)
                 row = self.connection.execute(
@@ -958,12 +988,16 @@ class Storage:
                 targets = [
                     dict(r)
                     for r in self.connection.execute(
-                        """SELECT target_name, COUNT(*) battles,
-                    SUM(result='VICTORY') wins, COALESCE(SUM(xp),0) xp,
-                    COALESCE(SUM(dust),0) dust FROM battles
-                    WHERE session_id=? GROUP BY target_name
-                    ORDER BY wins DESC, battles DESC, target_name""",
-                        (sid,),
+                        """SELECT b.target_name, COUNT(*) battles,
+                    SUM(b.result='VICTORY') wins, COALESCE(SUM(b.xp),0) xp,
+                    COALESCE(SUM(b.dust),0) dust,
+                    COALESCE(SUM(c.amount),0) crystals
+                    FROM battles b
+                    LEFT JOIN battle_currencies c
+                      ON c.battle_id=b.id AND c.currency_code=?
+                    WHERE b.session_id=? GROUP BY b.target_name
+                    ORDER BY wins DESC, battles DESC, b.target_name""",
+                        (MIST_CRYSTAL_CODE, sid),
                     ).fetchall()
                 ]
             state = self.connection.execute(
@@ -1004,6 +1038,7 @@ class Storage:
             f"☠️ Поражений: {b.get('defeats', 0)}\n"
             f"✨ XP: {b.get('xp', 0)}\n"
             f"💠 Пыль: {b.get('dust', 0)}\n"
+            f"💎 Кристаллы: {b.get('crystals', 0)}\n"
             f"🎁 Предметов: {d.get('items', 0)}\n"
             f"🃏 Карт: {d.get('cards', 0)}\n"
             f"👣 Ходов: {st.get('moves', 0)}"

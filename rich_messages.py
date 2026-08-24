@@ -130,13 +130,18 @@ def stats_rich(data: dict, drop_items: list[dict] | None = None) -> str:
         ("☠️ Поражений", battle.get("defeats", 0)),
         ("✨ Опыт", battle.get("xp", 0)),
         ("💠 Туманная пыль", battle.get("dust", 0)),
+        ("💎 Туманные кристаллы", battle.get("crystals", 0)),
         ("🎁 Предметов", drops.get("items", 0)),
         ("🃏 Карт", drops.get("cards", 0)),
         ("👣 Перемещений", state.get("moves", 0)),
         ("🔄 Цикл", f"{state.get('current_cycle', 1)}/{state.get('cycles_count', 1)}"),
     ]
     target_rows = [
-        (row["target_name"], f"{row['wins']} побед · {row['xp']} XP · {row['dust']} пыли")
+        (
+            row["target_name"],
+            f"{row['wins']} побед · {row['xp']} XP · {row['dust']} пыли · "
+            f"{row.get('crystals', 0)} кристаллов",
+        )
         for row in data.get("targets", [])
     ]
     body = rich_table(rows)

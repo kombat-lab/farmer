@@ -2193,6 +2193,7 @@ class Farmer:
                     result="VICTORY",
                     xp=reward.xp,
                     dust=reward.dust,
+                    crystals=reward.crystals,
                     items=reward.items,
                     position=self.context.current_position,
                     combat_decisions=tuple(

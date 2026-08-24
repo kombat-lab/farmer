@@ -24,3 +24,13 @@ class BoundedKeyCache:
 
     def __contains__(self, key: tuple) -> bool:
         return key in self._keys
+
+    def discard(self, key: tuple) -> None:
+        """Forgets a key when an action was rejected before reaching the game."""
+        if key not in self._keys:
+            return
+        self._keys.discard(key)
+        try:
+            self._order.remove(key)
+        except ValueError:
+            pass

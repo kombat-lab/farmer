@@ -4,12 +4,13 @@ import asyncio
 import random
 import sqlite3
 import unittest
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from telethon.errors import FloodWaitError
+from telethon.errors import BotResponseTimeoutError
 
 from blessing import BlessingManager
 from combat_learning import build_shadow_plan
@@ -26,8 +27,6 @@ from combat_strategy import (
     resolve_decision_trace,
 )
 from config import (
-    ACTIVITY_PROFILE_FAST,
-    ACTIVITY_PROFILE_NORMAL,
     DEFAULT_BATTLE_START_HP_PERCENT,
     DEFAULT_HEAL_THRESHOLD,
     DEFAULT_MOVES_PER_CYCLE_MAX,
@@ -51,11 +50,11 @@ from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_b
 from storage import Storage
 from targeting import select_combat_target
 from telegram_safety import (
+    AdaptivePacingController,
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
     TelegramActionTelemetry,
-    decide_flood_wait,
     message_state_key,
 )
 
@@ -1497,85 +1496,90 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(farmer.inbound_generation, 1)
         self.assertEqual(farmer.event_queue.qsize(), 2)
 
-    async def test_inline_action_retries_once_after_recoverable_flood_wait(self) -> None:
-        message = FakeMessage("Выберите цель", [["Kombat"]])
-        click_count = 0
-
-        async def click(_row: int, _column: int) -> None:
-            nonlocal click_count
-            click_count += 1
-            if click_count == 1:
-                raise FloodWaitError(request=None, capture=3)
-
-        message.click = click
+    def test_repeated_flood_waits_increase_pause_without_stopping(self) -> None:
         farmer = Farmer.__new__(Farmer)
-        farmer.running = True
-        farmer.latest_messages = {message.id: message}
-        farmer.latest_received_message = message
-        farmer.attempted_actions = BoundedKeyCache()
-        farmer.telegram_cooldown_until = 0.0
-        farmer.telegram_action_limiter = TelegramActionLimiter(
-            min_interval=0.0,
-            max_actions=10,
-            window_seconds=60.0,
-        )
-        farmer.telegram_action_telemetry = TelegramActionTelemetry()
-        farmer.callback_timeout_count = 0
-        farmer.log = lambda _message: None
-        recovery_attempts: list[int] = []
+        farmer.telegram_flood_incidents = deque()
 
-        async def recover(
-            _error: FloodWaitError,
-            _action: str,
-            *,
-            retries_used: int,
-        ) -> bool:
-            recovery_attempts.append(retries_used)
-            return True
+        first_pause, first_count = farmer.flood_wait_pause(3)
+        second_pause, second_count = farmer.flood_wait_pause(3)
+        third_pause, third_count = farmer.flood_wait_pause(3)
 
-        farmer.recover_from_flood_wait = recover
+        self.assertEqual((first_pause, first_count), (5.0, 1))
+        self.assertEqual((second_pause, second_count), (15.0, 2))
+        self.assertEqual((third_pause, third_count), (30.0, 3))
 
-        clicked = await farmer.press_button(message, 0, 0, "тестовая цель")
+    async def test_callback_timeout_pauses_without_retry_or_stop(self) -> None:
+        with TemporaryDirectory() as directory:
+            message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
+            click_count = 0
 
-        self.assertTrue(clicked)
-        self.assertEqual(click_count, 2)
-        self.assertEqual(recovery_attempts, [0])
+            async def click(_row: int, _column: int) -> None:
+                nonlocal click_count
+                click_count += 1
+                raise BotResponseTimeoutError(request=None)
 
-    def test_short_flood_wait_gets_one_buffered_retry(self) -> None:
-        decision = decide_flood_wait(
-            3,
-            retries_used=0,
-            short_wait_max=10,
-            safety_buffer=2.0,
-            max_retries=1,
-        )
+            async def notify(_text: str) -> None:
+                return None
 
-        self.assertTrue(decision.retry)
-        self.assertEqual(decision.server_wait_seconds, 3)
-        self.assertEqual(decision.pause_seconds, 5.0)
+            message.click = click
+            farmer = Farmer.__new__(Farmer)
+            farmer.running = True
+            farmer.state = BotState.COMBAT
+            farmer.storage = Storage(Path(directory) / "test.sqlite3")
+            farmer.notifier = SimpleNamespace(send=notify)
+            farmer.latest_messages = {message.id: message}
+            farmer.latest_received_message = message
+            farmer.attempted_actions = BoundedKeyCache()
+            farmer.telegram_cooldown_until = 0.0
+            farmer.telegram_cooldown_until_utc = None
+            farmer.telegram_cooldown_reason = None
+            farmer.telegram_cooldown_action = None
+            farmer.telegram_cooldown_resume_mode = "reprocess"
+            farmer.telegram_cooldown_task = None
+            farmer.telegram_cooldown_notified = False
+            farmer.telegram_cooldown_changed = asyncio.Event()
+            farmer.telegram_action_limiter = TelegramActionLimiter(
+                min_interval=0.0,
+                limits=((10, 60.0),),
+            )
+            farmer.telegram_action_telemetry = TelegramActionTelemetry()
+            farmer.telegram_pacing = AdaptivePacingController(
+                minimum_factor=0.9,
+                maximum_factor=1.5,
+                adjust_interval=180.0,
+                acceleration_lock=1800.0,
+                soft_1m=9,
+                hard_1m=11,
+                soft_10m=60,
+                hard_10m=66,
+            )
+            farmer.event_queue = asyncio.Queue()
+            farmer.callback_timeout_count = 0
+            farmer.mark_progress = lambda _message: None
+            farmer.log = lambda _message: None
 
-    def test_same_action_cannot_retry_twice_after_flood_wait(self) -> None:
-        decision = decide_flood_wait(
-            3,
-            retries_used=1,
-            short_wait_max=10,
-            safety_buffer=2.0,
-            max_retries=1,
-        )
+            clicked = await farmer.press_button(message, 0, 0, "атака")
 
-        self.assertFalse(decision.retry)
-        self.assertEqual(decision.pause_seconds, 0.0)
+            self.assertFalse(clicked)
+            self.assertTrue(farmer.running)
+            self.assertEqual(click_count, 1)
+            self.assertGreaterEqual(farmer.telegram_cooldown_remaining(), 29.0)
+            self.assertIsNotNone(await farmer.storage.get_setting("telegram_cooldown_until"))
 
-    def test_long_flood_wait_still_requires_stop(self) -> None:
-        decision = decide_flood_wait(
-            11,
-            retries_used=0,
-            short_wait_max=10,
-            safety_buffer=2.0,
-            max_retries=1,
-        )
+            assert farmer.telegram_cooldown_task is not None
+            farmer.telegram_cooldown_task.cancel()
+            try:
+                await farmer.telegram_cooldown_task
+            except asyncio.CancelledError:
+                pass
+            farmer.telegram_cooldown_task = None
+            farmer.telegram_cooldown_until = 0.0
 
-        self.assertFalse(decision.retry)
+            repeated = await farmer.press_button(message, 0, 0, "другая атака")
+            self.assertFalse(repeated)
+            self.assertTrue(farmer.running)
+            self.assertEqual(click_count, 1)
+            await farmer.storage.close()
 
     def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
         now = 100.0
@@ -1603,6 +1607,18 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(message_state_key(first), message_state_key(second))
+
+    def test_countdown_only_edit_has_same_semantic_state(self) -> None:
+        first = FakeMessage("🎯 Раунд 8\n⏳ Осталось: 23 сек.", [["Атака"]])
+        second = FakeMessage("🎯 Раунд 8\n⏳ Осталось: 18 сек.", [["Атака"]])
+
+        self.assertEqual(message_state_key(first), message_state_key(second))
+
+    def test_meaningful_round_change_has_different_semantic_state(self) -> None:
+        first = FakeMessage("🎯 Раунд 8\n⏳ Осталось: 23 сек.", [["Атака"]])
+        second = FakeMessage("🎯 Раунд 9\n⏳ Осталось: 23 сек.", [["Атака"]])
+
+        self.assertNotEqual(message_state_key(first), message_state_key(second))
 
     def test_state_refresh_is_reserved_once_per_inbound_generation(self) -> None:
         gate = StateRefreshGate()
@@ -1648,6 +1664,19 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await limiter.acquire(), 9.0)
         self.assertEqual(now, 10.0)
         self.assertFalse(limiter.pending)
+
+    async def test_action_limiter_enforces_accumulated_window_without_sleeping(self) -> None:
+        now = 0.0
+        limiter = TelegramActionLimiter(
+            min_interval=0.0,
+            limits=((10, 60.0), (4, 600.0)),
+            clock=lambda: now,
+        )
+        for _ in range(4):
+            self.assertEqual(await limiter.reserve(), 0.0)
+            now += 1.0
+
+        self.assertEqual(await limiter.reserve(), 596.0)
 
 
 class HumanDelayTests(unittest.TestCase):
@@ -1703,12 +1732,12 @@ class HumanDelayTests(unittest.TestCase):
 
         self.assertTrue(all(240.0 <= duration <= 480.0 for duration in durations))
 
-    def test_fast_profile_uses_small_action_delays(self) -> None:
+    def test_automatic_pacing_scales_configured_action_delays(self) -> None:
         farmer = Farmer.__new__(Farmer)
         farmer.delay_model = HumanDelayModel(random.Random(9))
+        farmer.telegram_pacing = SimpleNamespace(factor=1.2)
         farmer.settings = SimpleNamespace(
             values=SimpleNamespace(
-                activity_profile=ACTIVITY_PROFILE_FAST,
                 move_delay_min=10.0,
                 move_delay_max=20.0,
                 attack_delay_min=10.0,
@@ -1722,7 +1751,27 @@ class HumanDelayTests(unittest.TestCase):
 
         delays = [farmer.action_delay(action) for action in ActionType]
 
-        self.assertTrue(all(0.0 <= delay <= 1.2 for delay in delays))
+        self.assertTrue(all(12.0 <= delay <= 24.0 for delay in delays))
+
+    def test_pacing_slows_down_under_accumulated_pressure(self) -> None:
+        now = 1000.0
+        pacing = AdaptivePacingController(
+            minimum_factor=0.9,
+            maximum_factor=1.5,
+            adjust_interval=180.0,
+            acceleration_lock=1800.0,
+            soft_1m=9,
+            hard_1m=11,
+            soft_10m=60,
+            hard_10m=66,
+            clock=lambda: now,
+        )
+
+        update = pacing.observe(11, 66)
+
+        self.assertTrue(update.changed)
+        self.assertEqual(update.pressure, "high")
+        self.assertGreater(update.factor, 1.0)
 
 
 class SharedComponentTests(unittest.IsolatedAsyncioTestCase):
@@ -2005,7 +2054,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 settings.values.battle_start_hp_percent,
                 DEFAULT_BATTLE_START_HP_PERCENT,
             )
-            self.assertEqual(settings.values.activity_profile, ACTIVITY_PROFILE_NORMAL)
             self.assertNotIn("removed_setting", await storage.get_settings())
             changes_after_first_load = storage.connection.total_changes
             await settings.load()
@@ -2063,29 +2111,34 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             await storage.set_setting("farmer_stop_requested", True)
+            await storage.set_setting(
+                "telegram_cooldown_until",
+                "2026-08-25T00:30:00+00:00",
+            )
+            await storage.set_setting("telegram_cooldown_reason", "test")
 
             await SettingsService(storage).load()
 
             self.assertTrue(await storage.get_setting("farmer_stop_requested"))
+            self.assertEqual(
+                await storage.get_setting("telegram_cooldown_until"),
+                "2026-08-25T00:30:00+00:00",
+            )
+            self.assertEqual(await storage.get_setting("telegram_cooldown_reason"), "test")
             await storage.close()
 
-    async def test_activity_profile_is_validated_and_persisted(self) -> None:
+    async def test_removed_activity_profile_is_cleaned_from_settings(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "test.sqlite3"
             storage = Storage(path)
+            await storage.set_setting("activity_profile", "fast")
+
             settings = SettingsService(storage)
             await settings.load()
-            await settings.set_activity_profile(ACTIVITY_PROFILE_FAST)
-            self.assertEqual(settings.values.activity_profile, ACTIVITY_PROFILE_FAST)
-            await storage.close()
 
-            reopened = Storage(path)
-            loaded = SettingsService(reopened)
-            await loaded.load()
-            self.assertEqual(loaded.values.activity_profile, ACTIVITY_PROFILE_FAST)
-            with self.assertRaises(ValueError):
-                await loaded.set_activity_profile("unknown")
-            await reopened.close()
+            self.assertFalse(hasattr(settings.values, "activity_profile"))
+            self.assertNotIn("activity_profile", await storage.get_settings())
+            await storage.close()
 
     async def test_treatment_enemy_targets_are_persisted_without_duplicates(self) -> None:
         with TemporaryDirectory() as directory:

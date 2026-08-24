@@ -5,9 +5,6 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from config import (
-    ACTIVITY_PROFILE_FAST,
-    ACTIVITY_PROFILE_NORMAL,
-    DEFAULT_ACTIVITY_PROFILE,
     DEFAULT_ATTACK_DELAY_MAX,
     DEFAULT_ATTACK_DELAY_MIN,
     DEFAULT_BATTLE_START_HP_PERCENT,
@@ -30,7 +27,13 @@ from config import (
 from game_catalog import ALL_MONSTER_NAMES, get_monster_names
 from storage import Storage
 
-NON_UI_SETTING_KEYS = frozenset({"farmer_stop_requested"})
+NON_UI_SETTING_KEYS = frozenset(
+    {
+        "farmer_stop_requested",
+        "telegram_cooldown_until",
+        "telegram_cooldown_reason",
+    }
+)
 
 
 @dataclass
@@ -38,7 +41,6 @@ class FarmerSettings:
     cycles_count: int = DEFAULT_CYCLES_COUNT
     moves_per_cycle_min: int = DEFAULT_MOVES_PER_CYCLE_MIN
     moves_per_cycle_max: int = DEFAULT_MOVES_PER_CYCLE_MAX
-    activity_profile: str = DEFAULT_ACTIVITY_PROFILE
 
     enabled_targets: list[str] = field(default_factory=lambda: list(ALL_MONSTER_NAMES))
     treatment_enemy_targets: list[str] = field(default_factory=list)
@@ -85,7 +87,6 @@ class SettingsService:
         self._normalize_treatment_enemy_targets()
         self._normalize_character()
         self._normalize_moves_range()
-        self._normalize_activity_profile()
         self.values.blessing_enabled = self._normalize_bool(
             self.values.blessing_enabled,
             default=False,
@@ -119,14 +120,6 @@ class SettingsService:
         self.values.blessing_enabled = enabled
         await self.storage.set_setting("blessing_enabled", enabled)
         return enabled
-
-    async def set_activity_profile(self, profile: str) -> str:
-        normalized = str(profile).strip().casefold()
-        if normalized not in {ACTIVITY_PROFILE_NORMAL, ACTIVITY_PROFILE_FAST}:
-            raise ValueError(f"Неизвестный профиль активности: {profile}")
-        self.values.activity_profile = normalized
-        await self.storage.set_setting("activity_profile", normalized)
-        return normalized
 
     async def add_treatment_enemy_target(self, target: str) -> bool:
         normalized = target.strip()
@@ -283,12 +276,6 @@ class SettingsService:
             maximum = DEFAULT_MOVES_PER_CYCLE_MAX
         self.values.moves_per_cycle_min = minimum
         self.values.moves_per_cycle_max = maximum
-
-    def _normalize_activity_profile(self) -> None:
-        profile = str(self.values.activity_profile).strip().casefold()
-        if profile not in {ACTIVITY_PROFILE_NORMAL, ACTIVITY_PROFILE_FAST}:
-            profile = DEFAULT_ACTIVITY_PROFILE
-        self.values.activity_profile = profile
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:

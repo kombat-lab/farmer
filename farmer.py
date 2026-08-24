@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,7 +11,7 @@ from statistics import FarmStatistics, format_report
 from typing import Any
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import BotResponseTimeoutError, FloodWaitError, RPCError
 
 from blessing import BlessingManager
 from combat_learning import build_shadow_plan
@@ -31,7 +32,6 @@ from config import (
     ACTIVITY_BREAK_MOVES_MIN,
     ACTIVITY_BREAK_WORK_MAX,
     ACTIVITY_BREAK_WORK_MIN,
-    ACTIVITY_PROFILE_FAST,
     API_HASH,
     API_ID,
     CHARACTER_NAME,
@@ -39,10 +39,6 @@ from config import (
     DATA_RETENTION_DAYS,
     DEATH_RECOVERY_MAX_WAIT,
     DEATH_RECOVERY_MIN_WAIT,
-    FAST_ATTACK_DELAY,
-    FAST_MOVE_DELAY,
-    FAST_SKILL_DELAY,
-    FAST_TARGET_DELAY,
     GAME_BOT,
     GENERAL_PROGRESS_TIMEOUT,
     LOG_BACKUP_COUNT,
@@ -60,16 +56,24 @@ from config import (
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
     TARGET_SELECTION_TIMEOUT,
-    TELEGRAM_ACTION_LIMIT,
+    TELEGRAM_ACTION_LIMITS,
     TELEGRAM_ACTION_MIN_INTERVAL,
-    TELEGRAM_ACTION_WINDOW,
-    TELEGRAM_FLOOD_ACTION_RETRIES,
-    TELEGRAM_FLOOD_RECOVERY_LIMIT,
-    TELEGRAM_FLOOD_RECOVERY_WINDOW,
+    TELEGRAM_CALLBACK_TIMEOUT_BASE,
+    TELEGRAM_CALLBACK_TIMEOUT_MAX,
+    TELEGRAM_FLOOD_BACKOFF_BASE,
+    TELEGRAM_FLOOD_BACKOFF_MAX,
+    TELEGRAM_FLOOD_INCIDENT_WINDOW,
     TELEGRAM_FLOOD_WAIT_BUFFER,
+    TELEGRAM_PACING_ACCELERATION_LOCK,
+    TELEGRAM_PACING_ADJUST_INTERVAL,
+    TELEGRAM_PACING_HARD_1M,
+    TELEGRAM_PACING_HARD_10M,
+    TELEGRAM_PACING_MAX_FACTOR,
+    TELEGRAM_PACING_MIN_FACTOR,
+    TELEGRAM_PACING_SOFT_1M,
+    TELEGRAM_PACING_SOFT_10M,
     TELEGRAM_RECOVERY_LIMIT,
     TELEGRAM_RECOVERY_WINDOW,
-    TELEGRAM_SHORT_FLOOD_WAIT_MAX,
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
@@ -99,11 +103,11 @@ from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
 from telegram_safety import (
+    AdaptivePacingController,
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
     TelegramActionTelemetry,
-    decide_flood_wait,
     message_state_key,
 )
 from watchdog import ProgressWatchdog
@@ -125,7 +129,6 @@ MAX_FAILED_MOVE_ATTEMPTS = len(SnakeNavigator.ALL_MOVE_BUTTONS)
 EVENT_QUEUE_SIZE = 200
 PROCESSED_EVENT_CACHE_SIZE = 500
 LATEST_MESSAGE_CACHE_SIZE = 200
-MAX_CALLBACK_TIMEOUTS = 2
 
 class Farmer:
     def __init__(self, storage: Storage, notifier: Notifier, settings: SettingsService) -> None:
@@ -182,6 +185,14 @@ class Farmer:
         self.pending_progress_reason: str | None = None
         self.intentional_waits = 0
         self.telegram_cooldown_until = 0.0
+        self.telegram_cooldown_until_utc: datetime | None = None
+        self.telegram_cooldown_reason: str | None = None
+        self.telegram_cooldown_action: str | None = None
+        self.telegram_cooldown_resume_mode = "reprocess"
+        self.telegram_cooldown_task: asyncio.Task | None = None
+        self.telegram_cooldown_notified = False
+        self.telegram_cooldown_changed = asyncio.Event()
+        self.telegram_flood_incidents: deque[float] = deque()
 
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
@@ -197,16 +208,21 @@ class Farmer:
             max_attempts=TELEGRAM_RECOVERY_LIMIT,
             window_seconds=TELEGRAM_RECOVERY_WINDOW,
         )
-        self.flood_wait_recovery_guard = RollingAttemptGuard(
-            max_attempts=TELEGRAM_FLOOD_RECOVERY_LIMIT,
-            window_seconds=TELEGRAM_FLOOD_RECOVERY_WINDOW,
-        )
         self.telegram_action_limiter = TelegramActionLimiter(
             min_interval=TELEGRAM_ACTION_MIN_INTERVAL,
-            max_actions=TELEGRAM_ACTION_LIMIT,
-            window_seconds=TELEGRAM_ACTION_WINDOW,
+            limits=TELEGRAM_ACTION_LIMITS,
         )
         self.telegram_action_telemetry = TelegramActionTelemetry()
+        self.telegram_pacing = AdaptivePacingController(
+            minimum_factor=TELEGRAM_PACING_MIN_FACTOR,
+            maximum_factor=TELEGRAM_PACING_MAX_FACTOR,
+            adjust_interval=TELEGRAM_PACING_ADJUST_INTERVAL,
+            acceleration_lock=TELEGRAM_PACING_ACCELERATION_LOCK,
+            soft_1m=TELEGRAM_PACING_SOFT_1M,
+            hard_1m=TELEGRAM_PACING_HARD_1M,
+            soft_10m=TELEGRAM_PACING_SOFT_10M,
+            hard_10m=TELEGRAM_PACING_HARD_10M,
+        )
 
         self.blessing = BlessingManager()
 
@@ -222,6 +238,20 @@ class Farmer:
 
     def record_telegram_action(self, kind: str) -> None:
         snapshot = self.telegram_action_telemetry.record(kind)
+        last_minute_value = snapshot["last_minute"]
+        last_ten_minutes_value = snapshot["last_ten_minutes"]
+        last_minute = last_minute_value if isinstance(last_minute_value, int) else 0
+        last_ten_minutes = (
+            last_ten_minutes_value if isinstance(last_ten_minutes_value, int) else 0
+        )
+        pacing = self.telegram_pacing.observe(last_minute, last_ten_minutes)
+        if pacing.changed:
+            self.log(
+                "[TELEGRAM_PACING] коэффициент "
+                f"{pacing.previous_factor:.2f} → {pacing.factor:.2f}; "
+                f"нагрузка={pacing.pressure}, 1 мин={last_minute}, "
+                f"10 мин={last_ten_minutes}."
+            )
         total_value = snapshot["total"]
         total = total_value if isinstance(total_value, int) else 0
         if total % 10 == 0:
@@ -403,7 +433,15 @@ class Farmer:
         try:
             self.event_queue.put_nowait(message)
         except asyncio.QueueFull:
-            await self.stop("очередь Telegram-событий переполнена")
+            # Preserve the newest revision instead of crashing during a burst
+            # of message edits. Latest-message caches still protect semantic
+            # processing from the discarded stale item.
+            with suppress(asyncio.QueueEmpty):
+                self.event_queue.get_nowait()
+                self.event_queue.task_done()
+            with suppress(asyncio.QueueFull):
+                self.event_queue.put_nowait(message)
+            self.log("Очередь Telegram-событий уплотнена: удалена устаревшая запись.")
 
     async def event_worker(self) -> None:
         while self.running:
@@ -436,24 +474,17 @@ class Farmer:
         remaining_seconds: int | None = None,
     ) -> float:
         s = self.settings.values
-        if s.activity_profile == ACTIVITY_PROFILE_FAST:
-            ranges = {
-                ActionType.MOVE: FAST_MOVE_DELAY,
-                ActionType.OPEN_ATTACK: FAST_ATTACK_DELAY,
-                ActionType.SELECT_TARGET: FAST_TARGET_DELAY,
-                ActionType.USE_SKILL: FAST_SKILL_DELAY,
-            }
-        else:
-            ranges = {
-                ActionType.MOVE: (s.move_delay_min, s.move_delay_max),
-                ActionType.OPEN_ATTACK: (s.attack_delay_min, s.attack_delay_max),
-                ActionType.SELECT_TARGET: (s.target_delay_min, s.target_delay_max),
-                ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
-            }
+        ranges = {
+            ActionType.MOVE: (s.move_delay_min, s.move_delay_max),
+            ActionType.OPEN_ATTACK: (s.attack_delay_min, s.attack_delay_max),
+            ActionType.SELECT_TARGET: (s.target_delay_min, s.target_delay_max),
+            ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
+        }
         minimum, maximum = ranges[action_type]
+        factor = self.telegram_pacing.factor
         return self.delay_model.action_delay(
-            minimum,
-            maximum,
+            minimum * factor,
+            maximum * factor,
             urgent=urgent,
             remaining_seconds=remaining_seconds,
         )
@@ -466,110 +497,232 @@ class Farmer:
         finally:
             self.intentional_waits -= 1
 
-    async def wait_for_telegram_cooldown(self) -> float:
-        """Blocks every user-account action until the shared cooldown expires."""
-        waited = 0.0
-        while (delay := self.telegram_cooldown_until - time.monotonic()) > 0:
-            await self.intentional_sleep(delay)
-            waited += delay
-        return waited
+    def telegram_cooldown_remaining(self) -> float:
+        return max(0.0, self.telegram_cooldown_until - time.monotonic())
 
-    async def recover_from_flood_wait(
-        self,
-        error: FloodWaitError,
-        action: str,
-        *,
-        retries_used: int,
-    ) -> bool:
-        decision = decide_flood_wait(
-            int(error.seconds),
-            retries_used=retries_used,
-            short_wait_max=TELEGRAM_SHORT_FLOOD_WAIT_MAX,
-            safety_buffer=TELEGRAM_FLOOD_WAIT_BUFFER,
-            max_retries=TELEGRAM_FLOOD_ACTION_RETRIES,
-        )
-        if not decision.retry:
-            detail = (
-                "повторное ограничение после единственной автоматической попытки"
-                if retries_used >= TELEGRAM_FLOOD_ACTION_RETRIES
-                else (
-                    f"ожидание превышает безопасный порог "
-                    f"{TELEGRAM_SHORT_FLOOD_WAIT_MAX} сек."
-                )
+    def telegram_safety_status(self) -> dict[str, object]:
+        snapshot = self.telegram_action_telemetry.snapshot()
+        return {
+            "telegram_cooldown_remaining": int(self.telegram_cooldown_remaining()),
+            "telegram_cooldown_until": (
+                self.telegram_cooldown_until_utc.isoformat()
+                if self.telegram_cooldown_until_utc is not None
+                else None
+            ),
+            "telegram_cooldown_reason": self.telegram_cooldown_reason,
+            "telegram_pacing_factor": self.telegram_pacing.factor,
+            "telegram_pacing_pressure": self.telegram_pacing.pressure,
+            "telegram_actions_1m": snapshot["last_minute"],
+            "telegram_actions_10m": snapshot["last_ten_minutes"],
+        }
+
+    async def restore_telegram_cooldown(self) -> None:
+        raw_until = await self.storage.get_setting("telegram_cooldown_until")
+        if not isinstance(raw_until, str):
+            return
+        try:
+            until = datetime.fromisoformat(raw_until)
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=UTC)
+        except ValueError:
+            await self.storage.delete_settings({"telegram_cooldown_until"})
+            return
+        remaining = (until - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            await self.storage.delete_settings(
+                {"telegram_cooldown_until", "telegram_cooldown_reason"}
             )
-            await self.stop_for_flood_wait(error, action, detail=detail)
-            return False
+            return
+        reason = await self.storage.get_setting(
+            "telegram_cooldown_reason", "восстановленная пауза Telegram"
+        )
+        self.telegram_cooldown_until = time.monotonic() + remaining
+        self.telegram_cooldown_until_utc = until
+        self.telegram_cooldown_reason = str(reason)
+        self.telegram_cooldown_resume_mode = "refresh"
+        self.telegram_cooldown_notified = False
+        self.log(f"Восстановлена Telegram-пауза ещё на {remaining:.0f} сек.")
+        self.telegram_cooldown_task = asyncio.create_task(
+            self.telegram_cooldown_loop(), name="telegram-cooldown"
+        )
 
-        if not self.flood_wait_recovery_guard.allow():
-            await self.stop_for_flood_wait(
-                error,
-                action,
-                detail=(
-                    f"короткий FLOOD_WAIT повторился более "
-                    f"{TELEGRAM_FLOOD_RECOVERY_LIMIT} раз за "
-                    f"{int(TELEGRAM_FLOOD_RECOVERY_WINDOW // 60)} минут"
-                ),
-            )
-            return False
-
-        self.telegram_cooldown_until = max(
-            self.telegram_cooldown_until,
-            time.monotonic() + decision.pause_seconds,
-        )
-        self.mark_progress("безопасная пауза после FLOOD_WAIT")
-        reason = (
-            f"Telegram FLOOD_WAIT на {decision.server_wait_seconds} сек. "
-            f"при действии: {action}; безопасная пауза "
-            f"{decision.pause_seconds:.0f} сек."
-        )
-        await self.storage.add_event(
-            "TELEGRAM_FLOOD_WAIT_PAUSE",
-            reason,
-            level="WARNING",
-            payload={
-                "seconds": decision.server_wait_seconds,
-                "pause_seconds": decision.pause_seconds,
-                "action": action,
-                "retry": retries_used + 1,
-            },
-        )
-        self.log(reason)
-        await self.notifier.send(
-            "⏳ <b>Telegram запросил короткую паузу</b>\n"
-            f"Ожидание Telegram: {decision.server_wait_seconds} сек.\n"
-            f"Безопасная пауза: {decision.pause_seconds:.0f} сек.\n"
-            f"Действие: {action}\n"
-            "После паузы будет выполнена одна автоматическая попытка."
-        )
-        await self.wait_for_telegram_cooldown()
-        return self.running
-
-    async def stop_for_flood_wait(
+    async def start_telegram_cooldown(
         self,
-        error: FloodWaitError,
-        action: str,
+        seconds: float,
         *,
-        detail: str | None = None,
+        reason: str,
+        action: str,
+        resume_mode: str,
+        event_type: str,
+        payload: dict[str, object] | None = None,
+        severe: bool = False,
     ) -> None:
-        seconds = max(1, int(error.seconds))
-        reason = f"Telegram FLOOD_WAIT на {seconds} сек. при действии: {action}"
-        if detail:
-            reason += f"; {detail}"
-        detail_line = f"Причина: {detail}.\n" if detail else ""
+        pause = max(1.0, seconds)
+        deadline = time.monotonic() + pause
+        until_utc = datetime.now(UTC) + timedelta(seconds=pause)
+        if deadline >= self.telegram_cooldown_until:
+            self.telegram_cooldown_until = deadline
+            self.telegram_cooldown_until_utc = until_utc
+            self.telegram_cooldown_reason = reason
+            self.telegram_cooldown_action = action
+        if resume_mode == "refresh":
+            self.telegram_cooldown_resume_mode = "refresh"
+
+        pacing = self.telegram_pacing.register_incident(severe=severe)
+        self.mark_progress(f"Telegram-пауза: {reason}")
+        persisted_until = self.telegram_cooldown_until_utc or until_utc
+        await self.storage.set_settings(
+            {
+                "telegram_cooldown_until": persisted_until.isoformat(),
+                "telegram_cooldown_reason": self.telegram_cooldown_reason,
+            }
+        )
+        event_payload = {
+            "pause_seconds": pause,
+            "action": action,
+            "pacing_factor": pacing.factor,
+            "telegram_actions": self.telegram_action_telemetry.snapshot(),
+            "queue_size": self.event_queue.qsize(),
+        }
+        if payload:
+            event_payload.update(payload)
         await self.storage.add_event(
-            "TELEGRAM_FLOOD_WAIT",
-            reason,
-            level="CRITICAL",
-            payload={"seconds": seconds, "action": action, "detail": detail},
+            event_type,
+            f"{reason}; пауза {pause:.0f} сек.; действие: {action}",
+            level="WARNING",
+            payload=event_payload,
         )
-        await self.notifier.send(
-            "⛔️ <b>Telegram ограничил действия</b>\n"
-            f"Ожидание: {seconds} сек.\n"
-            f"Действие: {action}\n"
-            f"{detail_line}"
-            "Фармер остановлен, дополнительных повторов не будет."
+        self.log(
+            f"{reason}. Исходящие действия приостановлены на {pause:.0f} сек.; "
+            f"темп x{pacing.factor:.2f}."
         )
-        await self.stop(reason)
+        should_notify = event_type != "TELEGRAM_LOCAL_RATE_PAUSE" or pause >= 10.0
+        if should_notify and not self.telegram_cooldown_notified:
+            await self.notifier.send(
+                "⏳ <b>Telegram-пауза</b>\n"
+                f"Причина: {reason}\n"
+                f"Пауза: {pause:.0f} сек.\n"
+                "Входящие сообщения продолжают обрабатываться локально."
+            )
+            self.telegram_cooldown_notified = True
+        if self.telegram_cooldown_task is None or self.telegram_cooldown_task.done():
+            self.telegram_cooldown_task = asyncio.create_task(
+                self.telegram_cooldown_loop(), name="telegram-cooldown"
+            )
+        self.telegram_cooldown_changed.set()
+
+    async def telegram_cooldown_loop(self) -> None:
+        try:
+            while self.running:
+                remaining = self.telegram_cooldown_remaining()
+                if remaining <= 0:
+                    break
+                self.telegram_cooldown_changed.clear()
+                try:
+                    await asyncio.wait_for(
+                        self.telegram_cooldown_changed.wait(),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            return
+        if not self.running:
+            return
+
+        resume_mode = self.telegram_cooldown_resume_mode
+        self.telegram_cooldown_until = 0.0
+        self.telegram_cooldown_until_utc = None
+        self.telegram_cooldown_reason = None
+        self.telegram_cooldown_action = None
+        self.telegram_cooldown_resume_mode = "reprocess"
+        self.telegram_cooldown_task = None
+        was_notified = self.telegram_cooldown_notified
+        self.telegram_cooldown_notified = False
+        await self.storage.delete_settings(
+            {"telegram_cooldown_until", "telegram_cooldown_reason"}
+        )
+        await self.storage.add_event(
+            "TELEGRAM_COOLDOWN_FINISHED",
+            "Telegram-пауза завершена; работа продолжена по последнему состоянию",
+        )
+        self.log("Telegram-пауза завершена. Перепроверяю последнее состояние.")
+        if was_notified:
+            await self.notifier.send(
+                "▶️ <b>Telegram-пауза завершена</b>\nФармер продолжает работу."
+            )
+
+        if resume_mode == "refresh" or self.latest_received_message is None:
+            await self.request_map_refresh(force=True)
+            return
+        self.enqueue_latest_for_reprocessing()
+
+    def enqueue_latest_for_reprocessing(self) -> None:
+        message = self.latest_received_message
+        if message is None:
+            return
+        if self.event_queue.full():
+            with suppress(asyncio.QueueEmpty):
+                self.event_queue.get_nowait()
+                self.event_queue.task_done()
+        with suppress(asyncio.QueueFull):
+            self.event_queue.put_nowait(message)
+
+    def flood_wait_pause(self, server_seconds: int) -> tuple[float, int]:
+        now = time.monotonic()
+        cutoff = now - TELEGRAM_FLOOD_INCIDENT_WINDOW
+        while self.telegram_flood_incidents and self.telegram_flood_incidents[0] <= cutoff:
+            self.telegram_flood_incidents.popleft()
+        self.telegram_flood_incidents.append(now)
+        count = len(self.telegram_flood_incidents)
+        repeated_backoff = (
+            0.0
+            if count == 1
+            else min(
+                TELEGRAM_FLOOD_BACKOFF_MAX,
+                TELEGRAM_FLOOD_BACKOFF_BASE * (2 ** (count - 2)),
+            )
+        )
+        return max(server_seconds + TELEGRAM_FLOOD_WAIT_BUFFER, repeated_backoff), count
+
+    async def pause_for_flood_wait(
+        self,
+        error: FloodWaitError,
+        action: str,
+        *,
+        resume_mode: str,
+    ) -> None:
+        server_seconds = max(1, int(error.seconds))
+        pause, incident_count = self.flood_wait_pause(server_seconds)
+        await self.start_telegram_cooldown(
+            pause,
+            reason=f"Telegram FLOOD_WAIT на {server_seconds} сек.",
+            action=action,
+            resume_mode=resume_mode,
+            event_type="TELEGRAM_FLOOD_WAIT",
+            payload={
+                "server_seconds": server_seconds,
+                "incident_count_10m": incident_count,
+            },
+            severe=server_seconds >= 60 or incident_count >= 3,
+        )
+
+    async def reserve_telegram_action_slot(self, action: str, *, resume_mode: str) -> bool:
+        """Reserves an outbound slot without blocking inbound parsing for long waits."""
+        limiter_delay = await self.telegram_action_limiter.reserve()
+        if 0.05 <= limiter_delay < 2.0:
+            await self.intentional_sleep(limiter_delay)
+            limiter_delay = await self.telegram_action_limiter.reserve()
+        if limiter_delay < 0.05:
+            return True
+        await self.start_telegram_cooldown(
+            limiter_delay,
+            reason="достигнут локальный бюджет Telegram-действий",
+            action=action,
+            resume_mode=resume_mode,
+            event_type="TELEGRAM_LOCAL_RATE_PAUSE",
+        )
+        return False
 
     async def press_button(
         self,
@@ -578,7 +731,14 @@ class Farmer:
         column: int,
         description: str,
     ) -> bool:
-        action_key = (*self.event_key(message), description)
+        if self.telegram_cooldown_remaining() > 0:
+            self.log(f"Действие отложено до завершения Telegram-паузы: {description}")
+            return False
+
+        # One semantic prompt may produce only one outgoing callback. The
+        # description is deliberately excluded: recalculating strategy must not
+        # allow a different button to be pressed for the same game turn.
+        action_key = self.event_key(message)
         if action_key in self.attempted_actions:
             reason = (
                 "игра не обновила состояние после inline-действия; "
@@ -587,76 +747,65 @@ class Farmer:
             await self.storage.add_event(
                 "REPEATED_TELEGRAM_ACTION_BLOCKED",
                 reason,
-                level="CRITICAL",
+                level="WARNING",
             )
-            await self.notifier.send(
-                "⛔️ <b>Повтор inline-действия заблокирован</b>\n"
-                "После предыдущего нажатия игра не прислала "
-                "новое состояние. Фармер остановлен вместо повторного запроса."
-            )
-            await self.stop(reason)
+            self.log(reason)
             return False
 
         self.attempted_actions.remember(action_key)
-        flood_retries = 0
+        if not await self.reserve_telegram_action_slot(
+            description, resume_mode="reprocess"
+        ):
+            self.attempted_actions.discard(action_key)
+            return False
 
-        while self.running:
-            await self.wait_for_telegram_cooldown()
-            limiter_delay = await self.telegram_action_limiter.acquire()
-            if limiter_delay >= 0.05:
-                self.log(
-                    f"Защитный лимит Telegram добавил "
-                    f"{limiter_delay:.1f} сек. перед действием."
-                )
+        if not self.running or not self.is_latest_message(message):
+            self.log(f"Отменено устаревшее действие: {description}")
+            return False
 
-            if not self.running or not self.is_latest_message(message):
-                self.log(f"Отменено устаревшее действие: {description}")
-                return False
-
-            try:
-                self.record_telegram_action("inline_callback")
-                await message.click(row, column)
-                self.callback_timeout_count = 0
-                return True
-            except FloodWaitError as error:
-                recovered = await self.recover_from_flood_wait(
-                    error,
-                    description,
-                    retries_used=flood_retries,
-                )
-                if not recovered:
-                    return False
-                flood_retries += 1
-            except RPCError as error:
-                if getattr(error, "message", "") != "BOT_RESPONSE_TIMEOUT":
-                    self.log(
-                        f"Telegram не выполнил нажатие «{description}»: "
-                        f"{type(error).__name__}: {error}"
-                    )
-                    return False
-
-                self.callback_timeout_count += 1
-                self.log(
-                    f"Telegram не получил ответ на inline-кнопку "
-                    f"«{description}» "
-                    f"({self.callback_timeout_count}/{MAX_CALLBACK_TIMEOUTS}): {error}"
-                )
-                if self.callback_timeout_count >= MAX_CALLBACK_TIMEOUTS:
-                    reason = "повторный BOT_RESPONSE_TIMEOUT; возможно ограничение inline-кнопок"
-                    await self.storage.add_event(
-                        "TELEGRAM_CALLBACK_TIMEOUT",
-                        reason,
-                        level="CRITICAL",
-                    )
-                    await self.notifier.send(
-                        "⛔️ <b>Не работают inline-кнопки</b>\n"
-                        "Telegram дважды подряд не получил ответ "
-                        "от игрового бота. Фармер остановлен без повторов."
-                    )
-                    await self.stop(reason)
-                return False
-
-        return False
+        try:
+            self.record_telegram_action("inline_callback")
+            await message.click(row, column)
+            self.callback_timeout_count = 0
+            return True
+        except FloodWaitError as error:
+            # Telegram rejected this RPC before the game could process it. It
+            # may be reconsidered after the cooldown, but only from the latest
+            # semantic prompt.
+            self.attempted_actions.discard(action_key)
+            await self.pause_for_flood_wait(
+                error,
+                description,
+                resume_mode="reprocess",
+            )
+            return False
+        except BotResponseTimeoutError:
+            # The callback may already have reached the game. Never repeat it
+            # blindly; wait and reconcile with one fresh state instead.
+            self.callback_timeout_count += 1
+            pause = min(
+                TELEGRAM_CALLBACK_TIMEOUT_MAX,
+                TELEGRAM_CALLBACK_TIMEOUT_BASE * (2 ** (self.callback_timeout_count - 1)),
+            )
+            await self.start_telegram_cooldown(
+                pause,
+                reason=(
+                    "BOT_RESPONSE_TIMEOUT: результат inline-действия неизвестен "
+                    f"({self.callback_timeout_count} подряд)"
+                ),
+                action=description,
+                resume_mode="refresh",
+                event_type="TELEGRAM_CALLBACK_TIMEOUT",
+                payload={"consecutive_timeouts": self.callback_timeout_count},
+                severe=self.callback_timeout_count >= 2,
+            )
+            return False
+        except RPCError as error:
+            self.log(
+                f"Telegram не выполнил нажатие «{description}»: "
+                f"{type(error).__name__}: {error}"
+            )
+            return False
 
     async def click_button(
         self,
@@ -670,6 +819,9 @@ class Farmer:
         urgent: bool = False,
         remaining_seconds: int | None = None,
     ) -> bool:
+        if self.telegram_cooldown_remaining() > 0:
+            self.log(f"Исходящее действие подавлено Telegram-паузой: {description}")
+            return False
         delay = self.action_delay(
             action_type,
             urgent=urgent,
@@ -1193,9 +1345,7 @@ class Farmer:
             await self.complete_cycle()
             return
 
-        if self.settings.values.activity_profile == ACTIVITY_PROFILE_FAST:
-            self.activity_break_planner.reset()
-        elif self.activity_break_planner.is_due(
+        if self.activity_break_planner.is_due(
             self.moves_in_cycle,
             moves_min=ACTIVITY_BREAK_MOVES_MIN,
             moves_max=ACTIVITY_BREAK_MOVES_MAX,
@@ -1206,8 +1356,7 @@ class Farmer:
             return
 
         if (
-            self.settings.values.activity_profile != ACTIVITY_PROFILE_FAST
-            and map_info.movement_finished
+            map_info.movement_finished
             and self.delay_model.should_take_long_pause(
                 self.settings.values.long_pause_chance
             )
@@ -1335,6 +1484,10 @@ class Farmer:
     ) -> None:
         self.state = BotState.COMBAT
         self.mark_progress("получен список целей навыка")
+
+        if self.telegram_cooldown_remaining() > 0:
+            self.log("Выбор боевой цели отложен до завершения Telegram-паузы.")
+            return
 
         if normalize(self.combat.pending_skill or "") == "лечение":
             enemy_name, enemy_position = select_combat_target(
@@ -1642,21 +1795,25 @@ class Farmer:
 
         await self.request_map_refresh()
 
-    async def request_map_refresh(self) -> bool:
-        if not self.event_queue.empty():
+    async def request_map_refresh(self, *, force: bool = False) -> bool:
+        if self.telegram_cooldown_remaining() > 0:
+            self.log("Запрос карты подавлен до завершения Telegram-паузы.")
+            return False
+        if not force and not self.event_queue.empty():
             self.log("Запрос карты не нужен: входящее состояние уже ждёт локального разбора.")
             return False
 
         # One semantic inbound state may cause several local recovery paths.
         # Only the first of them is allowed to reach Telegram.
         generation = self.inbound_generation
-        if not self.state_refresh_gate.reserve(generation):
+        if not force and not self.state_refresh_gate.reserve(generation):
             self.log("Повторный запрос карты для того же состояния подавлен.")
             return False
 
         message = self.latest_received_message
         if (
-            message is not None
+            not force
+            and message is not None
             and self.is_latest_message(message)
             and find_button(message, exact=LOOK_BUTTON) is not None
         ):
@@ -1667,36 +1824,27 @@ class Farmer:
                 description=LOOK_BUTTON,
             )
 
-        flood_retries = 0
-        while self.running:
-            await self.wait_for_telegram_cooldown()
-            limiter_delay = await self.telegram_action_limiter.acquire()
-            if limiter_delay >= 0.05:
-                self.log(
-                    f"Защитный лимит Telegram добавил "
-                    f"{limiter_delay:.1f} сек. перед запросом карты."
-                )
-            if not self.running or self.inbound_generation != generation:
-                self.log("Запрос карты отменён: уже получено новое состояние.")
-                return False
-            try:
-                self.record_telegram_action("map_message")
-                await self.client.send_message(
-                    self.game_bot,
-                    MAP_COMMAND,
-                )
-                return True
-            except FloodWaitError as error:
-                recovered = await self.recover_from_flood_wait(
-                    error,
-                    MAP_COMMAND,
-                    retries_used=flood_retries,
-                )
-                if not recovered:
-                    return False
-                flood_retries += 1
-
-        return False
+        if not await self.reserve_telegram_action_slot(
+            MAP_COMMAND, resume_mode="refresh"
+        ):
+            return False
+        if not self.running or (not force and self.inbound_generation != generation):
+            self.log("Запрос карты отменён: уже получено новое состояние.")
+            return False
+        try:
+            self.record_telegram_action("map_message")
+            await self.client.send_message(
+                self.game_bot,
+                MAP_COMMAND,
+            )
+            return True
+        except FloodWaitError as error:
+            await self.pause_for_flood_wait(
+                error,
+                MAP_COMMAND,
+                resume_mode="refresh",
+            )
+            return False
 
     async def recover_latest_state(
         self,
@@ -1781,6 +1929,9 @@ class Farmer:
                 BotState.WAITING_FOR_HEALTH,
                 BotState.RECOVERY,
             }:
+                continue
+
+            if self.telegram_cooldown_remaining() > 0:
                 continue
 
             # A deliberate safety delay is not a stalled game state. Starting
@@ -2138,6 +2289,7 @@ class Farmer:
             self.recovery_task,
             self.rest_task,
             self.activity_break_task,
+            getattr(self, "telegram_cooldown_task", None),
             self.progress_persist_task,
         ):
             if task and task is not asyncio.current_task():
@@ -2207,9 +2359,8 @@ class Farmer:
         logger.info("FoG Farmer запущен")
         logger.info("Telegram-сессия подключена")
         logger.info(
-            "Telegram-предохранитель: не более %s действий за %s сек., интервал не менее %.1f сек.",
-            TELEGRAM_ACTION_LIMIT,
-            int(TELEGRAM_ACTION_WINDOW),
+            "Telegram-предохранитель: окна %s; интервал не менее %.1f сек.; темп автоматический.",
+            TELEGRAM_ACTION_LIMITS,
             TELEGRAM_ACTION_MIN_INTERVAL,
         )
         logger.info("Персонаж: %s", CHARACTER_NAME)
@@ -2247,5 +2398,6 @@ class Farmer:
         self.worker_task = asyncio.create_task(self.event_worker())
         self.watchdog_task = asyncio.create_task(self.watchdog_loop())
 
+        await self.restore_telegram_cooldown()
         await self.process_latest_state()
         await self.client.run_until_disconnected()

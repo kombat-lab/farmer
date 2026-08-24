@@ -12,11 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from bot_states import SettingsInput
-from config import (
-    ACTIVITY_PROFILE_FAST,
-    ACTIVITY_PROFILE_NORMAL,
-    ADMIN_TELEGRAM_ID,
-)
+from config import ADMIN_TELEGRAM_ID
 from game_catalog import (
     LOCATION_CATALOG,
     LOCATION_NAMES,
@@ -55,7 +51,6 @@ CHARACTER_ROWS = [
     ["↩️ Настройки"],
 ]
 DELAYS_ROWS = [
-    ["☕ Обычный профиль", "⚡ Быстрый профиль"],
     ["Перемещение", "⚔️ Открытие нападения"],
     ["Выбор цели", "✨ Использование навыка"],
     ["☕ Короткая пауза", "Шанс короткой паузы"],
@@ -532,29 +527,6 @@ class ControlBot:
                 message,
                 settings_rich(self.settings),
                 "⏱ Настройки задержек",
-                DELAYS_ROWS,
-            )
-
-        @r.message(
-            StateFilter(None),
-            text_is("☕ Обычный профиль", "⚡ Быстрый профиль"),
-        )
-        async def activity_profile_handler(message: Message) -> None:
-            profile = (
-                ACTIVITY_PROFILE_FAST
-                if "Быстрый" in (message.text or "")
-                else ACTIVITY_PROFILE_NORMAL
-            )
-            await self.settings.set_activity_profile(profile)
-            description = (
-                "минимальные задержки, без длительных перерывов"
-                if profile == ACTIVITY_PROFILE_FAST
-                else "настроенные задержки и безопасные перерывы на пустой карте"
-            )
-            await self._send_rich(
-                message,
-                settings_rich(self.settings),
-                f"✅ Выбран профиль: {description}.",
                 DELAYS_ROWS,
             )
 

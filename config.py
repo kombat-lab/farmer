@@ -57,24 +57,14 @@ DEFAULT_LONG_PAUSE_MAX = 10.0
 DEFAULT_CYCLE_REST_MIN = 300.0
 DEFAULT_CYCLE_REST_MAX = 900.0
 
-ACTIVITY_PROFILE_NORMAL = "normal"
-ACTIVITY_PROFILE_FAST = "fast"
-DEFAULT_ACTIVITY_PROFILE = ACTIVITY_PROFILE_NORMAL
-
-# Профиль «Обычный» делает длительные перерывы только на пустой карте.
-# Условие срабатывает по первому из двух ограничений: перемещениям или
-# активному времени. Профиль «Быстрый» эти перерывы отключает.
+# Длительные перерывы выполняются только на пустой карте. Условие срабатывает
+# по первому из двух ограничений: перемещениям или активному времени.
 ACTIVITY_BREAK_MOVES_MIN = 25
 ACTIVITY_BREAK_MOVES_MAX = 40
 ACTIVITY_BREAK_WORK_MIN = 25 * 60.0
 ACTIVITY_BREAK_WORK_MAX = 45 * 60.0
 ACTIVITY_BREAK_DURATION_MIN = 4 * 60.0
 ACTIVITY_BREAK_DURATION_MAX = 8 * 60.0
-
-FAST_MOVE_DELAY = (0.4, 1.2)
-FAST_ATTACK_DELAY = (0.3, 0.8)
-FAST_TARGET_DELAY = (0.3, 0.8)
-FAST_SKILL_DELAY = (0.4, 1.2)
 
 WATCHDOG_CHECK_INTERVAL = 5
 MOVE_PROGRESS_TIMEOUT = 30
@@ -90,20 +80,31 @@ MIN_HP_AFTER_DEATH = 250
 
 # Независимый от пользовательских задержек предохранитель. Он охватывает
 # inline-кнопки и текстовые команды игровому боту одним общим бюджетом.
+# Лимиты являются локальной политикой Farmer, а не заявленными лимитами
+# Telegram. Длинное окно не позволяет накопить слишком плотную серию запросов.
 TELEGRAM_ACTION_MIN_INTERVAL = 1.0
-TELEGRAM_ACTION_LIMIT = 20
-TELEGRAM_ACTION_WINDOW = 60.0
+TELEGRAM_ACTION_LIMITS = ((12, 60.0), (70, 600.0))
 TELEGRAM_RECOVERY_LIMIT = 3
 TELEGRAM_RECOVERY_WINDOW = 10 * 60.0
 
-# A short server cooldown is recoverable once per action. Repeated cooldowns
-# remain bounded across the whole farmer session so external Telegram activity
-# cannot turn recovery into an endless retry loop.
-TELEGRAM_SHORT_FLOOD_WAIT_MAX = 10
+# Ограничение Telegram никогда не останавливает фармер. Серверное ожидание
+# дополняется запасом, а повторные инциденты увеличивают минимальную паузу.
 TELEGRAM_FLOOD_WAIT_BUFFER = 2.0
-TELEGRAM_FLOOD_ACTION_RETRIES = 1
-TELEGRAM_FLOOD_RECOVERY_LIMIT = 3
-TELEGRAM_FLOOD_RECOVERY_WINDOW = 10 * 60.0
+TELEGRAM_FLOOD_INCIDENT_WINDOW = 10 * 60.0
+TELEGRAM_FLOOD_BACKOFF_BASE = 15.0
+TELEGRAM_FLOOD_BACKOFF_MAX = 5 * 60.0
+TELEGRAM_CALLBACK_TIMEOUT_BASE = 30.0
+TELEGRAM_CALLBACK_TIMEOUT_MAX = 5 * 60.0
+
+# Автоматический темп плавно масштабирует пользовательские диапазоны.
+TELEGRAM_PACING_MIN_FACTOR = 0.90
+TELEGRAM_PACING_MAX_FACTOR = 1.50
+TELEGRAM_PACING_ADJUST_INTERVAL = 3 * 60.0
+TELEGRAM_PACING_ACCELERATION_LOCK = 30 * 60.0
+TELEGRAM_PACING_SOFT_1M = 9
+TELEGRAM_PACING_HARD_1M = 11
+TELEGRAM_PACING_SOFT_10M = 60
+TELEGRAM_PACING_HARD_10M = 66
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3

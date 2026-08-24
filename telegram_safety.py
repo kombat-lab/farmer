@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
@@ -12,38 +13,101 @@ Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 
 
-@dataclass(frozen=True, slots=True)
-class FloodWaitDecision:
-    retry: bool
-    server_wait_seconds: int
-    pause_seconds: float
+_COUNTDOWN_RE = re.compile(r"(?im)^\s*⏳\s*Осталось:\s*\d+\s*сек\.?\s*$")
 
 
-def decide_flood_wait(
-    seconds: int,
-    *,
-    retries_used: int,
-    short_wait_max: int,
-    safety_buffer: float,
-    max_retries: int,
-) -> FloodWaitDecision:
-    """Returns a bounded recovery decision for a Telegram FLOOD_WAIT."""
-    server_wait = max(1, int(seconds))
-    can_retry = server_wait <= short_wait_max and retries_used < max_retries
-    return FloodWaitDecision(
-        retry=can_retry,
-        server_wait_seconds=server_wait,
-        pause_seconds=server_wait + max(0.0, safety_buffer) if can_retry else 0.0,
-    )
+def semantic_message_text(text: str) -> str:
+    """Removes volatile countdowns without hiding meaningful game changes."""
+    return _COUNTDOWN_RE.sub("", text).strip()
 
 
 def message_state_key(message) -> tuple:
     """Semantic UI state, independent of a no-op Telegram edit timestamp."""
     return (
         message.id,
-        message.raw_text or "",
+        semantic_message_text(message.raw_text or ""),
         tuple(get_button_texts(message)),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PacingUpdate:
+    previous_factor: float
+    factor: float
+    pressure: str
+
+    @property
+    def changed(self) -> bool:
+        return abs(self.factor - self.previous_factor) >= 0.001
+
+
+class AdaptivePacingController:
+    """Smoothly scales configured delays using only locally observed pressure."""
+
+    def __init__(
+        self,
+        *,
+        minimum_factor: float,
+        maximum_factor: float,
+        adjust_interval: float,
+        acceleration_lock: float,
+        soft_1m: int,
+        hard_1m: int,
+        soft_10m: int,
+        hard_10m: int,
+        clock: Clock = time.monotonic,
+    ) -> None:
+        if not 0 < minimum_factor <= 1.0 <= maximum_factor:
+            raise ValueError("Некорректные границы автоматического темпа")
+        self.minimum_factor = minimum_factor
+        self.maximum_factor = maximum_factor
+        self.adjust_interval = max(1.0, adjust_interval)
+        self.acceleration_lock = max(0.0, acceleration_lock)
+        self.soft_1m = soft_1m
+        self.hard_1m = hard_1m
+        self.soft_10m = soft_10m
+        self.hard_10m = hard_10m
+        self.clock = clock
+        self.factor = 1.0
+        self.last_adjusted_at = float("-inf")
+        self.acceleration_locked_until = 0.0
+        self.pressure = "normal"
+
+    def observe(self, last_minute: int, last_ten_minutes: int) -> PacingUpdate:
+        now = self.clock()
+        previous = self.factor
+        if last_minute >= self.hard_1m or last_ten_minutes >= self.hard_10m:
+            pressure = "high"
+            target = min(self.maximum_factor, self.factor + 0.10)
+        elif last_minute >= self.soft_1m or last_ten_minutes >= self.soft_10m:
+            pressure = "elevated"
+            target = min(self.maximum_factor, self.factor + 0.04)
+        else:
+            pressure = "normal"
+            target = max(self.minimum_factor, self.factor - 0.02)
+
+        self.pressure = pressure
+        if now - self.last_adjusted_at < self.adjust_interval:
+            return PacingUpdate(previous, self.factor, pressure)
+        if target < self.factor and now < self.acceleration_locked_until:
+            return PacingUpdate(previous, self.factor, pressure)
+
+        self.factor = target
+        self.last_adjusted_at = now
+        return PacingUpdate(previous, self.factor, pressure)
+
+    def register_incident(self, *, severe: bool = False) -> PacingUpdate:
+        now = self.clock()
+        previous = self.factor
+        floor = 1.35 if severe else 1.20
+        self.factor = min(self.maximum_factor, max(floor, self.factor + 0.15))
+        self.pressure = "cooldown"
+        self.last_adjusted_at = now
+        self.acceleration_locked_until = max(
+            self.acceleration_locked_until,
+            now + self.acceleration_lock,
+        )
+        return PacingUpdate(previous, self.factor, self.pressure)
 
 
 class StateRefreshGate:
@@ -123,16 +187,23 @@ class TelegramActionLimiter:
         self,
         *,
         min_interval: float,
-        max_actions: int,
-        window_seconds: float,
+        max_actions: int | None = None,
+        window_seconds: float | None = None,
+        limits: tuple[tuple[int, float], ...] | None = None,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
-        if min_interval < 0 or max_actions < 1 or window_seconds <= 0:
+        if limits is None:
+            if max_actions is None or window_seconds is None:
+                raise ValueError("Не задан лимит Telegram-действий")
+            limits = ((max_actions, window_seconds),)
+        if min_interval < 0 or not limits or any(
+            maximum < 1 or window <= 0 for maximum, window in limits
+        ):
             raise ValueError("Некорректные параметры ограничителя Telegram-действий")
         self.min_interval = min_interval
-        self.max_actions = max_actions
-        self.window_seconds = window_seconds
+        self.limits = tuple(sorted(limits, key=lambda item: item[1]))
+        self.retention_seconds = max(window for _, window in self.limits)
         self.clock = clock
         self.sleep = sleep
         self._timestamps: deque[float] = deque()
@@ -143,6 +214,32 @@ class TelegramActionLimiter:
     def pending(self) -> bool:
         return self._pending > 0
 
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.retention_seconds
+        while self._timestamps and self._timestamps[0] <= cutoff:
+            self._timestamps.popleft()
+
+    def _required_delay(self, now: float) -> float:
+        delay = 0.0
+        if self._timestamps:
+            delay = max(delay, self._timestamps[-1] + self.min_interval - now)
+        for maximum, window in self.limits:
+            window_cutoff = now - window
+            recent = [stamp for stamp in self._timestamps if stamp > window_cutoff]
+            if len(recent) >= maximum:
+                delay = max(delay, recent[0] + window - now)
+        return max(0.0, delay)
+
+    async def reserve(self) -> float:
+        """Reserves a slot or returns the wait required without sleeping."""
+        async with self._lock:
+            now = self.clock()
+            self._prune(now)
+            delay = self._required_delay(now)
+            if delay <= 0:
+                self._timestamps.append(now)
+            return delay
+
     async def acquire(self) -> float:
         """Waits for a safe slot and returns the total imposed delay."""
         self._pending += 1
@@ -151,15 +248,8 @@ class TelegramActionLimiter:
             async with self._lock:
                 while True:
                     now = self.clock()
-                    cutoff = now - self.window_seconds
-                    while self._timestamps and self._timestamps[0] <= cutoff:
-                        self._timestamps.popleft()
-
-                    delay = 0.0
-                    if self._timestamps:
-                        delay = max(delay, self._timestamps[-1] + self.min_interval - now)
-                    if len(self._timestamps) >= self.max_actions:
-                        delay = max(delay, self._timestamps[0] + self.window_seconds - now)
+                    self._prune(now)
+                    delay = self._required_delay(now)
 
                     if delay <= 0:
                         self._timestamps.append(now)

@@ -147,4 +147,6 @@ class FarmerSupervisor:
     async def status(self):
         state = await self.storage.get_state()
         state["task_running"] = self.is_running()
+        if self.farmer is not None:
+            state.update(self.farmer.telegram_safety_status())
         return state

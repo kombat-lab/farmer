@@ -175,6 +175,7 @@ class Farmer:
         self.pause_requested = False
         self.current_cycle = 1
         self.moves_in_cycle = 0
+        self.cycle_move_target = self.choose_cycle_move_target()
         self.rest_task: asyncio.Task | None = None
         self.activity_break_task: asyncio.Task | None = None
         self.progress_persist_task: asyncio.Task | None = None
@@ -208,6 +209,13 @@ class Farmer:
         self.telegram_action_telemetry = TelegramActionTelemetry()
 
         self.blessing = BlessingManager()
+
+    def choose_cycle_move_target(self) -> int:
+        values = self.settings.values
+        return random.randint(
+            values.moves_per_cycle_min,
+            values.moves_per_cycle_max,
+        )
 
     def log(self, text: str) -> None:
         logger.info("[%s] %s", self.state.name, text)
@@ -297,7 +305,7 @@ class Farmer:
             "current_cycle": self.current_cycle,
             "cycles_count": self.settings.values.cycles_count,
             "moves_in_cycle": self.moves_in_cycle,
-            "moves_per_cycle": self.settings.values.moves_per_cycle,
+            "moves_per_cycle": self.cycle_move_target,
             "pause_requested": int(
                 self.pause_requested if pause_requested is None else pause_requested
             ),
@@ -852,9 +860,13 @@ class Farmer:
                 self.rest_task = None
             self.current_cycle += 1
             self.moves_in_cycle = 0
+            self.cycle_move_target = self.choose_cycle_move_target()
             self.navigator.reset_coverage(self.context.current_position)
             self.activity_break_planner.reset()
-            action = f"передышка пропущена, начат цикл {self.current_cycle}"
+            action = (
+                f"передышка пропущена, начат цикл {self.current_cycle}; "
+                f"цель — {self.cycle_move_target} ходов"
+            )
         elif self.state is BotState.ACTIVITY_BREAK:
             if self.activity_break_task:
                 self.activity_break_task.cancel()
@@ -879,6 +891,7 @@ class Farmer:
             game_state="STARTING",
             current_cycle=self.current_cycle,
             moves_in_cycle=self.moves_in_cycle,
+            moves_per_cycle=self.cycle_move_target,
             pause_requested=0,
             rest_until=None,
             last_action=action,
@@ -902,10 +915,13 @@ class Farmer:
         self.mark_progress(f"передышка после цикла {self.current_cycle}: {int(rest_seconds)} сек.")
         await self.storage.add_event(
             "CYCLE_COMPLETED",
-            f"Завершён цикл {self.current_cycle} из {total}; передышка {int(rest_seconds)} сек.",
+            f"Завершён цикл {self.current_cycle} из {total}: "
+            f"{self.moves_in_cycle} перемещений при цели {self.cycle_move_target}; "
+            f"передышка {int(rest_seconds)} сек.",
         )
         await self.notifier.send(
             f"😴 Завершён цикл {self.current_cycle} из {total}\n"
+            f"Перемещений: {self.moves_in_cycle}\n"
             f"Передышка: {int(rest_seconds // 60)} мин. {int(rest_seconds % 60)} сек."
         )
         self.rest_task = asyncio.create_task(self.rest_between_cycles(rest_seconds))
@@ -966,16 +982,22 @@ class Farmer:
             return
         self.current_cycle += 1
         self.moves_in_cycle = 0
+        self.cycle_move_target = self.choose_cycle_move_target()
         self.navigator.reset_coverage(self.context.current_position)
         self.activity_break_planner.reset()
         self.state = BotState.STARTING
-        self.mark_progress(f"начат цикл {self.current_cycle}")
+        self.mark_progress(
+            f"начат цикл {self.current_cycle}; цель — {self.cycle_move_target} ходов"
+        )
         await self.storage.add_event(
             "CYCLE_STARTED",
-            f"Начат цикл {self.current_cycle} из {self.settings.values.cycles_count}",
+            f"Начат цикл {self.current_cycle} из {self.settings.values.cycles_count}; "
+            f"цель — {self.cycle_move_target} ходов",
         )
         await self.notifier.send(
-            f"▶️ <b>Начат цикл {self.current_cycle} из {self.settings.values.cycles_count}</b>"
+            f"▶️ <b>Начат цикл {self.current_cycle} "
+            f"из {self.settings.values.cycles_count}</b>\n"
+            f"Ходов в этом цикле: {self.cycle_move_target}"
         )
         await self.process_latest_state()
 
@@ -1165,8 +1187,8 @@ class Farmer:
             return
 
         if (
-            self.moves_in_cycle >= self.settings.values.moves_per_cycle
-            and self.navigator.cycle_can_finish(self.settings.values.moves_per_cycle)
+            self.moves_in_cycle >= self.cycle_move_target
+            and self.navigator.cycle_can_finish()
         ):
             await self.complete_cycle()
             return
@@ -2159,17 +2181,21 @@ class Farmer:
             )
         self.session_id = await self.storage.start_session(
             cycles_count=self.settings.values.cycles_count,
-            moves_per_cycle=self.settings.values.moves_per_cycle,
+            moves_per_cycle=self.cycle_move_target,
         )
         await self.storage.add_event(
             "FARMER_STARTED",
             f"Фармер запущен: {self.settings.values.cycles_count} цикл(а), "
-            f"по {self.settings.values.moves_per_cycle} ходов",
+            f"диапазон {self.settings.values.moves_per_cycle_min}–"
+            f"{self.settings.values.moves_per_cycle_max} ходов; "
+            f"первый цикл — {self.cycle_move_target}",
         )
         await self.notifier.send(
             "▶️ Фармер запущен\n"
             f"Циклов: {self.settings.values.cycles_count}\n"
-            f"Ходов в цикле: {self.settings.values.moves_per_cycle}"
+            f"Диапазон ходов: {self.settings.values.moves_per_cycle_min}–"
+            f"{self.settings.values.moves_per_cycle_max}\n"
+            f"Первый цикл: {self.cycle_move_target} ходов"
         )
 
         await self.client.start()
@@ -2187,6 +2213,12 @@ class Farmer:
             TELEGRAM_ACTION_MIN_INTERVAL,
         )
         logger.info("Персонаж: %s", CHARACTER_NAME)
+        logger.info(
+            "Ходы в цикле: диапазон %s–%s; текущая цель — %s.",
+            self.settings.values.moves_per_cycle_min,
+            self.settings.values.moves_per_cycle_max,
+            self.cycle_move_target,
+        )
         logger.info("Цели: %s", self.settings.values.enabled_targets)
         logger.info(
             "Watchdog: движение %s сек., бой %s сек.",

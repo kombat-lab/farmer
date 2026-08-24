@@ -303,12 +303,11 @@ class SnakeNavigator:
         position = current_position or self.start
         self.visited_positions = {position} if position in self.position_to_indices else set()
 
-    def cycle_can_finish(self, move_limit: int) -> bool:
-        """Extends a 9x9 sweep past its nominal 80 moves until every cell is seen."""
+    def cycle_can_finish(self) -> bool:
+        """Не завершает обычную карту 9x9 до покрытия всех её клеток."""
         requires_full_coverage = (
             not self.obstacle_mode
-            and self.coverage_total > 0
-            and self.coverage_total <= move_limit + 1
+            and self.coverage_total == 81
         )
         return not requires_full_coverage or self.coverage_count >= self.coverage_total
 

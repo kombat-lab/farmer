@@ -30,6 +30,8 @@ from config import (
     ACTIVITY_PROFILE_NORMAL,
     DEFAULT_BATTLE_START_HP_PERCENT,
     DEFAULT_HEAL_THRESHOLD,
+    DEFAULT_MOVES_PER_CYCLE_MAX,
+    DEFAULT_MOVES_PER_CYCLE_MIN,
 )
 from event_cache import BoundedKeyCache
 from farmer import Farmer
@@ -1270,6 +1272,17 @@ class ModelTests(unittest.TestCase):
         first.combat_enemies.append("Черная мушка")
         self.assertEqual(second.combat_enemies, [])
 
+    def test_cycle_move_target_uses_configured_range(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.settings = SimpleNamespace(
+            values=SimpleNamespace(
+                moves_per_cycle_min=97,
+                moves_per_cycle_max=97,
+            )
+        )
+
+        self.assertEqual(farmer.choose_cycle_move_target(), 97)
+
 
 class MovementRecoveryTests(unittest.TestCase):
     def test_9x9_sweep_from_mid_map_reaches_every_cell(self) -> None:
@@ -1285,7 +1298,7 @@ class MovementRecoveryTests(unittest.TestCase):
                 position = start
                 moves = 0
 
-                while not navigator.cycle_can_finish(80):
+                while not navigator.cycle_can_finish():
                     plan = navigator.plan(position)
                     position = plan.destination
                     navigator.confirm_success(plan, position)
@@ -1305,7 +1318,7 @@ class MovementRecoveryTests(unittest.TestCase):
             height=12,
         )
 
-        self.assertTrue(navigator.cycle_can_finish(80))
+        self.assertTrue(navigator.cycle_can_finish())
 
     def test_unsent_plan_does_not_poison_next_button_choice(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
@@ -1999,6 +2012,53 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(storage.connection.total_changes, changes_after_first_load)
             await storage.close()
 
+    async def test_legacy_move_count_becomes_configurable_range(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.set_setting("moves_per_cycle", 100)
+            settings = SettingsService(storage)
+
+            await settings.load()
+
+            self.assertEqual(settings.values.moves_per_cycle_min, 80)
+            self.assertEqual(settings.values.moves_per_cycle_max, 120)
+            stored = await storage.get_settings()
+            self.assertNotIn("moves_per_cycle", stored)
+            self.assertEqual(stored["moves_per_cycle_min"], 80)
+            self.assertEqual(stored["moves_per_cycle_max"], 120)
+            await storage.close()
+
+    async def test_move_range_is_validated_and_persisted(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            storage = Storage(path)
+            settings = SettingsService(storage)
+            await settings.load()
+
+            self.assertEqual(
+                (
+                    settings.values.moves_per_cycle_min,
+                    settings.values.moves_per_cycle_max,
+                ),
+                (DEFAULT_MOVES_PER_CYCLE_MIN, DEFAULT_MOVES_PER_CYCLE_MAX),
+            )
+            self.assertEqual(settings.parse_moves_range("91–127"), (91, 127))
+            self.assertEqual(settings.parse_moves_range("91 127"), (91, 127))
+            with self.assertRaises(ValueError):
+                settings.parse_moves_range("127 91")
+            with self.assertRaises(ValueError):
+                settings.parse_moves_range("-1 127")
+
+            await settings.set_moves_range(91, 127)
+            await storage.close()
+
+            reopened = Storage(path)
+            loaded = SettingsService(reopened)
+            await loaded.load()
+            self.assertEqual(loaded.values.moves_per_cycle_min, 91)
+            self.assertEqual(loaded.values.moves_per_cycle_max, 127)
+            await reopened.close()
+
     async def test_runtime_control_setting_is_not_removed_by_ui_settings(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
@@ -2396,10 +2456,11 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 move_count=89,
             )
             farmer.moves_in_cycle = 80
+            farmer.cycle_move_target = 80
             farmer.current_cycle = 1
             farmer.session_id = session_id
             farmer.settings = SimpleNamespace(
-                values=SimpleNamespace(moves_per_cycle=80, cycles_count=1)
+                values=SimpleNamespace(cycles_count=1)
             )
             farmer.statistics = FarmStatistics()
             farmer.storage = storage

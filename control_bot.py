@@ -42,7 +42,7 @@ INFO_ROWS = [
     ["⚙️ Настройки"],
 ]
 SETTINGS_ROWS = [
-    ["Количество циклов", "Ходов в цикле"],
+    ["Количество циклов", "Диапазон ходов"],
     ["Выбор мобов", "❤️ Персонаж"],
     ["⏱ Задержки"],
     ["📋 Журнал"],
@@ -364,12 +364,13 @@ class ControlBot:
             await state.clear()
             await self._send_text(message, f"✅ Количество циклов: {value}", SETTINGS_ROWS)
 
-        @r.message(StateFilter(None), text_is("Ходов в цикле"))
+        @r.message(StateFilter(None), text_is("Диапазон ходов", "Ходов в цикле"))
         async def moves_prompt(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsInput.moves_per_cycle)
             await self._send_text(
                 message,
-                "Отправьте количество подтверждённых перемещений.",
+                "Отправьте минимальное и максимальное количество перемещений.\n"
+                "Например: 80 120 или 80–120.",
                 [[CANCEL_BUTTON]],
             )
 
@@ -380,17 +381,21 @@ class ControlBot:
                 await self._send_text(message, "Ввод отменён.", SETTINGS_ROWS)
                 return
             try:
-                value = int(message.text or "")
-                if value < 1:
-                    raise ValueError
+                minimum, maximum = self.settings.parse_moves_range(message.text or "")
             except ValueError:
                 await self._send_text(
-                    message, "Введите целое число больше нуля.", [[CANCEL_BUTTON]]
+                    message,
+                    "Введите два целых числа: минимум и максимум. Например: 80 120.",
+                    [[CANCEL_BUTTON]],
                 )
                 return
-            await self.settings.set_value("moves_per_cycle", value)
+            await self.settings.set_moves_range(minimum, maximum)
             await state.clear()
-            await self._send_text(message, f"✅ Ходов в цикле: {value}", SETTINGS_ROWS)
+            await self._send_text(
+                message,
+                f"✅ Диапазон ходов в цикле: {minimum}–{maximum}",
+                SETTINGS_ROWS,
+            )
 
         @r.message(StateFilter(None), text_is("❤️ Персонаж"))
         async def character_settings_handler(message: Message) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -19,7 +20,8 @@ from config import (
     DEFAULT_LONG_PAUSE_MIN,
     DEFAULT_MOVE_DELAY_MAX,
     DEFAULT_MOVE_DELAY_MIN,
-    DEFAULT_MOVES_PER_CYCLE,
+    DEFAULT_MOVES_PER_CYCLE_MAX,
+    DEFAULT_MOVES_PER_CYCLE_MIN,
     DEFAULT_SKILL_DELAY_MAX,
     DEFAULT_SKILL_DELAY_MIN,
     DEFAULT_TARGET_DELAY_MAX,
@@ -34,7 +36,8 @@ NON_UI_SETTING_KEYS = frozenset({"farmer_stop_requested"})
 @dataclass
 class FarmerSettings:
     cycles_count: int = DEFAULT_CYCLES_COUNT
-    moves_per_cycle: int = DEFAULT_MOVES_PER_CYCLE
+    moves_per_cycle_min: int = DEFAULT_MOVES_PER_CYCLE_MIN
+    moves_per_cycle_max: int = DEFAULT_MOVES_PER_CYCLE_MAX
     activity_profile: str = DEFAULT_ACTIVITY_PROFILE
 
     enabled_targets: list[str] = field(default_factory=lambda: list(ALL_MONSTER_NAMES))
@@ -76,9 +79,12 @@ class SettingsService:
             if hasattr(self.values, key):
                 setattr(self.values, key, value)
 
+        self._upgrade_legacy_moves_setting(stored)
+
         self._normalize_enabled_targets()
         self._normalize_treatment_enemy_targets()
         self._normalize_character()
+        self._normalize_moves_range()
         self._normalize_activity_profile()
         self.values.blessing_enabled = self._normalize_bool(
             self.values.blessing_enabled,
@@ -96,6 +102,17 @@ class SettingsService:
 
         setattr(self.values, key, value)
         await self.storage.set_setting(key, value)
+
+    async def set_moves_range(self, minimum: int, maximum: int) -> None:
+        self.validate_moves_range(minimum, maximum)
+        self.values.moves_per_cycle_min = minimum
+        self.values.moves_per_cycle_max = maximum
+        await self.storage.set_settings(
+            {
+                "moves_per_cycle_min": minimum,
+                "moves_per_cycle_max": maximum,
+            }
+        )
 
     async def toggle_blessing(self) -> bool:
         enabled = not self.values.blessing_enabled
@@ -242,6 +259,31 @@ class SettingsService:
             battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
         self.values.battle_start_hp_percent = battle_start_hp
 
+    def _upgrade_legacy_moves_setting(self, stored: dict[str, Any]) -> None:
+        if (
+            "moves_per_cycle_min" in stored
+            or "moves_per_cycle_max" in stored
+            or "moves_per_cycle" not in stored
+        ):
+            return
+        try:
+            previous = max(1, int(stored["moves_per_cycle"]))
+        except (TypeError, ValueError):
+            previous = 100
+        self.values.moves_per_cycle_min = max(1, previous - 20)
+        self.values.moves_per_cycle_max = previous + 20
+
+    def _normalize_moves_range(self) -> None:
+        try:
+            minimum = int(self.values.moves_per_cycle_min)
+            maximum = int(self.values.moves_per_cycle_max)
+            self.validate_moves_range(minimum, maximum)
+        except (TypeError, ValueError):
+            minimum = DEFAULT_MOVES_PER_CYCLE_MIN
+            maximum = DEFAULT_MOVES_PER_CYCLE_MAX
+        self.values.moves_per_cycle_min = minimum
+        self.values.moves_per_cycle_max = maximum
+
     def _normalize_activity_profile(self) -> None:
         profile = str(self.values.activity_profile).strip().casefold()
         if profile not in {ACTIVITY_PROFILE_NORMAL, ACTIVITY_PROFILE_FAST}:
@@ -266,6 +308,23 @@ class SettingsService:
     def validate_character_value(value: int) -> None:
         if value < 1:
             raise ValueError("Значение должно быть больше нуля.")
+
+    @staticmethod
+    def validate_moves_range(minimum: int, maximum: int) -> None:
+        if minimum < 1 or maximum < minimum:
+            raise ValueError("Минимум должен быть больше нуля, максимум — не меньше минимума.")
+
+    @classmethod
+    def parse_moves_range(cls, value: str) -> tuple[int, int]:
+        match = re.fullmatch(
+            r"\s*(\d+)\s*(?:[-–—:;]|\s+)\s*(\d+)\s*",
+            value,
+        )
+        if match is None:
+            raise ValueError("Нужно указать минимум и максимум.")
+        minimum, maximum = map(int, match.groups())
+        cls.validate_moves_range(minimum, maximum)
+        return minimum, maximum
 
     @staticmethod
     def validate_range(minimum: float, maximum: float) -> None:

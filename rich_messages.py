@@ -210,7 +210,7 @@ def settings_rich(settings: SettingsService) -> str:
     body = rich_table(
         [
             ("Количество циклов", s.cycles_count),
-            ("Ходов в цикле", s.moves_per_cycle),
+            ("Ходов в цикле", f"{s.moves_per_cycle_min}–{s.moves_per_cycle_max}"),
             ("Профиль активности", profile_name),
             ("Порог лечения", s.heal_threshold),
             ("HP перед новым боем", f"{s.battle_start_hp_percent}%"),

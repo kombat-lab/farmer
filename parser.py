@@ -35,6 +35,11 @@ SIZE_RE = re.compile(
 )
 
 
+def is_passive_health_notification(text: str) -> bool:
+    """Уведомление обновляет HP, но не заменяет сообщение с игровыми кнопками."""
+    return HEALTH_RESTORED_RE.search(text) is not None
+
+
 def normalize(value: str) -> str:
     """
     Нормализует текст для сравнений.

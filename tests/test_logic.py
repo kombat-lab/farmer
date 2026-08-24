@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import sqlite3
 import unittest
@@ -36,7 +37,12 @@ from game_catalog import ALL_MONSTER_NAMES, get_location, get_monster_names
 from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
 from models import ActionType, BotState, RuntimeContext
 from navigator import SnakeNavigator
-from parser import classify_message, extract_player_hp, parse_map
+from parser import (
+    classify_message,
+    extract_player_hp,
+    is_passive_health_notification,
+    parse_map,
+)
 from rewards import BattleReward, parse_item_stack
 from settings_service import SettingsService
 from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_button
@@ -83,6 +89,18 @@ class ParserTests(unittest.TestCase):
                 CHARACTER,
             ),
             (554, 780),
+        )
+
+    def test_health_recovery_notification_is_passive_ui_state(self) -> None:
+        self.assertTrue(
+            is_passive_health_notification(
+                "❤️ Ваше здоровье полностью восстановлено: 755/755."
+            )
+        )
+        self.assertFalse(
+            is_passive_health_notification(
+                "⚔️ Раунд 3\nKombat восстанавливает 40 HP · renew"
+            )
         )
         self.assertEqual(
             extract_player_hp(
@@ -635,6 +653,85 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertFalse(plan.as_payload()["has_safe_candidate"])
         self.assertIn("безопасного плана", plan.format_log())
 
+    def test_shadow_planner_does_not_spend_mana_without_tempo_gain(self) -> None:
+        memory = CombatMemory(
+            target_name="Крапива-жгучка",
+            enemy_current_hp=165,
+            enemy_max_hp=165,
+        )
+        for value in (21, 22, 23, 24):
+            memory.incoming_damage.add(value)
+        for value in (55, 57):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        for value in (85, 88):
+            memory.outgoing_damage.setdefault(
+                "святое свечение", ObservedRange()
+            ).add(value)
+        message = FakeMessage(
+            "🔷 Мана: 12/12",
+            [["Святое свечение [Мана 3]"], ["Атака аколита"]],
+        )
+
+        plan = build_shadow_plan(
+            message,
+            memory=memory,
+            current_hp=700,
+            max_hp=755,
+            executed=CombatDecision(
+                "атака аколита", SkillTarget.ENEMY, "экономия маны"
+            ),
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan.confident)
+        self.assertTrue(plan.agrees)
+        holy = next(
+            candidate
+            for candidate in plan.candidates
+            if candidate.skill_name == "святое свечение"
+        )
+        self.assertTrue(holy.mana_dominated)
+
+    def test_shadow_planner_spends_mana_when_it_prevents_an_enemy_hit(self) -> None:
+        memory = CombatMemory(
+            target_name="Крапива-жгучка",
+            enemy_current_hp=140,
+            enemy_max_hp=165,
+        )
+        for value in (21, 22, 23, 24):
+            memory.incoming_damage.add(value)
+        for value in (55, 57):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        for value in (85, 88):
+            memory.outgoing_damage.setdefault(
+                "святое свечение", ObservedRange()
+            ).add(value)
+        message = FakeMessage(
+            "🔷 Мана: 12/12",
+            [["Святое свечение [Мана 3]"], ["Атака аколита"]],
+        )
+
+        plan = build_shadow_plan(
+            message,
+            memory=memory,
+            current_hp=700,
+            max_hp=755,
+            executed=CombatDecision(
+                "атака аколита", SkillTarget.ENEMY, "старое решение"
+            ),
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan.confident)
+        self.assertEqual(plan.recommendation.skill_name, "святое свечение")
+        self.assertFalse(plan.candidates[0].mana_dominated)
+
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
         memory.begin("Фонарщик", "Вы напали:\nФонарщик\n1025❤️ из 1025❤️")
@@ -1175,6 +1272,51 @@ class ModelTests(unittest.TestCase):
 
 
 class MovementRecoveryTests(unittest.TestCase):
+    def test_9x9_sweep_from_mid_map_reaches_every_cell(self) -> None:
+        for start in ((0, 0), (0, 1), (0, 4), (2, 1), (4, 4), (8, 8)):
+            with self.subTest(start=start):
+                navigator = SnakeNavigator(0, 8, 0, 8)
+                navigator.use_location(
+                    "Поляна",
+                    current_position=start,
+                    width=9,
+                    height=9,
+                )
+                position = start
+                moves = 0
+
+                while not navigator.cycle_can_finish(80):
+                    plan = navigator.plan(position)
+                    position = plan.destination
+                    navigator.confirm_success(plan, position)
+                    moves += 1
+                    self.assertLessEqual(moves, 100)
+
+                self.assertEqual(navigator.coverage_count, 81)
+                self.assertEqual(navigator.coverage_total, 81)
+                self.assertEqual({y for _, y in navigator.visited_positions}, set(range(9)))
+
+    def test_large_map_keeps_configured_move_limit(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            "Выжженное поле",
+            current_position=(0, 0),
+            width=12,
+            height=12,
+        )
+
+        self.assertTrue(navigator.cycle_can_finish(80))
+
+    def test_unsent_plan_does_not_poison_next_button_choice(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        first = navigator.plan((2, 1))
+
+        self.assertTrue(navigator.cancel_last_plan(first))
+        second = navigator.plan((2, 1))
+
+        self.assertEqual(second.destination, first.destination)
+        self.assertEqual(second.button, first.button)
+
     def test_obstacle_route_leaves_top_left_entrance_down_right_first(self) -> None:
         navigator = SnakeNavigator(0, 8, 0, 8)
         navigator.use_location(
@@ -1315,6 +1457,33 @@ class MovementRecoveryTests(unittest.TestCase):
 
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_passive_health_notice_does_not_cancel_map_action(self) -> None:
+        map_message = FakeMessage(
+            "🗺️ Поляна\nПозиция: (2, 1)\nМонстры на клетке: 0",
+            [["➡️"]],
+            message_id=10,
+        )
+        health_message = FakeMessage(
+            "❤️ Ваше здоровье полностью восстановлено: 755/755.",
+            [],
+            message_id=11,
+        )
+        farmer = Farmer.__new__(Farmer)
+        farmer.running = True
+        farmer.latest_messages = {}
+        farmer.latest_received_message = None
+        farmer.processed_events = BoundedKeyCache()
+        farmer.inbound_generation = 0
+        farmer.event_queue = asyncio.Queue()
+
+        await farmer.enqueue_message(map_message)
+        await farmer.enqueue_message(health_message)
+
+        self.assertIs(farmer.latest_received_message, map_message)
+        self.assertTrue(farmer.is_latest_message(map_message))
+        self.assertEqual(farmer.inbound_generation, 1)
+        self.assertEqual(farmer.event_queue.qsize(), 2)
+
     async def test_inline_action_retries_once_after_recoverable_flood_wait(self) -> None:
         message = FakeMessage("Выберите цель", [["Kombat"]])
         click_count = 0

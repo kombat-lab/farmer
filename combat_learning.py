@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from combat_round import CombatRoundState
@@ -10,6 +10,7 @@ from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills
 
 SHADOW_HORIZON = 3
+SHADOW_PLAN_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -225,22 +226,26 @@ def battle_learning_summary(
 class ActionProjection:
     skill_name: str
     target: SkillTarget
+    mana_cost: int
     score: float
     projected_player_hp: int | None
     projected_enemy_hp: int | None
     expected_enemy_hits: int | None
     unsafe: bool
+    mana_dominated: bool
     reason: str
 
     def as_payload(self) -> dict[str, Any]:
         return {
             "skill_name": self.skill_name,
             "target": self.target.value,
+            "mana_cost": self.mana_cost,
             "score": round(self.score, 2),
             "projected_player_hp": self.projected_player_hp,
             "projected_enemy_hp": self.projected_enemy_hp,
             "expected_enemy_hits": self.expected_enemy_hits,
             "unsafe": self.unsafe,
+            "mana_dominated": self.mana_dominated,
             "reason": self.reason,
         }
 
@@ -267,7 +272,7 @@ class ShadowCombatPlan:
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": SHADOW_PLAN_VERSION,
             "horizon": self.horizon,
             "confident": self.confident,
             "has_safe_candidate": self.has_safe_candidate,
@@ -292,7 +297,9 @@ class ShadowCombatPlan:
             confidence = "достаточно данных" if self.confident else "данные ещё копятся"
         candidates = "; ".join(
             f"{candidate.skill_name}→{candidate.target.value}="
-            f"{candidate.score:.1f}{' опасно' if candidate.unsafe else ''}"
+            f"{candidate.score:.1f}"
+            f"{' опасно' if candidate.unsafe else ''}"
+            f"{' лишняя мана' if candidate.mana_dominated else ''}"
             for candidate in self.candidates
         )
         return (
@@ -473,11 +480,13 @@ def build_shadow_plan(
             ActionProjection(
                 skill_name=skill_name,
                 target=target,
+                mana_cost=skill.mana_cost,
                 score=score,
                 projected_player_hp=projected_hp,
                 projected_enemy_hp=remaining_enemy_hp,
                 expected_enemy_hits=expected_enemy_hits,
                 unsafe=unsafe,
+                mana_dominated=False,
                 reason=reason,
             )
         )
@@ -485,8 +494,41 @@ def build_shadow_plan(
     if not projections:
         return None
 
-    projections.sort(key=lambda item: (not item.unsafe, item.score), reverse=True)
-    safe_projections = [projection for projection in projections if not projection.unsafe]
+    def is_mana_dominated(candidate: ActionProjection) -> bool:
+        if (
+            candidate.target is not SkillTarget.ENEMY
+            or candidate.expected_enemy_hits is None
+        ):
+            return False
+        return any(
+            other is not candidate
+            and not other.unsafe
+            and other.target is SkillTarget.ENEMY
+            and other.expected_enemy_hits == candidate.expected_enemy_hits
+            and other.mana_cost < candidate.mana_cost
+            and (
+                other.projected_player_hp is None
+                or candidate.projected_player_hp is None
+                or other.projected_player_hp >= candidate.projected_player_hp
+            )
+            for other in projections
+        )
+
+    projections = [
+        replace(projection, mana_dominated=is_mana_dominated(projection))
+        for projection in projections
+    ]
+    projections.sort(
+        key=lambda item: (not item.unsafe, not item.mana_dominated, item.score),
+        reverse=True,
+    )
+    safe_projections = [
+        projection
+        for projection in projections
+        if not projection.unsafe and not projection.mana_dominated
+    ]
+    if not safe_projections:
+        safe_projections = [projection for projection in projections if not projection.unsafe]
     confident = incoming_samples >= 4 and all_effects_known and bool(safe_projections)
     best = safe_projections[0] if safe_projections else projections[0]
     recommendation = CombatDecision(

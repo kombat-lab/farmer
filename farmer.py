@@ -88,6 +88,7 @@ from parser import (
     classify_message,
     extract_combat_target,
     extract_player_hp,
+    is_passive_health_notification,
     normalize,
     parse_map,
 )
@@ -357,6 +358,13 @@ class Farmer:
             and self.event_key(latest_global) == self.event_key(message)
         )
 
+    def is_latest_revision(self, message) -> bool:
+        latest_for_id = self.latest_messages.get(message.id)
+        return (
+            latest_for_id is not None
+            and self.event_key(latest_for_id) == self.event_key(message)
+        )
+
     def remember_event(self, message) -> bool:
         return self.processed_events.remember(self.event_key(message))
 
@@ -380,8 +388,9 @@ class Farmer:
             ):
                 self.latest_received_message = message
             return
-        self.latest_received_message = message
-        self.inbound_generation += 1
+        if not is_passive_health_notification(message.raw_text or ""):
+            self.latest_received_message = message
+            self.inbound_generation += 1
 
         try:
             self.event_queue.put_nowait(message)
@@ -396,7 +405,12 @@ class Farmer:
                 # While an older revision was waiting in the queue, Telethon
                 # may already have delivered a newer edit. Only the newest
                 # revision is allowed to make a decision or press a button.
-                if not self.is_latest_message(message):
+                if not self.is_latest_revision(message):
+                    continue
+                if (
+                    not is_passive_health_notification(message.raw_text or "")
+                    and not self.is_latest_message(message)
+                ):
                     continue
                 await self.handle_message(message)
             except asyncio.CancelledError:
@@ -838,6 +852,7 @@ class Farmer:
                 self.rest_task = None
             self.current_cycle += 1
             self.moves_in_cycle = 0
+            self.navigator.reset_coverage(self.context.current_position)
             self.activity_break_planner.reset()
             action = f"передышка пропущена, начат цикл {self.current_cycle}"
         elif self.state is BotState.ACTIVITY_BREAK:
@@ -951,6 +966,7 @@ class Farmer:
             return
         self.current_cycle += 1
         self.moves_in_cycle = 0
+        self.navigator.reset_coverage(self.context.current_position)
         self.activity_break_planner.reset()
         self.state = BotState.STARTING
         self.mark_progress(f"начат цикл {self.current_cycle}")
@@ -1148,7 +1164,10 @@ class Farmer:
                 self.mark_progress("открыт полный список целей")
             return
 
-        if self.moves_in_cycle >= self.settings.values.moves_per_cycle:
+        if (
+            self.moves_in_cycle >= self.settings.values.moves_per_cycle
+            and self.navigator.cycle_can_finish(self.settings.values.moves_per_cycle)
+        ):
             await self.complete_cycle()
             return
 
@@ -1190,6 +1209,8 @@ class Farmer:
             self.context.pending_move = plan
             self.state = BotState.MOVING
             self.mark_progress("команда перемещения отправлена")
+        else:
+            self.navigator.cancel_last_plan(plan)
 
     async def handle_target_selection(
         self,

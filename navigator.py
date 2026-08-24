@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable
 
 from models import MovePlan, Position, RouteDirection
@@ -9,10 +10,13 @@ class SnakeNavigator:
     """
     Навигатор по прямоугольной карте с препятствиями.
 
-    Для обычных локаций сохраняется прежняя змейка 9x9.
+    На обычных прямоугольных картах используется змейка с учётом уже
+    посещённых клеток. Если запуск произошёл в середине маршрута, навигатор
+    соединяет пройденный участок с ближайшей ещё не охваченной областью.
 
-    Для Мёртвого леса строится непрерывный DFS-маршрут, который посещает
-    все доступные клетки. Возвраты по уже посещённым клеткам допустимы.
+    Для карт с известными или изученными препятствиями строится непрерывный
+    DFS-маршрут по доступной области. Возвраты по уже посещённым клеткам
+    допустимы.
 
     Если игра оставляет персонажа на прежней координате, следующий вызов
     plan() автоматически пробует альтернативную кнопку перехода. Это
@@ -130,6 +134,7 @@ class SnakeNavigator:
             self.start,
             fallback=0,
         )
+        self.visited_positions: set[Position] = {self.start}
 
     def _inside(self, position: Position) -> bool:
         x, y = position
@@ -283,7 +288,29 @@ class SnakeNavigator:
         self.route = self._build_route()
         self.position_to_indices = self._index_route(self.route)
         self.route_index = self._nearest_index(position)
+        self.visited_positions = {position}
         return True
+
+    @property
+    def coverage_count(self) -> int:
+        return len(self.visited_positions.intersection(self.position_to_indices))
+
+    @property
+    def coverage_total(self) -> int:
+        return len(self.position_to_indices)
+
+    def reset_coverage(self, current_position: Position | None = None) -> None:
+        position = current_position or self.start
+        self.visited_positions = {position} if position in self.position_to_indices else set()
+
+    def cycle_can_finish(self, move_limit: int) -> bool:
+        """Extends a 9x9 sweep past its nominal 80 moves until every cell is seen."""
+        requires_full_coverage = (
+            not self.obstacle_mode
+            and self.coverage_total > 0
+            and self.coverage_total <= move_limit + 1
+        )
+        return not requires_full_coverage or self.coverage_count >= self.coverage_total
 
     def take_recovery_discarded_obstacles(self) -> set[Position]:
         discarded = set(self.recovery_discarded_obstacles)
@@ -421,12 +448,54 @@ class SnakeNavigator:
             destination,
         )
 
+    def _first_step_to_unvisited(
+        self,
+        origin: Position,
+        nominal_destination: Position,
+    ) -> Position:
+        """Finds the shortest connector from a completed route segment to new cells."""
+        unvisited = set(self.position_to_indices).difference(self.visited_positions)
+        if not unvisited or nominal_destination in unvisited:
+            return nominal_destination
+
+        parents: dict[Position, Position | None] = {origin: None}
+        queue: deque[Position] = deque((origin,))
+        target: Position | None = None
+
+        while queue:
+            current = queue.popleft()
+            if current in unvisited:
+                target = current
+                break
+
+            neighbors = list(self._neighbors(current))
+            if current == origin and nominal_destination in neighbors:
+                neighbors.remove(nominal_destination)
+                neighbors.insert(0, nominal_destination)
+            for neighbor in neighbors:
+                if neighbor in parents:
+                    continue
+                parents[neighbor] = current
+                queue.append(neighbor)
+
+        if target is None:
+            return nominal_destination
+
+        first_step = target
+        while parents[first_step] != origin:
+            parent = parents[first_step]
+            if parent is None:
+                return nominal_destination
+            first_step = parent
+        return first_step
+
     def plan(
         self,
         position: Position,
     ) -> MovePlan:
         self.ensure_position(position)
         self.validate_position(position)
+        self.visited_positions.add(position)
 
         # Если предыдущая попытка оставила нас на той же клетке, её кнопка
         # исключается и ниже выбирается следующий вариант.
@@ -450,6 +519,8 @@ class SnakeNavigator:
             destination_index = self.route_index - 1
 
         destination = self.route[destination_index]
+        if not self.obstacle_mode:
+            destination = self._first_step_to_unvisited(position, destination)
 
         plan = MovePlan(
             origin=position,
@@ -489,6 +560,7 @@ class SnakeNavigator:
 
         self.direction = plan.direction_after_success
         self.last_plan = None
+        self.visited_positions.add(actual_position)
 
         # После успешного выхода с клетки старые неудачные кнопки больше
         # не нужны и не должны влиять на следующий круг.
@@ -496,6 +568,13 @@ class SnakeNavigator:
             plan.origin,
             None,
         )
+
+    def cancel_last_plan(self, plan: MovePlan) -> bool:
+        """Forgets a plan whose Telegram action was never sent."""
+        if self.last_plan != plan:
+            return False
+        self.last_plan = None
+        return True
 
     def reject_last_plan(
         self,
@@ -542,6 +621,10 @@ class SnakeNavigator:
         self.position_to_indices = self._index_route(self.route)
         self.route_index = self._nearest_index(current_position)
         self.direction = old_direction
+        self.visited_positions = {
+            position for position in self.visited_positions if position in self.position_to_indices
+        }
+        self.visited_positions.add(current_position)
 
     def recover_from_actual_transition(
         self,
@@ -551,6 +634,9 @@ class SnakeNavigator:
         if previous not in self.position_to_indices or current not in self.position_to_indices:
             self.ensure_position(current)
             return current in self.position_to_indices
+
+        self.visited_positions.add(previous)
+        self.visited_positions.add(current)
 
         previous_indices = self.position_to_indices[previous]
         current_indices = self.position_to_indices[current]

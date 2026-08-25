@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from telethon.errors import BotResponseTimeoutError
 
@@ -1420,6 +1421,69 @@ class RichMessagePanelTests(unittest.TestCase):
         self.assertEqual(selected["disabled"], {})
         self.assertNotIn("callback_data", selected)
         self.assertTrue(prompt["force_reply"])
+
+    def test_aiogram_compatibility_layer_removes_unknown_rich_blocks(self) -> None:
+        from rich_messages import aiogram_compatible_rich_html
+
+        html = (
+            '<h2>Панель</h2><tg-button-row align="center">'
+            '<tg-button type="callback_data" data="ui:home">Домой</tg-button>'
+            "</tg-button-row><blockquote expandable>Диагностика</blockquote>"
+            "<table><tr><td>Данные</td></tr></table>"
+        )
+
+        compatible = aiogram_compatible_rich_html(html)
+
+        self.assertNotIn("tg-button", compatible)
+        self.assertNotIn("expandable", compatible)
+        self.assertIn("<blockquote>Диагностика</blockquote>", compatible)
+        self.assertIn("<table>", compatible)
+
+
+class RichMessageDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_moves_rich_buttons_to_inline_keyboard(self) -> None:
+        from rich_messages import send_rich_with_fallback
+
+        bot = SimpleNamespace(send_rich_message=AsyncMock())
+        markup = SimpleNamespace(name="inline")
+
+        await send_rich_with_fallback(
+            bot,
+            chat_id=42,
+            html=(
+                '<h2>Панель</h2><tg-button-row align="center">'
+                '<tg-button type="callback_data" data="ui:home">Домой</tg-button>'
+                "</tg-button-row>"
+            ),
+            fallback_text="Панель",
+            fallback_reply_markup=markup,
+        )
+
+        arguments = bot.send_rich_message.await_args.kwargs
+        self.assertNotIn("tg-button", arguments["rich_message"].html)
+        self.assertIs(arguments["reply_markup"], markup)
+
+    async def test_edit_sends_only_aiogram_compatible_rich_blocks(self) -> None:
+        from rich_messages import edit_rich_with_fallback
+
+        bot = SimpleNamespace(edit_message_text=AsyncMock())
+        markup = SimpleNamespace(name="inline")
+
+        await edit_rich_with_fallback(
+            bot,
+            chat_id=42,
+            message_id=7,
+            html="<blockquote expandable>Диагностика</blockquote>",
+            fallback_text="Диагностика",
+            fallback_reply_markup=markup,
+        )
+
+        arguments = bot.edit_message_text.await_args.kwargs
+        self.assertEqual(
+            arguments["rich_message"].html,
+            "<blockquote>Диагностика</blockquote>",
+        )
+        self.assertIs(arguments["reply_markup"], markup)
 
 
 class MovementRecoveryTests(unittest.TestCase):

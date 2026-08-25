@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Sequence
 from html import escape
 from typing import TYPE_CHECKING
@@ -21,9 +22,30 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fog_farmer")
 
+_RICH_BUTTON_ROW_RE = re.compile(
+    r"<tg-button-row\b[^>]*>.*?</tg-button-row>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_EXPANDABLE_BLOCKQUOTE_RE = re.compile(
+    r"<blockquote\s+expandable\s*>",
+    flags=re.IGNORECASE,
+)
+
 ReplyMarkup = (
     InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | ForceReply
 )
+
+
+def aiogram_compatible_rich_html(html: str) -> str:
+    """Убирает блоки Bot API 10.3, которых ещё нет в моделях aiogram.
+
+    Telegram уже принимает кнопки и раскрываемые цитаты, однако aiogram 3.30
+    падает при разборе успешного ответа с типами ``buttons`` и
+    ``expandable_blockquote``. Кнопки панели при этом передаются обычной inline-
+    клавиатурой, а раскрываемая цитата становится обычной.
+    """
+    html = _RICH_BUTTON_ROW_RE.sub("", html)
+    return _EXPANDABLE_BLOCKQUOTE_RE.sub("<blockquote>", html)
 
 
 def _e(value: object) -> str:
@@ -552,12 +574,21 @@ async def send_rich_with_fallback(
     fallback_reply_markup: ReplyMarkup | None = None,
     disable_notification: bool | None = None,
 ) -> Message:
-    """Отправляет RichMessage и откатывается на обычное сообщение при отказе API."""
+    """Отправляет совместимый RichMessage и откатывается при отказе API."""
+    compatible_html = aiogram_compatible_rich_html(html)
+    rich_reply_markup = (
+        fallback_reply_markup
+        if compatible_html != html and fallback_reply_markup is not None
+        else reply_markup
+    )
     try:
         return await bot.send_rich_message(
             chat_id=chat_id,
-            rich_message=InputRichMessage(html=html, skip_entity_detection=True),
-            reply_markup=reply_markup,
+            rich_message=InputRichMessage(
+                html=compatible_html,
+                skip_entity_detection=True,
+            ),
+            reply_markup=rich_reply_markup,
             disable_notification=disable_notification,
         )
     except (TelegramBadRequest, TelegramNetworkError) as error:
@@ -580,11 +611,16 @@ async def edit_rich_with_fallback(
     fallback_reply_markup: InlineKeyboardMarkup | None = None,
 ) -> Message | bool | None:
     """Редактирует существующую панель без создания нового сообщения."""
+    compatible_html = aiogram_compatible_rich_html(html)
     try:
         return await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            rich_message=InputRichMessage(html=html, skip_entity_detection=True),
+            rich_message=InputRichMessage(
+                html=compatible_html,
+                skip_entity_detection=True,
+            ),
+            reply_markup=fallback_reply_markup,
         )
     except TelegramBadRequest as error:
         if "message is not modified" in str(error).casefold():

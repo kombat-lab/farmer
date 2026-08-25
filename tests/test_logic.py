@@ -1871,7 +1871,6 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             farmer.telegram_cooldown_changed = asyncio.Event()
             farmer.telegram_action_limiter = TelegramActionLimiter(
                 min_interval=0.0,
-                limits=((10, 60.0),),
             )
             farmer.telegram_action_telemetry = TelegramActionTelemetry()
             farmer.telegram_pacing = AdaptivePacingController(
@@ -1879,10 +1878,6 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
                 maximum_factor=1.5,
                 adjust_interval=180.0,
                 acceleration_lock=1800.0,
-                soft_1m=9,
-                hard_1m=11,
-                soft_10m=60,
-                hard_10m=66,
             )
             farmer.event_queue = asyncio.Queue()
             farmer.callback_timeout_count = 0
@@ -1972,7 +1967,7 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         now = 601.0
         self.assertTrue(guard.allow())
 
-    async def test_action_limiter_serializes_and_caps_a_window(self) -> None:
+    async def test_action_limiter_only_spaces_neighboring_requests(self) -> None:
         now = 0.0
 
         def clock() -> float:
@@ -1984,30 +1979,33 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         limiter = TelegramActionLimiter(
             min_interval=1.0,
-            max_actions=2,
-            window_seconds=10.0,
             clock=clock,
             sleep=sleep,
         )
 
         self.assertEqual(await limiter.acquire(), 0.0)
         self.assertEqual(await limiter.acquire(), 1.0)
-        self.assertEqual(await limiter.acquire(), 9.0)
-        self.assertEqual(now, 10.0)
+        self.assertEqual(await limiter.acquire(), 1.0)
+        self.assertEqual(now, 2.0)
         self.assertFalse(limiter.pending)
 
-    async def test_action_limiter_enforces_accumulated_window_without_sleeping(self) -> None:
+    async def test_long_activity_never_creates_a_rolling_budget_pause(self) -> None:
         now = 0.0
-        limiter = TelegramActionLimiter(
-            min_interval=0.0,
-            limits=((10, 60.0), (4, 600.0)),
-            clock=lambda: now,
-        )
-        for _ in range(4):
-            self.assertEqual(await limiter.reserve(), 0.0)
-            now += 1.0
 
-        self.assertEqual(await limiter.reserve(), 596.0)
+        async def sleep(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        limiter = TelegramActionLimiter(
+            min_interval=1.0,
+            clock=lambda: now,
+            sleep=sleep,
+        )
+        waits = [await limiter.acquire() for _ in range(100)]
+
+        self.assertEqual(waits[0], 0.0)
+        self.assertTrue(all(wait <= 1.0 for wait in waits))
+        self.assertEqual(now, 99.0)
 
 
 class HumanDelayTests(unittest.TestCase):
@@ -2084,25 +2082,28 @@ class HumanDelayTests(unittest.TestCase):
 
         self.assertTrue(all(12.0 <= delay <= 24.0 for delay in delays))
 
-    def test_pacing_slows_down_under_accumulated_pressure(self) -> None:
+    def test_pacing_reacts_to_real_incident_and_recovers_later(self) -> None:
         now = 1000.0
         pacing = AdaptivePacingController(
             minimum_factor=0.9,
             maximum_factor=1.5,
             adjust_interval=180.0,
             acceleration_lock=1800.0,
-            soft_1m=9,
-            hard_1m=11,
-            soft_10m=60,
-            hard_10m=66,
             clock=lambda: now,
         )
 
-        update = pacing.observe(11, 66)
+        busy_but_healthy = pacing.observe()
+        incident = pacing.register_incident()
+        now += 600.0
+        locked = pacing.observe()
+        now += 1201.0
+        recovered = pacing.observe()
 
-        self.assertTrue(update.changed)
-        self.assertEqual(update.pressure, "high")
-        self.assertGreater(update.factor, 1.0)
+        self.assertFalse(busy_but_healthy.changed)
+        self.assertGreater(incident.factor, 1.0)
+        self.assertEqual(locked.pressure, "recovery")
+        self.assertLess(recovered.factor, incident.factor)
+        self.assertEqual(recovered.pressure, "normal")
 
 
 class SharedComponentTests(unittest.IsolatedAsyncioTestCase):

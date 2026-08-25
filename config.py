@@ -78,12 +78,11 @@ DEATH_RECOVERY_MIN_WAIT = 120
 DEATH_RECOVERY_MAX_WAIT = 600
 MIN_HP_AFTER_DEATH = 250
 
-# Независимый от пользовательских задержек предохранитель. Он охватывает
-# inline-кнопки и текстовые команды игровому боту одним общим бюджетом.
-# Лимиты являются локальной политикой Farmer, а не заявленными лимитами
-# Telegram. Длинное окно не позволяет накопить слишком плотную серию запросов.
+# Независимый от пользовательских задержек предохранитель сглаживает только
+# соседние исходящие запросы. Фиксированного минутного/десятиминутного бюджета
+# нет: нормальный долгий бой не должен останавливаться из-за придуманного
+# локального потолка.
 TELEGRAM_ACTION_MIN_INTERVAL = 1.0
-TELEGRAM_ACTION_LIMITS = ((12, 60.0), (70, 600.0))
 TELEGRAM_RECOVERY_LIMIT = 3
 TELEGRAM_RECOVERY_WINDOW = 10 * 60.0
 
@@ -96,15 +95,13 @@ TELEGRAM_FLOOD_BACKOFF_MAX = 5 * 60.0
 TELEGRAM_CALLBACK_TIMEOUT_BASE = 30.0
 TELEGRAM_CALLBACK_TIMEOUT_MAX = 5 * 60.0
 
-# Автоматический темп плавно масштабирует пользовательские диапазоны.
+# Автоматический темп замедляется после реального инцидента Telegram и затем
+# осторожно возвращается к обычному значению. Сама по себе активная игра не
+# считается ошибкой и не вызывает паузу.
 TELEGRAM_PACING_MIN_FACTOR = 0.90
 TELEGRAM_PACING_MAX_FACTOR = 1.50
 TELEGRAM_PACING_ADJUST_INTERVAL = 3 * 60.0
 TELEGRAM_PACING_ACCELERATION_LOCK = 30 * 60.0
-TELEGRAM_PACING_SOFT_1M = 9
-TELEGRAM_PACING_HARD_1M = 11
-TELEGRAM_PACING_SOFT_10M = 60
-TELEGRAM_PACING_HARD_10M = 66
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3

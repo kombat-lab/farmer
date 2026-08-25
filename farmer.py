@@ -56,7 +56,6 @@ from config import (
     RECOVERY_WATCHDOG_TIMEOUT,
     SESSION_NAME,
     TARGET_SELECTION_TIMEOUT,
-    TELEGRAM_ACTION_LIMITS,
     TELEGRAM_ACTION_MIN_INTERVAL,
     TELEGRAM_CALLBACK_TIMEOUT_BASE,
     TELEGRAM_CALLBACK_TIMEOUT_MAX,
@@ -66,12 +65,8 @@ from config import (
     TELEGRAM_FLOOD_WAIT_BUFFER,
     TELEGRAM_PACING_ACCELERATION_LOCK,
     TELEGRAM_PACING_ADJUST_INTERVAL,
-    TELEGRAM_PACING_HARD_1M,
-    TELEGRAM_PACING_HARD_10M,
     TELEGRAM_PACING_MAX_FACTOR,
     TELEGRAM_PACING_MIN_FACTOR,
-    TELEGRAM_PACING_SOFT_1M,
-    TELEGRAM_PACING_SOFT_10M,
     TELEGRAM_RECOVERY_LIMIT,
     TELEGRAM_RECOVERY_WINDOW,
     WATCHDOG_CHECK_INTERVAL,
@@ -210,7 +205,6 @@ class Farmer:
         )
         self.telegram_action_limiter = TelegramActionLimiter(
             min_interval=TELEGRAM_ACTION_MIN_INTERVAL,
-            limits=TELEGRAM_ACTION_LIMITS,
         )
         self.telegram_action_telemetry = TelegramActionTelemetry()
         self.telegram_pacing = AdaptivePacingController(
@@ -218,10 +212,6 @@ class Farmer:
             maximum_factor=TELEGRAM_PACING_MAX_FACTOR,
             adjust_interval=TELEGRAM_PACING_ADJUST_INTERVAL,
             acceleration_lock=TELEGRAM_PACING_ACCELERATION_LOCK,
-            soft_1m=TELEGRAM_PACING_SOFT_1M,
-            hard_1m=TELEGRAM_PACING_HARD_1M,
-            soft_10m=TELEGRAM_PACING_SOFT_10M,
-            hard_10m=TELEGRAM_PACING_HARD_10M,
         )
 
         self.blessing = BlessingManager()
@@ -244,12 +234,12 @@ class Farmer:
         last_ten_minutes = (
             last_ten_minutes_value if isinstance(last_ten_minutes_value, int) else 0
         )
-        pacing = self.telegram_pacing.observe(last_minute, last_ten_minutes)
+        pacing = self.telegram_pacing.observe()
         if pacing.changed:
             self.log(
                 "[TELEGRAM_PACING] коэффициент "
                 f"{pacing.previous_factor:.2f} → {pacing.factor:.2f}; "
-                f"нагрузка={pacing.pressure}, 1 мин={last_minute}, "
+                f"режим={pacing.pressure}, 1 мин={last_minute}, "
                 f"10 мин={last_ten_minutes}."
             )
         total_value = snapshot["total"]
@@ -677,8 +667,7 @@ class Farmer:
             f"{reason}. Исходящие действия приостановлены на {pause:.0f} сек.; "
             f"темп x{pacing.factor:.2f}."
         )
-        should_notify = event_type != "TELEGRAM_LOCAL_RATE_PAUSE" or pause >= 10.0
-        if should_notify and not self.telegram_cooldown_notified:
+        if not self.telegram_cooldown_notified:
             await self.notifier.send(
                 "⏳ <b>Telegram-пауза</b>\n"
                 f"Причина: {reason}\n"
@@ -788,22 +777,15 @@ class Farmer:
             severe=server_seconds >= 60 or incident_count >= 3,
         )
 
-    async def reserve_telegram_action_slot(self, action: str, *, resume_mode: str) -> bool:
-        """Reserves an outbound slot without blocking inbound parsing for long waits."""
-        limiter_delay = await self.telegram_action_limiter.reserve()
-        if 0.05 <= limiter_delay < 2.0:
-            await self.intentional_sleep(limiter_delay)
-            limiter_delay = await self.telegram_action_limiter.reserve()
-        if limiter_delay < 0.05:
-            return True
-        await self.start_telegram_cooldown(
-            limiter_delay,
-            reason="достигнут локальный бюджет Telegram-действий",
-            action=action,
-            resume_mode=resume_mode,
-            event_type="TELEGRAM_LOCAL_RATE_PAUSE",
-        )
-        return False
+    async def reserve_telegram_action_slot(self, action: str) -> bool:
+        """Smooths an immediate burst without imposing a rolling-window pause."""
+        limiter_delay = await self.telegram_action_limiter.acquire()
+        if limiter_delay >= 0.05:
+            self.log(
+                f"Telegram-запрос «{action}» выровнен на {limiter_delay:.1f} сек. "
+                "между соседними действиями."
+            )
+        return self.running
 
     async def press_button(
         self,
@@ -834,9 +816,7 @@ class Farmer:
             return False
 
         self.attempted_actions.remember(action_key)
-        if not await self.reserve_telegram_action_slot(
-            description, resume_mode="reprocess"
-        ):
+        if not await self.reserve_telegram_action_slot(description):
             self.attempted_actions.discard(action_key)
             return False
 
@@ -1905,9 +1885,7 @@ class Farmer:
                 description=LOOK_BUTTON,
             )
 
-        if not await self.reserve_telegram_action_slot(
-            MAP_COMMAND, resume_mode="refresh"
-        ):
+        if not await self.reserve_telegram_action_slot(MAP_COMMAND):
             return False
         if not self.running or (not force and self.inbound_generation != generation):
             self.log("Запрос карты отменён: уже получено новое состояние.")
@@ -2466,8 +2444,8 @@ class Farmer:
         logger.info("FoG Farmer запущен")
         logger.info("Telegram-сессия подключена")
         logger.info(
-            "Telegram-предохранитель: окна %s; интервал не менее %.1f сек.; темп автоматический.",
-            TELEGRAM_ACTION_LIMITS,
+            "Telegram-предохранитель: без фиксированного бюджета; "
+            "интервал не менее %.1f сек.; темп адаптируется по реальным инцидентам.",
             TELEGRAM_ACTION_MIN_INTERVAL,
         )
         logger.info("Персонаж: %s", CHARACTER_NAME)

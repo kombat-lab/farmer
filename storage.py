@@ -537,6 +537,13 @@ class Storage:
             self.connection.commit()
             return max(0, deleted)
 
+    async def clear_map_obstacles(self) -> int:
+        """Forget observations created by an incompatible navigation model."""
+        async with self.lock:
+            cursor = self.connection.execute("DELETE FROM map_obstacles")
+            self.connection.commit()
+            return max(0, cursor.rowcount)
+
     async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
         async with self.lock:
             cur = self.connection.execute(

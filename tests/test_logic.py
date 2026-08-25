@@ -733,6 +733,52 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertEqual(plan.recommendation.skill_name, "святое свечение")
         self.assertFalse(plan.candidates[0].mana_dominated)
 
+    def test_shadow_planner_keeps_full_tempo_beyond_horizon(self) -> None:
+        memory = CombatMemory(
+            target_name="Туманный Жгун",
+            enemy_current_hp=745,
+            enemy_max_hp=745,
+        )
+        for value in (45, 48, 50, 52):
+            memory.incoming_damage.add(value)
+        for value in (26, 28):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        for value in (62, 64):
+            memory.outgoing_damage.setdefault(
+                "святое свечение", ObservedRange()
+            ).add(value)
+
+        plan = build_shadow_plan(
+            FakeMessage(
+                "🔷 Мана: 12/12",
+                [["Святое свечение [Мана 3]"], ["Атака аколита"]],
+            ),
+            memory=memory,
+            current_hp=700,
+            max_hp=755,
+            executed=CombatDecision(
+                "святое свечение", SkillTarget.ENEMY, "лучший урон"
+            ),
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        holy = next(
+            candidate
+            for candidate in plan.candidates
+            if candidate.skill_name == "святое свечение"
+        )
+        basic = next(
+            candidate
+            for candidate in plan.candidates
+            if candidate.skill_name == "атака аколита"
+        )
+        self.assertLess(holy.expected_enemy_hits, basic.expected_enemy_hits)
+        self.assertFalse(holy.mana_dominated)
+        self.assertEqual(plan.recommendation.skill_name, "святое свечение")
+
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
         memory.begin("Фонарщик", "Вы напали:\nФонарщик\n1025❤️ из 1025❤️")
@@ -1377,6 +1423,109 @@ class RichMessagePanelTests(unittest.TestCase):
 
 
 class MovementRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def apply_hex_move(position: tuple[int, int], button: str) -> tuple[int, int]:
+        x, y = position
+        if button == "⬅️":
+            return x - 1, y
+        if button == "➡️":
+            return x + 1, y
+        if y % 2 == 0:
+            offsets = {
+                "↖️": (-1, -1),
+                "↗️": (0, -1),
+                "↙️": (-1, 1),
+                "↘️": (0, 1),
+            }
+        else:
+            offsets = {
+                "↖️": (0, -1),
+                "↗️": (1, -1),
+                "↙️": (0, 1),
+                "↘️": (1, 1),
+            }
+        dx, dy = offsets[button]
+        return x + dx, y + dy
+
+    def test_vertical_buttons_follow_hex_row_parity(self) -> None:
+        self.assertEqual(
+            SnakeNavigator._primary_button_between((3, 10), (3, 9)),
+            "↗️",
+        )
+        self.assertEqual(
+            SnakeNavigator._primary_button_between((3, 10), (3, 11)),
+            "↘️",
+        )
+        self.assertEqual(
+            SnakeNavigator._primary_button_between((3, 11), (3, 10)),
+            "↖️",
+        )
+        self.assertEqual(
+            SnakeNavigator._primary_button_between((3, 9), (3, 10)),
+            "↙️",
+        )
+
+    def test_12x12_route_matches_real_hex_transitions(self) -> None:
+        navigator = SnakeNavigator(0, 8, 0, 8)
+        navigator.use_location(
+            "Мертвый лес",
+            current_position=(0, 0),
+            width=12,
+            height=12,
+        )
+        position = (0, 0)
+
+        for _ in range(180):
+            if navigator.coverage_count == navigator.coverage_total:
+                break
+            plan = navigator.plan(position)
+            actual = self.apply_hex_move(position, plan.button)
+            self.assertEqual(actual, plan.destination)
+            navigator.confirm_success(plan, actual)
+            position = actual
+
+        self.assertEqual(navigator.coverage_count, 144)
+        self.assertEqual(navigator.coverage_total, 144)
+
+    def test_second_enemy_is_inferred_from_the_received_round(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.settings = SimpleNamespace(
+            values=SimpleNamespace(enabled_targets=["Пенёк", "Летучая мышь"])
+        )
+        farmer.context = RuntimeContext(
+            active_target="Пенёк",
+            battle_target="Пенёк",
+            combat_enemies=["Пенёк"],
+        )
+        farmer.combat = CombatMemory()
+        farmer.combat.begin("Пенёк")
+        farmer.pending_combat_decision = None
+        messages: list[str] = []
+        farmer.log = messages.append
+        round_state = parse_combat_round(
+            """⚔️ Раун 31
+🪬🧙Kombat
+❤️ 250/755
+Летучая мышь
+❤️ 475/475
+Выберите навык:
+🔷 Мана: 8/12""",
+            ["Атака аколита"],
+        )
+
+        enemies = farmer.observed_combat_enemies(round_state)
+        self.assertEqual(enemies, ("Летучая мышь",))
+        self.assertTrue(
+            farmer.switch_combat_enemy(
+                enemies[0],
+                reason="тест",
+            )
+        )
+        self.assertEqual(farmer.combat.target_name, "Летучая мышь")
+        self.assertEqual(farmer.context.active_target, "Летучая мышь")
+        self.assertIn("Летучая мышь", farmer.context.combat_enemies)
+        self.assertIn("Боевая модель переключена", messages[0])
+
     def test_9x9_sweep_from_mid_map_reaches_every_cell(self) -> None:
         for start in ((0, 0), (0, 1), (0, 4), (2, 1), (4, 4), (8, 8)):
             with self.subTest(start=start):
@@ -1559,6 +1708,31 @@ class MovementRecoveryTests(unittest.TestCase):
 
         self.assertEqual(farmer.context.move_count, 1)
         self.assertEqual(farmer.moves_in_cycle, 8)
+
+
+class NavigationModelUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incompatible_obstacles_are_cleared_only_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.remember_map_obstacle("Мертвый лес", (1, 10))
+            await storage.remember_map_obstacle("Мертвый лес", (5, 11))
+            farmer = Farmer.__new__(Farmer)
+            farmer.storage = storage
+
+            self.assertEqual(await farmer.ensure_navigation_model(), 2)
+            self.assertEqual(await storage.get_map_obstacles("Мертвый лес"), set())
+            self.assertEqual(
+                await storage.get_setting("navigation_model_version"),
+                SnakeNavigator.MODEL_VERSION,
+            )
+
+            await storage.remember_map_obstacle("Мертвый лес", (4, 11))
+            self.assertEqual(await farmer.ensure_navigation_model(), 0)
+            self.assertEqual(
+                await storage.get_map_obstacles("Мертвый лес"),
+                {(4, 11)},
+            )
+            await storage.close()
 
 
 class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):

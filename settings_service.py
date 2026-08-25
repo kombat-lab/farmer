@@ -32,6 +32,7 @@ NON_UI_SETTING_KEYS = frozenset(
         "farmer_stop_requested",
         "telegram_cooldown_until",
         "telegram_cooldown_reason",
+        "navigation_model_version",
     }
 )
 

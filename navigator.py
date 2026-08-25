@@ -25,6 +25,7 @@ class SnakeNavigator:
     """
 
     DIAGONAL_BUTTONS = ("↖️", "↗️", "↙️", "↘️")
+    MODEL_VERSION = 2
     ALL_MOVE_BUTTONS = (
         "⬅️",
         "➡️",
@@ -333,11 +334,20 @@ class SnakeNavigator:
             if delta_x == -1:
                 return "⬅️"
 
+        # The game uses an odd-row offset hex grid. A vertical transition in
+        # the displayed coordinates is therefore performed by different
+        # diagonal buttons depending on the parity of the origin row:
+        #
+        #   even row: NE keeps x when moving up, SE keeps x when moving down
+        #   odd row:  NW keeps x when moving up, SW keeps x when moving down
+        #
+        # Choosing by the horizontal map edge used to send the character to
+        # an adjacent column and made valid cells look like obstacles.
         if delta_x == 0 and delta_y == 1:
-            return "↘️" if origin_x == 0 else "↙️"
+            return "↘️" if origin_y % 2 == 0 else "↙️"
 
         if delta_x == 0 and delta_y == -1:
-            return "↖️" if origin_x == 0 else "↗️"
+            return "↗️" if origin_y % 2 == 0 else "↖️"
 
         raise ValueError(f"Нельзя определить кнопку перехода {origin} → {destination}.")
 

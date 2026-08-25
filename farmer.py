@@ -15,7 +15,7 @@ from telethon.errors import BotResponseTimeoutError, FloodWaitError, RPCError
 
 from blessing import BlessingManager
 from combat_learning import build_shadow_plan
-from combat_round import parse_combat_round
+from combat_round import CombatRoundState, parse_combat_round
 from combat_strategy import (
     CombatDecisionTrace,
     CombatMemory,
@@ -296,6 +296,87 @@ class Farmer:
         if self.combat.target_name:
             knowledge.load_into(self.combat)
         self.log(f"Активирован боевой профиль для максимума HP {max_hp}.")
+
+    def canonical_combat_enemy(self, raw_name: str) -> str:
+        """Resolve decorated combat text to a configured monster name."""
+        normalized = normalize(raw_name)
+        candidates = [
+            *self.settings.values.enabled_targets,
+            *self.context.combat_enemies,
+        ]
+        if self.context.active_target:
+            candidates.append(self.context.active_target)
+        for candidate in candidates:
+            if normalize(candidate) in normalized:
+                return candidate
+        return raw_name.strip()
+
+    def observed_combat_enemies(
+        self,
+        round_state: CombatRoundState | None,
+        *,
+        excluding: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        """Infer enemies from the already received round without Telegram I/O."""
+        if round_state is None:
+            return ()
+
+        character = normalize(CHARACTER_NAME)
+        excluded = {normalize(name) for name in excluding}
+        raw_names = [
+            combatant.name
+            for combatant in round_state.combatants
+            if character not in normalize(combatant.name)
+        ]
+        raw_names.extend(
+            attack.actor
+            for attack in round_state.attacks
+            if character not in normalize(attack.actor)
+        )
+        raw_names.extend(round_state.near_death)
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw_name in raw_names:
+            enemy = self.canonical_combat_enemy(raw_name)
+            normalized = normalize(enemy)
+            if not normalized or normalized in excluded or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(enemy)
+        return tuple(result)
+
+    def switch_combat_enemy(self, enemy: str, *, reason: str) -> bool:
+        if normalize(self.combat.target_name or "") == normalize(enemy):
+            return False
+        previous = self.combat.target_name
+        self.context.active_target = enemy
+        self.context.add_combat_enemy(enemy)
+        self.combat.begin(enemy)
+        self.pending_combat_decision = None
+        self.log(
+            "Боевая модель переключена: "
+            f"{previous or 'неопределённый моб'} → {enemy}; {reason}."
+        )
+        return True
+
+    async def ensure_navigation_model(self) -> int:
+        """Drop only observations made with an incompatible coordinate model."""
+        stored_version = await self.storage.get_setting("navigation_model_version", 0)
+        if stored_version == SnakeNavigator.MODEL_VERSION:
+            return 0
+        deleted = await self.storage.clear_map_obstacles()
+        await self.storage.set_setting(
+            "navigation_model_version",
+            SnakeNavigator.MODEL_VERSION,
+        )
+        logger.info(
+            "Модель навигации обновлена до v%s; "
+            "удалено несовместимых препятствий: %s.",
+            SnakeNavigator.MODEL_VERSION,
+            deleted,
+        )
+        return deleted
 
     async def persist_combat_knowledge(self) -> None:
         max_hp = getattr(self, "active_combat_profile_max_hp", None)
@@ -1365,7 +1446,7 @@ class Farmer:
                 self.settings.values.long_pause_min,
                 self.settings.values.long_pause_max,
             )
-            self.log(f"Короткая пауза на пустой карте: {pause:.1f} сек.")
+            self.log(f"Короткая пауза после перемещения: {pause:.1f} сек.")
             await self.intentional_sleep(pause)
 
         plan = self.navigator.plan(map_info.position)
@@ -2013,6 +2094,22 @@ class Farmer:
                 self.combat.begin(observed_target, text)
             elif self.combat.target_name is None:
                 self.combat.target_name = observed_target
+
+        defeated_enemies = round_state.defeated if round_state is not None else ()
+        current_target_was_defeated = any(
+            normalize(self.combat.target_name or "") == normalize(defeated)
+            for defeated in defeated_enemies
+        )
+        if not current_target_was_defeated:
+            observed_enemies = self.observed_combat_enemies(round_state)
+            if observed_enemies and not any(
+                normalize(self.combat.target_name or "") == normalize(enemy)
+                for enemy in observed_enemies
+            ):
+                self.switch_combat_enemy(
+                    observed_enemies[0],
+                    reason="противник распознан в полученном раунде",
+                )
         if self.pending_combat_decision is not None and round_state is not None:
             player_skills = [
                 skill
@@ -2103,13 +2200,21 @@ class Farmer:
         if await self.handle_blessing_menu(message):
             return
 
-        defeated_enemies = round_state.defeated if round_state is not None else ()
         for defeated_enemy in defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")
             if normalize(self.combat.target_name or "") == normalize(defeated_enemy):
-                if self.context.active_target:
-                    self.combat.begin(self.context.active_target)
+                next_enemies = self.observed_combat_enemies(
+                    round_state,
+                    excluding=defeated_enemies,
+                )
+                if not next_enemies:
+                    next_enemies = tuple(self.context.combat_enemies)
+                if next_enemies:
+                    self.switch_combat_enemy(
+                        next_enemies[0],
+                        reason="в этом же бою остался следующий противник",
+                    )
                 else:
                     self.combat.reset()
 
@@ -2301,6 +2406,7 @@ class Farmer:
 
     async def run(self) -> None:
         self.validate_config()
+        await self.ensure_navigation_model()
         await self.load_combat_knowledge()
         for target in self.settings.values.treatment_enemy_targets:
             self.combat.confirm_treatment_enemy(target)

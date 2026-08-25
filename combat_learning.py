@@ -415,9 +415,12 @@ def build_shadow_plan(
         if remaining_enemy_hp == 0:
             expected_enemy_hits: int | None = 0
         elif remaining_enemy_hp is not None and sustainable_damage > 0:
-            expected_enemy_hits = min(
-                horizon,
-                max(1, math.ceil(remaining_enemy_hp / sustainable_damage)),
+            # Keep the full number of expected hits. Capping it to the shadow
+            # horizon made a stronger attack look identical to a basic attack
+            # in long fights and incorrectly labelled the mana as wasted.
+            expected_enemy_hits = max(
+                1,
+                math.ceil(remaining_enemy_hp / sustainable_damage),
             )
         else:
             expected_enemy_hits = None
@@ -429,7 +432,7 @@ def build_shadow_plan(
         future_healing += max(0, horizon - 1) * new_renewal
         projected_hp = healed_now + future_healing
         if expected_incoming is not None and expected_enemy_hits is not None:
-            projected_hp -= expected_incoming * expected_enemy_hits
+            projected_hp -= expected_incoming * min(horizon, expected_enemy_hits)
         projected_hp = max(0, min(max_hp, projected_hp))
 
         first_hit_hp = healed_now

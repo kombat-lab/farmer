@@ -34,7 +34,7 @@ from config import (
 )
 from event_cache import BoundedKeyCache
 from farmer import Farmer
-from game_catalog import ALL_MONSTER_NAMES, get_location, get_monster_names
+from game_catalog import ALL_MONSTER_NAMES, LOCATION_NAMES, get_location, get_monster_names
 from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
 from models import ActionType, BotState, RuntimeContext
 from navigator import SnakeNavigator
@@ -1281,6 +1281,99 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertEqual(farmer.choose_cycle_move_target(), 97)
+
+
+class RichMessagePanelTests(unittest.TestCase):
+    @staticmethod
+    def _settings() -> SettingsService:
+        return SettingsService(Storage.__new__(Storage))
+
+    def test_dashboard_uses_bot_api_10_3_controls_and_compact_tables(self) -> None:
+        from rich_messages import dashboard_rich
+
+        html = dashboard_rich(
+            {
+                "task_running": True,
+                "game_state": "COMBAT",
+                "location_name": "Мертвый лес",
+                "position_x": 4,
+                "position_y": 7,
+                "current_hp": 712,
+                "max_hp": 870,
+                "active_target": "Черная мушка",
+                "current_cycle": 1,
+                "cycles_count": 1,
+                "moves_in_cycle": 37,
+                "moves_per_cycle": 96,
+            },
+            {
+                "battle": {
+                    "battles": 27,
+                    "wins": 27,
+                    "xp": 817,
+                    "dust": 502,
+                    "crystals": 3,
+                },
+                "drops": {"items": 16, "cards": 0},
+            },
+        )
+
+        self.assertIn("<table bordered striped compact>", html)
+        self.assertIn('<tg-button-row align="center">', html)
+        self.assertIn('type="callback_data"', html)
+        self.assertIn('style="danger"', html)
+        self.assertIn("<blockquote expandable>", html)
+        self.assertIn("Мертвый лес", html)
+
+    def test_active_targets_are_collapsed_and_selected_values_are_disabled(self) -> None:
+        from rich_messages import combat_settings_rich, settings_rich
+
+        settings = self._settings()
+        settings.values.battle_start_hp_percent = 100
+
+        root = settings_rich(settings)
+        combat = combat_settings_rich(settings)
+
+        self.assertIn("<details><summary>🎯 Активные цели</summary>", root)
+        self.assertNotIn("<details open><summary>🎯 Активные цели</summary>", root)
+        self.assertIn('type="disabled" style="primary">100%</tg-button>', combat)
+        self.assertIn('data="settings:hp:50"', combat)
+
+    def test_callback_identifiers_fit_telegram_limit(self) -> None:
+        import re
+
+        from rich_messages import locations_rich, targets_rich
+
+        locations = locations_rich(
+            [(name, 1, 2) for name in LOCATION_NAMES]
+        )
+        targets = targets_rich(
+            "Выжженное поле",
+            [(name, True) for name in get_monster_names("Выжженное поле")],
+            category_index=0,
+        )
+
+        callback_values = re.findall(r'data="([^"]+)"', locations + targets)
+        self.assertTrue(callback_values)
+        self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callback_values))
+
+    def test_aiogram_compatibility_layer_preserves_10_3_fields(self) -> None:
+        from control_bot import _inline_button, _inline_keyboard
+
+        selected = _inline_button(
+            "100%",
+            "settings:hp:100",
+            style="primary",
+            disabled=True,
+        ).model_dump(exclude_none=True)
+        prompt = _inline_keyboard(
+            [[("Отмена", "input:cancel", "danger", False)]],
+            force_reply=True,
+        ).model_dump(exclude_none=True)
+
+        self.assertEqual(selected["disabled"], {})
+        self.assertNotIn("callback_data", selected)
+        self.assertTrue(prompt["force_reply"])
 
 
 class MovementRecoveryTests(unittest.TestCase):

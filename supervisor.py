@@ -149,4 +149,5 @@ class FarmerSupervisor:
         state["task_running"] = self.is_running()
         if self.farmer is not None:
             state.update(self.farmer.telegram_safety_status())
+            state["location_name"] = self.farmer.navigator.location_name
         return state

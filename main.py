@@ -49,7 +49,6 @@ async def main() -> None:
     notifier = Notifier(bot, ADMIN_TELEGRAM_ID)
     supervisor = FarmerSupervisor(storage, notifier, settings)
     control_bot = ControlBot(bot, storage, supervisor, settings)
-    notifier.set_keyboard_provider(control_bot.current_keyboard)
 
     logger.info("Запуск панели управления FoG Farmer на aiogram")
     await storage.add_event(

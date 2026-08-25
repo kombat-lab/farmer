@@ -1,50 +1,25 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.types import ReplyKeyboardMarkup
 
 from rich_messages import notification_rich, send_rich_with_fallback
 
 logger = logging.getLogger("fog_farmer")
-KeyboardProvider = Callable[[], Awaitable[ReplyKeyboardMarkup]]
 
 
 class Notifier:
+    """Отправляет редкие самостоятельные уведомления без постоянной клавиатуры."""
+
     def __init__(self, bot: Bot, admin_id: int) -> None:
         self.bot = bot
         self.admin_id = admin_id
-        self._keyboard_provider: KeyboardProvider | None = None
 
-    def set_keyboard_provider(self, provider: KeyboardProvider) -> None:
-        self._keyboard_provider = provider
-
-    async def _keyboard(self) -> ReplyKeyboardMarkup | None:
-        if self._keyboard_provider is None:
-            return None
+    async def send(self, text: str) -> None:
         try:
-            return await self._keyboard_provider()
-        except Exception:
-            logger.exception("Не удалось получить актуальную клавиатуру")
-            return None
-
-    async def send(
-        self,
-        text: str,
-        *,
-        reply_markup: ReplyKeyboardMarkup | None = None,
-    ) -> None:
-        if reply_markup is None:
-            reply_markup = await self._keyboard()
-        try:
-            await self.bot.send_message(
-                chat_id=self.admin_id,
-                text=text,
-                reply_markup=reply_markup,
-            )
+            await self.bot.send_message(chat_id=self.admin_id, text=text)
         except TelegramRetryAfter as error:
             logger.warning("Telegram просит повторить уведомление через %s сек.", error.retry_after)
         except TelegramNetworkError:
@@ -60,7 +35,6 @@ class Notifier:
         text: str | None = None,
         silent: bool = False,
     ) -> None:
-        keyboard = await self._keyboard()
         fallback = title
         if text:
             fallback += f"\n\n{text}"
@@ -72,11 +46,10 @@ class Notifier:
                 chat_id=self.admin_id,
                 html=notification_rich(title, rows=rows, text=text),
                 fallback_text=fallback,
-                reply_markup=keyboard,
                 disable_notification=silent,
             )
         except Exception:
-            logger.exception("Не удалось отправить Rich Message уведомление")
+            logger.exception("Не удалось отправить RichMessage-уведомление")
 
     async def card_drop(
         self,

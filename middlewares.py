@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
-from aiogram.types import Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
@@ -19,13 +19,21 @@ class AdminOnlyMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        if not isinstance(event, Message):
-            return None
+        if isinstance(event, Message):
+            if (
+                event.from_user is None
+                or event.from_user.id != self.admin_user_id
+                or event.chat.type != "private"
+            ):
+                return None
+            return await handler(event, data)
 
+        if not isinstance(event, CallbackQuery):
+            return None
         if (
-            event.from_user is None
-            or event.from_user.id != self.admin_user_id
-            or event.chat.type != "private"
+            event.from_user.id != self.admin_user_id
+            or event.message is None
+            or event.message.chat.type != "private"
         ):
             return None
 

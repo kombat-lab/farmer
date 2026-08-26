@@ -493,24 +493,62 @@ def locations_rich(
     notice: str | None = None,
 ) -> str:
     body = rich_notice(notice)
+    enabled_total = sum(enabled for _, enabled, _ in locations)
+    target_total = sum(total for _, _, total in locations)
+    configured_locations = sum(enabled > 0 for _, enabled, _ in locations)
     body += rich_table(
         [
-            (category, "все" if total and enabled == total else f"{enabled}/{total}")
-            for category, enabled, total in locations
+            ("Активных целей", f"{enabled_total}/{target_total}"),
+            ("Настроено локаций", f"{configured_locations}/{len(locations)}"),
         ],
-        headers=("Локация", "Выбрано"),
+        headers=None,
     )
-    buttons = [
-        rich_button(
-            f"{'✅' if total and enabled == total else '☑️' if enabled else '○'} {category}",
-            f"targets:location:{index}",
-        )
-        for index, (category, enabled, total) in enumerate(locations)
-    ]
-    for index in range(0, len(buttons), 2):
-        body += rich_button_row(*buttons[index : index + 2])
+    groups = (
+        (
+            "✅ Выбраны полностью",
+            [
+                (index, category, enabled, total)
+                for index, (category, enabled, total) in enumerate(locations)
+                if total > 0 and enabled == total
+            ],
+            "success",
+        ),
+        (
+            "☑️ Выбраны частично",
+            [
+                (index, category, enabled, total)
+                for index, (category, enabled, total) in enumerate(locations)
+                if 0 < enabled < total
+            ],
+            "primary",
+        ),
+        (
+            "○ Не выбраны",
+            [
+                (index, category, enabled, total)
+                for index, (category, enabled, total) in enumerate(locations)
+                if enabled == 0
+            ],
+            None,
+        ),
+    )
+    for title, group, style in groups:
+        if not group:
+            continue
+        body += f"<h3>{_e(title)}</h3>"
+        buttons = [
+            rich_button(
+                f"{category} · {'все' if total and enabled == total else f'{enabled}/{total}'}",
+                f"targets:location:{index}",
+                style=style,
+            )
+            for index, category, enabled, total in group
+        ]
+        for index in range(0, len(buttons), 2):
+            body += rich_button_row(*buttons[index : index + 2])
+    body += "<hr/>"
     body += rich_button_row(rich_button("← Настройки", "ui:settings", style="link"))
-    return rich_document("🎯 Активные цели", body, subtitle="Выберите локацию")
+    return rich_document("🎯 Активные цели", body, subtitle="Настройка по локациям")
 
 
 def targets_rich(
@@ -534,16 +572,41 @@ def targets_rich(
             style="danger" if all_enabled else "success",
         )
     )
-    buttons = [
-        rich_button(
-            f"{'✅' if enabled else '○'} {name}",
-            f"targets:one:{category_index}:{target_index}",
-            style="success" if enabled else None,
-        )
-        for target_index, (name, enabled) in enumerate(targets)
-    ]
-    for index in range(0, len(buttons), 2):
-        body += rich_button_row(*buttons[index : index + 2])
+    grouped_targets = (
+        (
+            "✅ Активные",
+            [
+                (target_index, name)
+                for target_index, (name, enabled) in enumerate(targets)
+                if enabled
+            ],
+            "success",
+        ),
+        (
+            "○ Не выбраны",
+            [
+                (target_index, name)
+                for target_index, (name, enabled) in enumerate(targets)
+                if not enabled
+            ],
+            None,
+        ),
+    )
+    for title, group, style in grouped_targets:
+        if not group:
+            continue
+        body += f"<h3>{_e(title)}</h3>"
+        buttons = [
+            rich_button(
+                name,
+                f"targets:one:{category_index}:{target_index}",
+                style=style,
+            )
+            for target_index, name in group
+        ]
+        for index in range(0, len(buttons), 2):
+            body += rich_button_row(*buttons[index : index + 2])
+    body += "<hr/>"
     body += rich_button_row(rich_button("← Локации", "targets:locations", style="link"))
     return rich_document(f"🎯 {category}", body)
 

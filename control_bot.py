@@ -311,17 +311,45 @@ class ControlBot:
                 for category in LOCATION_NAMES
             ]
             button_rows: list[list[tuple[str, str, str | None, bool]]] = []
-            location_buttons: list[tuple[str, str, str | None, bool]] = [
+            location_groups = (
                 (
-                    f"{'✅' if total and enabled == total else '☑️' if enabled else '○'} {category}",
-                    f"targets:location:{index}",
+                    [
+                        (index, category, enabled, total)
+                        for index, (category, enabled, total) in enumerate(locations)
+                        if total > 0 and enabled == total
+                    ],
+                    "success",
+                ),
+                (
+                    [
+                        (index, category, enabled, total)
+                        for index, (category, enabled, total) in enumerate(locations)
+                        if 0 < enabled < total
+                    ],
+                    "primary",
+                ),
+                (
+                    [
+                        (index, category, enabled, total)
+                        for index, (category, enabled, total) in enumerate(locations)
+                        if enabled == 0
+                    ],
                     None,
-                    False,
-                )
-                for index, (category, enabled, total) in enumerate(locations)
-            ]
-            for index in range(0, len(location_buttons), 2):
-                button_rows.append(location_buttons[index : index + 2])
+                ),
+            )
+            for group, style in location_groups:
+                location_buttons = [
+                    (
+                        f"{category} · "
+                        f"{'все' if total and enabled == total else f'{enabled}/{total}'}",
+                        f"targets:location:{index}",
+                        style,
+                        False,
+                    )
+                    for index, category, enabled, total in group
+                ]
+                for index in range(0, len(location_buttons), 2):
+                    button_rows.append(location_buttons[index : index + 2])
             button_rows.append([("← Настройки", "ui:settings", None, False)])
             return PanelView(
                 locations_rich(locations, notice=notice),
@@ -343,17 +371,19 @@ class ControlBot:
                     False,
                 )
             ]]
-            target_buttons: list[tuple[str, str, str | None, bool]] = [
-                (
-                    f"{'✅' if enabled else '○'} {name}",
-                    f"targets:one:{category_index}:{target_index}",
-                    "success" if enabled else None,
-                    False,
-                )
-                for target_index, (name, enabled) in enumerate(targets)
-            ]
-            for index in range(0, len(target_buttons), 2):
-                target_button_rows.append(target_buttons[index : index + 2])
+            for enabled_group, style in ((True, "success"), (False, None)):
+                target_buttons: list[tuple[str, str, str | None, bool]] = [
+                    (
+                        name,
+                        f"targets:one:{category_index}:{target_index}",
+                        style,
+                        False,
+                    )
+                    for target_index, (name, enabled) in enumerate(targets)
+                    if enabled is enabled_group
+                ]
+                for index in range(0, len(target_buttons), 2):
+                    target_button_rows.append(target_buttons[index : index + 2])
             target_button_rows.append([("← Локации", "targets:locations", None, False)])
             return PanelView(
                 targets_rich(

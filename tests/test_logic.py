@@ -1405,6 +1405,31 @@ class RichMessagePanelTests(unittest.TestCase):
         self.assertTrue(callback_values)
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callback_values))
 
+    def test_target_buttons_are_grouped_by_selection_state(self) -> None:
+        from rich_messages import locations_rich, targets_rich
+
+        locations = locations_rich(
+            [
+                ("Полностью", 3, 3),
+                ("Частично", 1, 3),
+                ("Пусто", 0, 3),
+            ]
+        )
+        targets = targets_rich(
+            "Тестовая локация",
+            [("Активный моб", True), ("Неактивный моб", False)],
+            category_index=0,
+        )
+
+        self.assertIn("✅ Выбраны полностью", locations)
+        self.assertIn("☑️ Выбраны частично", locations)
+        self.assertIn("○ Не выбраны", locations)
+        self.assertIn("Полностью · все", locations)
+        self.assertIn('style="success"', locations)
+        self.assertIn('style="primary"', locations)
+        self.assertLess(locations.index("Полностью · все"), locations.index("Частично · 1/3"))
+        self.assertLess(targets.index("✅ Активные"), targets.index("○ Не выбраны"))
+
     def test_aiogram_3_31_uses_typed_bot_api_10_3_fields(self) -> None:
         from aiogram.types import DisabledButton
 

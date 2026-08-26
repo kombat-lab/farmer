@@ -78,39 +78,16 @@ DEATH_RECOVERY_MIN_WAIT = 120
 DEATH_RECOVERY_MAX_WAIT = 600
 MIN_HP_AFTER_DEATH = 250
 
-# Независимый от пользовательских задержек предохранитель сглаживает только
-# соседние исходящие запросы. Фиксированного минутного/десятиминутного бюджета
-# нет: нормальный долгий бой не должен останавливаться из-за придуманного
-# локального потолка.
-TELEGRAM_ACTION_MIN_INTERVAL = 1.0
+# Наблюдательный режим не добавляет пауз сверх игровых задержек пользователя.
+TELEGRAM_ACTION_MIN_INTERVAL = 0.0
 TELEGRAM_RECOVERY_LIMIT = 3
 TELEGRAM_RECOVERY_WINDOW = 10 * 60.0
 
-# Telegram may accept an RPC without returning FLOOD_WAIT while game-bot
-# callbacks and unsolicited updates stop arriving. After several unanswered
-# recovery probes, stop sending requests for a while instead of stopping the
-# farmer or continuing to poll. Repeated silent stalls lengthen the pause.
-TELEGRAM_SILENT_STALL_INCIDENT_WINDOW = 2 * 60 * 60.0
-TELEGRAM_SILENT_STALL_BACKOFF_BASE = 5 * 60.0
-TELEGRAM_SILENT_STALL_BACKOFF_MAX = 30 * 60.0
-
-# Ограничение Telegram никогда не останавливает фармер. Серверное ожидание
-# дополняется запасом, а повторные инциденты увеличивают минимальную паузу.
+# Ограничение Telegram никогда не останавливает фармер. Явный серверный
+# FLOOD_WAIT соблюдается буквально с небольшим техническим запасом.
 TELEGRAM_FLOOD_WAIT_BUFFER = 2.0
 TELEGRAM_FLOOD_INCIDENT_WINDOW = 10 * 60.0
-TELEGRAM_FLOOD_BACKOFF_BASE = 15.0
-TELEGRAM_FLOOD_BACKOFF_MAX = 5 * 60.0
-TELEGRAM_CALLBACK_TIMEOUT_BASE = 30.0
-TELEGRAM_CALLBACK_TIMEOUT_MAX = 5 * 60.0
 TELEGRAM_CALLBACK_RPC_TIMEOUT = 30.0
-
-# Автоматический темп замедляется после реального инцидента Telegram и затем
-# осторожно возвращается к обычному значению. Сама по себе активная игра не
-# считается ошибкой и не вызывает паузу.
-TELEGRAM_PACING_MIN_FACTOR = 0.90
-TELEGRAM_PACING_MAX_FACTOR = 1.50
-TELEGRAM_PACING_ADJUST_INTERVAL = 3 * 60.0
-TELEGRAM_PACING_ACCELERATION_LOCK = 30 * 60.0
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3

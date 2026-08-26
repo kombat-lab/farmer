@@ -194,7 +194,6 @@ def dashboard_rich(state: dict, data: dict, *, notice: str | None = None) -> str
         ("🎁 Дроп", f"{drops.get('items', 0)} · карт {drops.get('cards', 0)}"),
     ]
 
-    pacing_text = f"x{float(state.get('telegram_pacing_factor') or 1):.2f}"
     load_text = (
         f"{state.get('telegram_actions_1m', 0)} / 1 мин. · "
         f"{state.get('telegram_actions_10m', 0)} / 10 мин."
@@ -202,7 +201,7 @@ def dashboard_rich(state: dict, data: dict, *, notice: str | None = None) -> str
     diagnostics = "<br>".join(
         (
             "<b>Диагностика</b>",
-            f"Автоматический темп: {_e(pacing_text)}",
+            "Темп: наблюдение без автокоррекции",
             f"Нагрузка Telegram: {_e(load_text)}",
             f"Последнее действие: {_e(state.get('last_action') or 'нет')}",
             f"Последний прогресс: {_e(state.get('last_progress_at') or 'нет')}",
@@ -229,6 +228,7 @@ def _duration(seconds: int) -> str:
 def stats_rich(
     data: dict,
     drop_items: list[dict] | None = None,
+    telegram_days: list[dict] | None = None,
     *,
     notice: str | None = None,
 ) -> str:
@@ -289,7 +289,41 @@ def stats_rich(
         )
     else:
         body += "<details><summary>🎁 Полученный дроп</summary><p>Предметов пока нет.</p></details>"
-    body += rich_button_row(rich_button("↻ Обновить", "ui:stats", style="primary"))
+    if telegram_days:
+        telegram_rows = []
+        for day in telegram_days:
+            incoming = int(day.get("incoming_new_messages", 0)) + int(
+                day.get("incoming_message_edits", 0)
+            )
+            manual_marks = int(day.get("manual_restriction_marks", 0))
+            silent_stalls = int(day.get("silent_stalls", 0))
+            flood_waits = int(day.get("flood_waits", 0))
+            telegram_rows.append(
+                (
+                    str(day.get("day", "—")),
+                    f"↑ {day.get('outgoing_total', 0)} · ↓ {incoming} · "
+                    f"пик {day.get('peak_actions_1m', 0)}/мин., "
+                    f"{day.get('peak_actions_10m', 0)}/10 мин. · "
+                    f"карта {day.get('map_requests', 0)} · "
+                    f"восст. {day.get('recovery_attempts', 0)} · "
+                    f"ручн. {manual_marks} / авто {silent_stalls} / "
+                    f"FLOOD_WAIT {flood_waits}",
+                )
+            )
+        body += (
+            "<details open><summary>📡 Telegram по дням (Москва)</summary>"
+            + rich_table(telegram_rows, headers=("День", "Нагрузка и признаки"))
+            + "</details>"
+        )
+    else:
+        body += (
+            "<details open><summary>📡 Telegram по дням (Москва)</summary>"
+            "<p>Наблюдения начнут накапливаться после обновления.</p></details>"
+        )
+    body += rich_button_row(
+        rich_button("↻ Обновить", "ui:stats", style="primary"),
+        rich_button("⛔ Отметить ограничение", "telegram:mark", style="danger"),
+    )
     body += _navigation("stats")
     return rich_document("📈 Статистика сессии", body)
 
@@ -330,7 +364,7 @@ def settings_rich(settings: SettingsService, *, notice: str | None = None) -> st
             ("Порог лечения", f"{s.heal_threshold} HP"),
             ("Перед боем", f"{s.battle_start_hp_percent}% HP"),
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),
-            ("Темп", "адаптивный"),
+            ("Темп", "по заданным задержкам"),
         ],
         headers=None,
     )
@@ -446,8 +480,8 @@ def delay_settings_rich(settings: SettingsService, *, notice: str | None = None)
     )
     body += rich_button_row(rich_button("Между циклами", "input:delay:cycle_rest"))
     body += (
-        "<footer>Значения являются базовыми: контроллер Telegram автоматически "
-        "и плавно корректирует фактический темп.</footer>"
+        "<footer>Фактический темп следует указанным диапазонам; Telegram-нагрузка "
+        "только записывается и не меняет задержки автоматически.</footer>"
     )
     body += rich_button_row(rich_button("← Настройки", "ui:settings", style="link"))
     return rich_document("⏱ Задержки и темп", body)

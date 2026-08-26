@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -181,11 +182,25 @@ class ControlBot:
             dashboard = await self.storage.get_statistics_dashboard()
             session = await self.storage.get_current_session()
             drops = await self.storage.get_drops(session.session_id)
+            telegram_days = await self.storage.get_telegram_activity_daily()
+            telegram_fallback = "\n".join(
+                f"{row['day']}: ↑{row['outgoing_total']} · "
+                f"↓{int(row['incoming_new_messages']) + int(row['incoming_message_edits'])} · "
+                f"пик {row['peak_actions_1m']}/мин. · "
+                f"ручн.{row['manual_restriction_marks']} · "
+                f"авто{row['silent_stalls']} · FW{row['flood_waits']}"
+                for row in telegram_days
+            ) or "Наблюдения пока не накоплены."
             return PanelView(
-                stats_rich(dashboard, drops, notice=notice),
-                self.storage.format_statistics_text(dashboard),
+                stats_rich(dashboard, drops, telegram_days, notice=notice),
+                self.storage.format_statistics_text(dashboard)
+                + "\n\n📡 Telegram по дням (Москва)\n"
+                + telegram_fallback,
                 _inline_keyboard([
-                    [("↻ Обновить", "ui:stats", "primary", False)],
+                    [
+                        ("↻ Обновить", "ui:stats", "primary", False),
+                        ("⛔ Отметить ограничение", "telegram:mark", "danger", False),
+                    ],
                     _main_navigation("stats"),
                 ]),
             )
@@ -589,6 +604,27 @@ class ControlBot:
             await query.answer()
             await state.clear()
             await self._edit_panel(query, str(query.data))
+
+        @r.callback_query(F.data == "telegram:mark")
+        async def telegram_restriction_handler(query: CallbackQuery) -> None:
+            bucket = datetime.now(UTC).replace(
+                minute=0, second=0, microsecond=0
+            ).isoformat()
+            await self.storage.increment_telegram_activity(
+                bucket,
+                {"manual_restriction_marks": 1},
+            )
+            await self.storage.add_event(
+                "TELEGRAM_RESTRICTION_MARKED",
+                "Пользователь отметил наблюдаемое ограничение игрового бота",
+                level="WARNING",
+            )
+            await query.answer("Ограничение зафиксировано", show_alert=True)
+            await self._edit_panel(
+                query,
+                "stats",
+                notice="Ограничение отмечено в текущем часовом интервале.",
+            )
 
         @r.callback_query(F.data.in_({"ctl:start", "ctl:pause", "ctl:resume", "ctl:stop"}))
         async def control_handler(query: CallbackQuery, state: FSMContext) -> None:

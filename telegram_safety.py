@@ -5,7 +5,6 @@ import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 
 from telegram_buttons import get_button_texts
 
@@ -28,70 +27,6 @@ def message_state_key(message) -> tuple:
         semantic_message_text(message.raw_text or ""),
         tuple(get_button_texts(message)),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class PacingUpdate:
-    previous_factor: float
-    factor: float
-    pressure: str
-
-    @property
-    def changed(self) -> bool:
-        return abs(self.factor - self.previous_factor) >= 0.001
-
-
-class AdaptivePacingController:
-    """Slows down after real Telegram incidents and recovers gradually."""
-
-    def __init__(
-        self,
-        *,
-        minimum_factor: float,
-        maximum_factor: float,
-        adjust_interval: float,
-        acceleration_lock: float,
-        clock: Clock = time.monotonic,
-    ) -> None:
-        if not 0 < minimum_factor <= 1.0 <= maximum_factor:
-            raise ValueError("Некорректные границы автоматического темпа")
-        self.minimum_factor = minimum_factor
-        self.maximum_factor = maximum_factor
-        self.adjust_interval = max(1.0, adjust_interval)
-        self.acceleration_lock = max(0.0, acceleration_lock)
-        self.clock = clock
-        self.factor = 1.0
-        self.last_adjusted_at = self.clock()
-        self.acceleration_locked_until = 0.0
-        self.pressure = "normal"
-
-    def observe(self) -> PacingUpdate:
-        """Gradually restores the normal pace when Telegram reports no errors."""
-        now = self.clock()
-        previous = self.factor
-        if now < self.acceleration_locked_until:
-            self.pressure = "recovery"
-            return PacingUpdate(previous, self.factor, self.pressure)
-        self.pressure = "normal"
-        if now - self.last_adjusted_at < self.adjust_interval:
-            return PacingUpdate(previous, self.factor, self.pressure)
-
-        self.factor = max(self.minimum_factor, self.factor - 0.02)
-        self.last_adjusted_at = now
-        return PacingUpdate(previous, self.factor, self.pressure)
-
-    def register_incident(self, *, severe: bool = False) -> PacingUpdate:
-        now = self.clock()
-        previous = self.factor
-        floor = 1.35 if severe else 1.20
-        self.factor = min(self.maximum_factor, max(floor, self.factor + 0.15))
-        self.pressure = "cooldown"
-        self.last_adjusted_at = now
-        self.acceleration_locked_until = max(
-            self.acceleration_locked_until,
-            now + self.acceleration_lock,
-        )
-        return PacingUpdate(previous, self.factor, self.pressure)
 
 
 class StateRefreshGate:

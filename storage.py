@@ -189,6 +189,26 @@ class Storage:
             PRIMARY KEY(location_name, position_x, position_y)
         );
 
+        CREATE TABLE IF NOT EXISTS telegram_activity_hourly (
+            bucket_start TEXT PRIMARY KEY,
+            outgoing_total INTEGER NOT NULL DEFAULT 0,
+            inline_callbacks INTEGER NOT NULL DEFAULT 0,
+            map_requests INTEGER NOT NULL DEFAULT 0,
+            peak_actions_1m INTEGER NOT NULL DEFAULT 0,
+            peak_actions_10m INTEGER NOT NULL DEFAULT 0,
+            incoming_new_messages INTEGER NOT NULL DEFAULT 0,
+            incoming_message_edits INTEGER NOT NULL DEFAULT 0,
+            incoming_semantic_states INTEGER NOT NULL DEFAULT 0,
+            callback_successes INTEGER NOT NULL DEFAULT 0,
+            callback_timeouts INTEGER NOT NULL DEFAULT 0,
+            flood_waits INTEGER NOT NULL DEFAULT 0,
+            flood_wait_seconds INTEGER NOT NULL DEFAULT 0,
+            recovery_attempts INTEGER NOT NULL DEFAULT 0,
+            silent_stalls INTEGER NOT NULL DEFAULT 0,
+            manual_restriction_marks INTEGER NOT NULL DEFAULT 0,
+            rpc_errors INTEGER NOT NULL DEFAULT 0
+        );
+
         DROP TABLE IF EXISTS combat_policy_stats;
         DROP TABLE IF EXISTS combat_strategy_stats;
         """)
@@ -291,6 +311,13 @@ class Storage:
                      )""",
                 (cutoff,),
             ).rowcount
+            telemetry_cutoff = (
+                datetime.now(UTC) - timedelta(days=90)
+            ).replace(minute=0, second=0, microsecond=0).isoformat()
+            self.connection.execute(
+                "DELETE FROM telegram_activity_hourly WHERE bucket_start < ?",
+                (telemetry_cutoff,),
+            )
             self.connection.commit()
             self.connection.execute("PRAGMA optimize")
             return {
@@ -300,6 +327,93 @@ class Storage:
                 "battles": max(0, deleted_battles),
                 "sessions": max(0, deleted_sessions),
             }
+
+    async def increment_telegram_activity(
+        self,
+        bucket_start: str,
+        metrics: dict[str, int],
+    ) -> None:
+        """Atomically merges one buffered hourly Telegram telemetry batch."""
+        columns = {
+            "outgoing_total",
+            "inline_callbacks",
+            "map_requests",
+            "peak_actions_1m",
+            "peak_actions_10m",
+            "incoming_new_messages",
+            "incoming_message_edits",
+            "incoming_semantic_states",
+            "callback_successes",
+            "callback_timeouts",
+            "flood_waits",
+            "flood_wait_seconds",
+            "recovery_attempts",
+            "silent_stalls",
+            "manual_restriction_marks",
+            "rpc_errors",
+        }
+        values = {
+            key: max(0, int(value))
+            for key, value in metrics.items()
+            if key in columns and int(value) > 0
+        }
+        if not values:
+            return
+        names = list(values)
+        insert_columns = ",".join(["bucket_start", *names])
+        placeholders = ",".join("?" for _ in range(len(names) + 1))
+        peak_columns = {"peak_actions_1m", "peak_actions_10m"}
+        updates = ",".join(
+            (
+                f"{name}=MAX({name},excluded.{name})"
+                if name in peak_columns
+                else f"{name}={name}+excluded.{name}"
+            )
+            for name in names
+        )
+        async with self.lock:
+            self.connection.execute(
+                f"""INSERT INTO telegram_activity_hourly({insert_columns})
+                    VALUES ({placeholders})
+                    ON CONFLICT(bucket_start) DO UPDATE SET {updates}""",
+                (bucket_start, *(values[name] for name in names)),
+            )
+            self.connection.commit()
+
+    async def get_telegram_activity_daily(
+        self,
+        days: int = 14,
+    ) -> list[dict[str, int | str]]:
+        """Returns compact Moscow-day totals; empty days are intentionally omitted."""
+        cutoff = (datetime.now(UTC) - timedelta(days=max(1, days) - 1)).date().isoformat()
+        async with self.lock:
+            rows = self.connection.execute(
+                """
+                SELECT date(bucket_start, '+3 hours') day,
+                       SUM(outgoing_total) outgoing_total,
+                       SUM(inline_callbacks) inline_callbacks,
+                       SUM(map_requests) map_requests,
+                       MAX(peak_actions_1m) peak_actions_1m,
+                       MAX(peak_actions_10m) peak_actions_10m,
+                       SUM(incoming_new_messages) incoming_new_messages,
+                       SUM(incoming_message_edits) incoming_message_edits,
+                       SUM(incoming_semantic_states) incoming_semantic_states,
+                       SUM(callback_successes) callback_successes,
+                       SUM(callback_timeouts) callback_timeouts,
+                       SUM(flood_waits) flood_waits,
+                       SUM(flood_wait_seconds) flood_wait_seconds,
+                       SUM(recovery_attempts) recovery_attempts,
+                       SUM(silent_stalls) silent_stalls,
+                       SUM(manual_restriction_marks) manual_restriction_marks,
+                       SUM(rpc_errors) rpc_errors
+                FROM telegram_activity_hourly
+                WHERE bucket_start >= ?
+                GROUP BY date(bucket_start, '+3 hours')
+                ORDER BY day DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     async def compact_if_needed(
         self,

@@ -51,7 +51,6 @@ from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_b
 from storage import Storage
 from targeting import select_combat_target
 from telegram_safety import (
-    AdaptivePacingController,
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
@@ -1849,7 +1848,7 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(farmer.inbound_generation, 1)
         self.assertEqual(farmer.event_queue.qsize(), 2)
 
-    def test_repeated_flood_waits_increase_pause_without_stopping(self) -> None:
+    def test_flood_wait_uses_only_server_delay_and_small_buffer(self) -> None:
         farmer = Farmer.__new__(Farmer)
         farmer.telegram_flood_incidents = deque()
 
@@ -1858,19 +1857,10 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         third_pause, third_count = farmer.flood_wait_pause(3)
 
         self.assertEqual((first_pause, first_count), (5.0, 1))
-        self.assertEqual((second_pause, second_count), (15.0, 2))
-        self.assertEqual((third_pause, third_count), (30.0, 3))
+        self.assertEqual((second_pause, second_count), (5.0, 2))
+        self.assertEqual((third_pause, third_count), (5.0, 3))
 
-    def test_repeated_silent_stalls_increase_quiet_period(self) -> None:
-        farmer = Farmer.__new__(Farmer)
-        farmer.telegram_silent_stall_incidents = deque()
-
-        self.assertEqual(farmer.silent_stall_pause(), (300.0, 1))
-        self.assertEqual(farmer.silent_stall_pause(), (600.0, 2))
-        self.assertEqual(farmer.silent_stall_pause(), (1200.0, 3))
-        self.assertEqual(farmer.silent_stall_pause(), (1800.0, 4))
-
-    async def test_recovery_limit_starts_cooldown_instead_of_stopping(self) -> None:
+    async def test_recovery_limit_records_incident_without_cooldown_or_stop(self) -> None:
         farmer = Farmer.__new__(Farmer)
         farmer.event_queue = asyncio.Queue()
         farmer.state = BotState.COMBAT
@@ -1880,16 +1870,17 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         farmer.watchdog = ProgressWatchdog()
         farmer.request_map_refresh = AsyncMock(return_value=True)
-        farmer.pause_for_silent_stall = AsyncMock()
+        farmer.record_silent_stall = AsyncMock()
+        farmer.record_telegram_metric = lambda _metric: None
         farmer.stop = AsyncMock()
 
         self.assertTrue(await farmer.recover_latest_state("first probe"))
-        self.assertFalse(await farmer.recover_latest_state("still silent"))
+        self.assertTrue(await farmer.recover_latest_state("still silent"))
 
-        farmer.pause_for_silent_stall.assert_awaited_once_with("still silent")
+        farmer.record_silent_stall.assert_awaited_once_with("still silent")
         farmer.stop.assert_not_awaited()
 
-    async def test_callback_timeout_pauses_without_retry_or_stop(self) -> None:
+    async def test_callback_timeout_is_recorded_without_retry_pause_or_stop(self) -> None:
         with TemporaryDirectory() as directory:
             message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
             click_count = 0
@@ -1923,12 +1914,6 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
                 min_interval=0.0,
             )
             farmer.telegram_action_telemetry = TelegramActionTelemetry()
-            farmer.telegram_pacing = AdaptivePacingController(
-                minimum_factor=0.9,
-                maximum_factor=1.5,
-                adjust_interval=180.0,
-                acceleration_lock=1800.0,
-            )
             farmer.event_queue = asyncio.Queue()
             farmer.callback_timeout_count = 0
             farmer.mark_progress = lambda _message: None
@@ -1939,17 +1924,8 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(clicked)
             self.assertTrue(farmer.running)
             self.assertEqual(click_count, 1)
-            self.assertGreaterEqual(farmer.telegram_cooldown_remaining(), 29.0)
-            self.assertIsNotNone(await farmer.storage.get_setting("telegram_cooldown_until"))
-
-            assert farmer.telegram_cooldown_task is not None
-            farmer.telegram_cooldown_task.cancel()
-            try:
-                await farmer.telegram_cooldown_task
-            except asyncio.CancelledError:
-                pass
-            farmer.telegram_cooldown_task = None
-            farmer.telegram_cooldown_until = 0.0
+            self.assertEqual(farmer.telegram_cooldown_remaining(), 0.0)
+            self.assertIsNone(await farmer.storage.get_setting("telegram_cooldown_until"))
 
             repeated = await farmer.press_button(message, 0, 0, "другая атака")
             self.assertFalse(repeated)
@@ -1973,13 +1949,13 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         farmer.attempted_actions = BoundedKeyCache()
         farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
         farmer.record_telegram_action = lambda _kind: None
-        farmer.pause_for_callback_timeout = AsyncMock()
+        farmer.record_callback_timeout = AsyncMock()
 
         with patch("farmer.TELEGRAM_CALLBACK_RPC_TIMEOUT", 0.01):
             clicked = await farmer.press_button(message, 0, 0, "атака")
 
         self.assertFalse(clicked)
-        farmer.pause_for_callback_timeout.assert_awaited_once()
+        farmer.record_callback_timeout.assert_awaited_once()
 
     def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
         now = 100.0
@@ -2135,10 +2111,9 @@ class HumanDelayTests(unittest.TestCase):
 
         self.assertTrue(all(240.0 <= duration <= 480.0 for duration in durations))
 
-    def test_automatic_pacing_scales_configured_action_delays(self) -> None:
+    def test_observation_mode_keeps_configured_action_delays(self) -> None:
         farmer = Farmer.__new__(Farmer)
         farmer.delay_model = HumanDelayModel(random.Random(9))
-        farmer.telegram_pacing = SimpleNamespace(factor=1.2)
         farmer.settings = SimpleNamespace(
             values=SimpleNamespace(
                 move_delay_min=10.0,
@@ -2154,31 +2129,7 @@ class HumanDelayTests(unittest.TestCase):
 
         delays = [farmer.action_delay(action) for action in ActionType]
 
-        self.assertTrue(all(12.0 <= delay <= 24.0 for delay in delays))
-
-    def test_pacing_reacts_to_real_incident_and_recovers_later(self) -> None:
-        now = 1000.0
-        pacing = AdaptivePacingController(
-            minimum_factor=0.9,
-            maximum_factor=1.5,
-            adjust_interval=180.0,
-            acceleration_lock=1800.0,
-            clock=lambda: now,
-        )
-
-        busy_but_healthy = pacing.observe()
-        incident = pacing.register_incident()
-        now += 600.0
-        locked = pacing.observe()
-        now += 1201.0
-        recovered = pacing.observe()
-
-        self.assertFalse(busy_but_healthy.changed)
-        self.assertGreater(incident.factor, 1.0)
-        self.assertEqual(locked.pressure, "recovery")
-        self.assertLess(recovered.factor, incident.factor)
-        self.assertEqual(recovered.pressure, "normal")
-
+        self.assertTrue(all(10.0 <= delay <= 20.0 for delay in delays))
 
 class SharedComponentTests(unittest.IsolatedAsyncioTestCase):
     async def test_blessing_flow_uses_single_manager(self) -> None:
@@ -2295,8 +2246,45 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("combat_knowledge", tables)
             self.assertIn("combat_battle_analysis", tables)
             self.assertIn("battle_currencies", tables)
+            self.assertIn("telegram_activity_hourly", tables)
             self.assertNotIn("combat_strategy_stats", tables)
             self.assertNotIn("combat_policy_stats", tables)
+            await storage.close()
+
+    async def test_telegram_activity_is_aggregated_by_day(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            await storage.increment_telegram_activity(
+                "2026-08-26T10:00:00+00:00",
+                {
+                    "outgoing_total": 7,
+                    "inline_callbacks": 6,
+                    "peak_actions_1m": 4,
+                },
+            )
+            await storage.increment_telegram_activity(
+                "2026-08-26T10:00:00+00:00",
+                {
+                    "outgoing_total": 2,
+                    "manual_restriction_marks": 1,
+                    "peak_actions_1m": 3,
+                },
+            )
+            await storage.increment_telegram_activity(
+                "2026-08-26T11:00:00+00:00",
+                {"incoming_message_edits": 12, "silent_stalls": 1},
+            )
+
+            with patch("storage.datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = datetime(2026, 8, 26, tzinfo=UTC)
+                days = await storage.get_telegram_activity_daily(days=1)
+
+            self.assertEqual(len(days), 1)
+            self.assertEqual(days[0]["outgoing_total"], 9)
+            self.assertEqual(days[0]["peak_actions_1m"], 4)
+            self.assertEqual(days[0]["incoming_message_edits"], 12)
+            self.assertEqual(days[0]["manual_restriction_marks"], 1)
+            self.assertEqual(days[0]["silent_stalls"], 1)
             await storage.close()
 
     async def test_opening_database_removes_obsolete_combat_tables(self) -> None:

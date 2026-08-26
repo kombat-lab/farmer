@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from collections import deque
+from collections import Counter, defaultdict, deque
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,21 +58,10 @@ from config import (
     TARGET_SELECTION_TIMEOUT,
     TELEGRAM_ACTION_MIN_INTERVAL,
     TELEGRAM_CALLBACK_RPC_TIMEOUT,
-    TELEGRAM_CALLBACK_TIMEOUT_BASE,
-    TELEGRAM_CALLBACK_TIMEOUT_MAX,
-    TELEGRAM_FLOOD_BACKOFF_BASE,
-    TELEGRAM_FLOOD_BACKOFF_MAX,
     TELEGRAM_FLOOD_INCIDENT_WINDOW,
     TELEGRAM_FLOOD_WAIT_BUFFER,
-    TELEGRAM_PACING_ACCELERATION_LOCK,
-    TELEGRAM_PACING_ADJUST_INTERVAL,
-    TELEGRAM_PACING_MAX_FACTOR,
-    TELEGRAM_PACING_MIN_FACTOR,
     TELEGRAM_RECOVERY_LIMIT,
     TELEGRAM_RECOVERY_WINDOW,
-    TELEGRAM_SILENT_STALL_BACKOFF_BASE,
-    TELEGRAM_SILENT_STALL_BACKOFF_MAX,
-    TELEGRAM_SILENT_STALL_INCIDENT_WINDOW,
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
@@ -102,7 +91,6 @@ from storage import Storage, utc_now
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
 from telegram_safety import (
-    AdaptivePacingController,
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
@@ -192,7 +180,10 @@ class Farmer:
         self.telegram_cooldown_notified = False
         self.telegram_cooldown_changed = asyncio.Event()
         self.telegram_flood_incidents: deque[float] = deque()
-        self.telegram_silent_stall_incidents: deque[float] = deque()
+        self.telegram_metrics_pending: dict[str, Counter[str]] = defaultdict(Counter)
+        self.telegram_metrics_flush_task: asyncio.Task | None = None
+        self.telegram_metrics_flush_lock = asyncio.Lock()
+        self.silent_stall_generation: int | None = None
 
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
@@ -212,13 +203,6 @@ class Farmer:
             min_interval=TELEGRAM_ACTION_MIN_INTERVAL,
         )
         self.telegram_action_telemetry = TelegramActionTelemetry()
-        self.telegram_pacing = AdaptivePacingController(
-            minimum_factor=TELEGRAM_PACING_MIN_FACTOR,
-            maximum_factor=TELEGRAM_PACING_MAX_FACTOR,
-            adjust_interval=TELEGRAM_PACING_ADJUST_INTERVAL,
-            acceleration_lock=TELEGRAM_PACING_ACCELERATION_LOCK,
-        )
-
         self.blessing = BlessingManager()
 
     def choose_cycle_move_target(self) -> int:
@@ -233,20 +217,20 @@ class Farmer:
 
     def record_telegram_action(self, kind: str) -> None:
         snapshot = self.telegram_action_telemetry.record(kind)
-        last_minute_value = snapshot["last_minute"]
-        last_ten_minutes_value = snapshot["last_ten_minutes"]
-        last_minute = last_minute_value if isinstance(last_minute_value, int) else 0
-        last_ten_minutes = (
-            last_ten_minutes_value if isinstance(last_ten_minutes_value, int) else 0
+        self.record_telegram_metric("outgoing_total")
+        self.record_telegram_metric(
+            "inline_callbacks" if kind == "inline_callback" else "map_requests"
         )
-        pacing = self.telegram_pacing.observe()
-        if pacing.changed:
-            self.log(
-                "[TELEGRAM_PACING] коэффициент "
-                f"{pacing.previous_factor:.2f} → {pacing.factor:.2f}; "
-                f"режим={pacing.pressure}, 1 мин={last_minute}, "
-                f"10 мин={last_ten_minutes}."
-            )
+        last_minute = snapshot["last_minute"]
+        last_ten_minutes = snapshot["last_ten_minutes"]
+        self.record_telegram_metric_peak(
+            "peak_actions_1m",
+            last_minute if isinstance(last_minute, int) else 0,
+        )
+        self.record_telegram_metric_peak(
+            "peak_actions_10m",
+            last_ten_minutes if isinstance(last_ten_minutes, int) else 0,
+        )
         total_value = snapshot["total"]
         total = total_value if isinstance(total_value, int) else 0
         if total % 10 == 0:
@@ -256,6 +240,51 @@ class Farmer:
                 f"за 10 мин={snapshot['last_ten_minutes']}, "
                 f"типы={snapshot['by_kind']}"
             )
+
+    @staticmethod
+    def telegram_metric_bucket() -> str:
+        return datetime.now(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+
+    def record_telegram_metric(self, metric: str, amount: int = 1) -> None:
+        """Buffers diagnostics locally; it never slows or blocks Telegram actions."""
+        if not hasattr(self, "telegram_metrics_pending"):
+            return
+        self.telegram_metrics_pending[self.telegram_metric_bucket()][metric] += amount
+        task = self.telegram_metrics_flush_task
+        if task is None or task.done():
+            self.telegram_metrics_flush_task = asyncio.create_task(
+                self._flush_telegram_metrics_after_delay(),
+                name="telegram-telemetry-flush",
+            )
+
+    def record_telegram_metric_peak(self, metric: str, value: int) -> None:
+        """Keeps a high-water mark inside the current hourly buffer."""
+        if not hasattr(self, "telegram_metrics_pending"):
+            return
+        bucket = self.telegram_metric_bucket()
+        self.telegram_metrics_pending[bucket][metric] = max(
+            self.telegram_metrics_pending[bucket][metric],
+            value,
+        )
+
+    async def _flush_telegram_metrics_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(15.0)
+            await self.flush_telegram_metrics()
+        except asyncio.CancelledError:
+            return
+
+    async def flush_telegram_metrics(self) -> None:
+        async with self.telegram_metrics_flush_lock:
+            pending = self.telegram_metrics_pending
+            self.telegram_metrics_pending = defaultdict(Counter)
+            try:
+                for bucket, metrics in pending.items():
+                    await self.storage.increment_telegram_activity(bucket, dict(metrics))
+            except BaseException:
+                for bucket, metrics in pending.items():
+                    self.telegram_metrics_pending[bucket].update(metrics)
+                raise
 
     def _new_combat_knowledge(self) -> RecentCombatKnowledge:
         knowledge = RecentCombatKnowledge()
@@ -502,6 +531,7 @@ class Farmer:
             ):
                 self.latest_received_message = message
             return
+        self.record_telegram_metric("incoming_semantic_states")
         if not is_passive_health_notification(message.raw_text or ""):
             self.latest_received_message = message
             self.inbound_generation += 1
@@ -557,10 +587,9 @@ class Farmer:
             ActionType.USE_SKILL: (s.skill_delay_min, s.skill_delay_max),
         }
         minimum, maximum = ranges[action_type]
-        factor = self.telegram_pacing.factor
         return self.delay_model.action_delay(
-            minimum * factor,
-            maximum * factor,
+            minimum,
+            maximum,
             urgent=urgent,
             remaining_seconds=remaining_seconds,
         )
@@ -586,8 +615,6 @@ class Farmer:
                 else None
             ),
             "telegram_cooldown_reason": self.telegram_cooldown_reason,
-            "telegram_pacing_factor": self.telegram_pacing.factor,
-            "telegram_pacing_pressure": self.telegram_pacing.pressure,
             "telegram_actions_1m": snapshot["last_minute"],
             "telegram_actions_10m": snapshot["last_ten_minutes"],
         }
@@ -612,6 +639,11 @@ class Farmer:
         reason = await self.storage.get_setting(
             "telegram_cooldown_reason", "восстановленная пауза Telegram"
         )
+        if not str(reason).startswith("Telegram FLOOD_WAIT"):
+            await self.storage.delete_settings(
+                {"telegram_cooldown_until", "telegram_cooldown_reason"}
+            )
+            return
         self.telegram_cooldown_until = time.monotonic() + remaining
         self.telegram_cooldown_until_utc = until
         self.telegram_cooldown_reason = str(reason)
@@ -631,7 +663,6 @@ class Farmer:
         resume_mode: str,
         event_type: str,
         payload: dict[str, object] | None = None,
-        severe: bool = False,
     ) -> None:
         pause = max(1.0, seconds)
         deadline = time.monotonic() + pause
@@ -644,7 +675,6 @@ class Farmer:
         if resume_mode == "refresh":
             self.telegram_cooldown_resume_mode = "refresh"
 
-        pacing = self.telegram_pacing.register_incident(severe=severe)
         self.mark_progress(f"Telegram-пауза: {reason}")
         persisted_until = self.telegram_cooldown_until_utc or until_utc
         await self.storage.set_settings(
@@ -656,7 +686,6 @@ class Farmer:
         event_payload = {
             "pause_seconds": pause,
             "action": action,
-            "pacing_factor": pacing.factor,
             "telegram_actions": self.telegram_action_telemetry.snapshot(),
             "queue_size": self.event_queue.qsize(),
         }
@@ -669,8 +698,7 @@ class Farmer:
             payload=event_payload,
         )
         self.log(
-            f"{reason}. Исходящие действия приостановлены на {pause:.0f} сек.; "
-            f"темп x{pacing.factor:.2f}."
+            f"{reason}. Исходящие действия приостановлены на {pause:.0f} сек."
         )
         if not self.telegram_cooldown_notified:
             await self.notifier.send(
@@ -750,15 +778,7 @@ class Farmer:
             self.telegram_flood_incidents.popleft()
         self.telegram_flood_incidents.append(now)
         count = len(self.telegram_flood_incidents)
-        repeated_backoff = (
-            0.0
-            if count == 1
-            else min(
-                TELEGRAM_FLOOD_BACKOFF_MAX,
-                TELEGRAM_FLOOD_BACKOFF_BASE * (2 ** (count - 2)),
-            )
-        )
-        return max(server_seconds + TELEGRAM_FLOOD_WAIT_BUFFER, repeated_backoff), count
+        return server_seconds + TELEGRAM_FLOOD_WAIT_BUFFER, count
 
     async def pause_for_flood_wait(
         self,
@@ -768,6 +788,8 @@ class Farmer:
         resume_mode: str,
     ) -> None:
         server_seconds = max(1, int(error.seconds))
+        self.record_telegram_metric("flood_waits")
+        self.record_telegram_metric("flood_wait_seconds", server_seconds)
         pause, incident_count = self.flood_wait_pause(server_seconds)
         await self.start_telegram_cooldown(
             pause,
@@ -779,64 +801,46 @@ class Farmer:
                 "server_seconds": server_seconds,
                 "incident_count_10m": incident_count,
             },
-            severe=server_seconds >= 60 or incident_count >= 3,
         )
 
-    def silent_stall_pause(self) -> tuple[float, int]:
-        """Return an increasing quiet period for unanswered recovery probes."""
-        now = time.monotonic()
-        cutoff = now - TELEGRAM_SILENT_STALL_INCIDENT_WINDOW
-        while (
-            self.telegram_silent_stall_incidents
-            and self.telegram_silent_stall_incidents[0] <= cutoff
-        ):
-            self.telegram_silent_stall_incidents.popleft()
-        self.telegram_silent_stall_incidents.append(now)
-        count = len(self.telegram_silent_stall_incidents)
-        pause = min(
-            TELEGRAM_SILENT_STALL_BACKOFF_MAX,
-            TELEGRAM_SILENT_STALL_BACKOFF_BASE * (2 ** min(count - 1, 20)),
-        )
-        return pause, count
-
-    async def pause_for_silent_stall(self, reason: str) -> None:
-        pause, incident_count = self.silent_stall_pause()
-        await self.start_telegram_cooldown(
-            pause,
-            reason=(
-                "игра не отвечает на аварийные проверки; "
-                "возможно тихое ограничение Telegram"
-            ),
-            action=MAP_COMMAND,
-            resume_mode="refresh",
-            event_type="TELEGRAM_SILENT_STALL",
+    async def record_silent_stall(self, reason: str) -> None:
+        """Records a suspected silent restriction without changing the pace."""
+        if self.silent_stall_generation == self.inbound_generation:
+            return
+        self.silent_stall_generation = self.inbound_generation
+        self.record_telegram_metric("silent_stalls")
+        await self.storage.add_event(
+            "TELEGRAM_SILENT_STALL",
+            "игра не отвечает на проверки; возможное тихое ограничение Telegram",
+            level="WARNING",
             payload={
                 "recovery_reason": reason,
-                "unanswered_recoveries": TELEGRAM_RECOVERY_LIMIT,
-                "incident_count_2h": incident_count,
+                "inbound_generation": self.inbound_generation,
+                "telegram_actions": self.telegram_action_telemetry.snapshot(),
             },
-            severe=True,
+        )
+        self.log(
+            "[TELEGRAM_DIAGNOSTIC] Зафиксирован признак тихого ограничения; "
+            "искусственная пауза не вводится."
         )
 
-    async def pause_for_callback_timeout(self, description: str, detail: str) -> None:
+    async def record_callback_timeout(self, description: str, detail: str) -> None:
         # The callback may already have reached the game. Never repeat the same
-        # semantic action blindly; pause and reconcile with one fresh state.
+        # semantic action blindly. Record the uncertainty without changing pace.
         self.callback_timeout_count += 1
-        pause = min(
-            TELEGRAM_CALLBACK_TIMEOUT_MAX,
-            TELEGRAM_CALLBACK_TIMEOUT_BASE * (2 ** (self.callback_timeout_count - 1)),
+        self.record_telegram_metric("callback_timeouts")
+        await self.storage.add_event(
+            "TELEGRAM_CALLBACK_TIMEOUT",
+            f"{detail}: результат inline-действия «{description}» неизвестен",
+            level="WARNING",
+            payload={
+                "consecutive_timeouts": self.callback_timeout_count,
+                "telegram_actions": self.telegram_action_telemetry.snapshot(),
+            },
         )
-        await self.start_telegram_cooldown(
-            pause,
-            reason=(
-                f"{detail}: результат inline-действия неизвестен "
-                f"({self.callback_timeout_count} подряд)"
-            ),
-            action=description,
-            resume_mode="refresh",
-            event_type="TELEGRAM_CALLBACK_TIMEOUT",
-            payload={"consecutive_timeouts": self.callback_timeout_count},
-            severe=self.callback_timeout_count >= 2,
+        self.log(
+            f"[TELEGRAM_DIAGNOSTIC] {detail}; результат «{description}» неизвестен. "
+            "Повтор этого действия заблокирован, искусственная пауза не вводится."
         )
 
     async def reserve_telegram_action_slot(self, action: str) -> bool:
@@ -893,6 +897,7 @@ class Farmer:
                 timeout=TELEGRAM_CALLBACK_RPC_TIMEOUT,
             )
             self.callback_timeout_count = 0
+            self.record_telegram_metric("callback_successes")
             return True
         except FloodWaitError as error:
             # Telegram rejected this RPC before the game could process it. It
@@ -906,18 +911,19 @@ class Farmer:
             )
             return False
         except BotResponseTimeoutError:
-            await self.pause_for_callback_timeout(
+            await self.record_callback_timeout(
                 description,
                 "BOT_RESPONSE_TIMEOUT",
             )
             return False
         except TimeoutError:
-            await self.pause_for_callback_timeout(
+            await self.record_callback_timeout(
                 description,
                 f"callback RPC не завершился за {TELEGRAM_CALLBACK_RPC_TIMEOUT:.0f} сек.",
             )
             return False
         except RPCError as error:
+            self.record_telegram_metric("rpc_errors")
             self.log(
                 f"Telegram не выполнил нажатие «{description}»: "
                 f"{type(error).__name__}: {error}"
@@ -1971,17 +1977,15 @@ class Farmer:
             )
             return False
 
-        if not self.recovery_attempt_guard.allow():
-            await self.pause_for_silent_stall(reason)
-            return False
+        within_observation_window = self.recovery_attempt_guard.allow()
+        self.record_telegram_metric("recovery_attempts")
 
         attempt = self.watchdog.begin_recovery_attempt()
 
         self.log(f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}")
 
-        if attempt > MAX_RECOVERY_ATTEMPTS:
-            await self.pause_for_silent_stall(reason)
-            return False
+        if not within_observation_window or attempt > MAX_RECOVERY_ATTEMPTS:
+            await self.record_silent_stall(reason)
 
         # Telethon already delivered the newest state to the local cache.
         # Reading history here adds an RPC and risks replaying an old inline UI.
@@ -2419,6 +2423,14 @@ class Farmer:
             },
         )
         await self.persist_combat_knowledge()
+        metrics_flush_task = getattr(self, "telegram_metrics_flush_task", None)
+        if metrics_flush_task:
+            metrics_flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await metrics_flush_task
+            self.telegram_metrics_flush_task = None
+        if hasattr(self, "telegram_metrics_pending"):
+            await self.flush_telegram_metrics()
         await self.storage.checkpoint()
         for task in (
             self.worker_task,
@@ -2497,8 +2509,8 @@ class Farmer:
         logger.info("FoG Farmer запущен")
         logger.info("Telegram-сессия подключена")
         logger.info(
-            "Telegram-предохранитель: без фиксированного бюджета; "
-            "интервал не менее %.1f сек.; темп адаптируется по реальным инцидентам.",
+            "Telegram: наблюдение без локального бюджета и автозамедления; "
+            "дополнительный интервал %.1f сек.",
             TELEGRAM_ACTION_MIN_INTERVAL,
         )
         logger.info("Персонаж: %s", CHARACTER_NAME)
@@ -2526,12 +2538,19 @@ class Farmer:
         )
         logger.info("=" * 72)
 
-        @self.client.on(events.NewMessage(chats=self.game_bot))
-        @self.client.on(events.MessageEdited(chats=self.game_bot))
-        async def on_game_message(event) -> None:
+        async def accept_game_message(event, metric: str) -> None:
             if event.message.out:
                 return
+            self.record_telegram_metric(metric)
             await self.enqueue_message(event.message)
+
+        @self.client.on(events.NewMessage(chats=self.game_bot))
+        async def on_game_message(event) -> None:
+            await accept_game_message(event, "incoming_new_messages")
+
+        @self.client.on(events.MessageEdited(chats=self.game_bot))
+        async def on_game_message_edit(event) -> None:
+            await accept_game_message(event, "incoming_message_edits")
 
         self.worker_task = asyncio.create_task(self.event_worker())
         self.watchdog_task = asyncio.create_task(self.watchdog_loop())

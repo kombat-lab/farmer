@@ -14,6 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    DisabledButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -68,13 +69,11 @@ def _inline_button(
     style: str | None = None,
     disabled: bool = False,
 ) -> InlineKeyboardButton:
-    # disabled появился в Bot API 10.3. aiogram 3.30 сохраняет неизвестные
-    # поля через extra_data и отправляет их без собственного класса-обёртки.
     return InlineKeyboardButton(
         text=text,
         callback_data=None if disabled else callback_data,
         style=style,
-        disabled={} if disabled else None,
+        disabled=DisabledButton() if disabled else None,
     )
 
 

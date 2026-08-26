@@ -1404,48 +1404,68 @@ class RichMessagePanelTests(unittest.TestCase):
         self.assertTrue(callback_values)
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callback_values))
 
-    def test_aiogram_compatibility_layer_preserves_10_3_fields(self) -> None:
+    def test_aiogram_3_31_uses_typed_bot_api_10_3_fields(self) -> None:
+        from aiogram.types import DisabledButton
+
         from control_bot import _inline_button, _inline_keyboard
 
-        selected = _inline_button(
+        selected_button = _inline_button(
             "100%",
             "settings:hp:100",
             style="primary",
             disabled=True,
-        ).model_dump(exclude_none=True)
+        )
+        selected = selected_button.model_dump(exclude_none=True)
         prompt = _inline_keyboard(
             [[("Отмена", "input:cancel", "danger", False)]],
             force_reply=True,
         ).model_dump(exclude_none=True)
 
+        self.assertIsInstance(selected_button.disabled, DisabledButton)
         self.assertEqual(selected["disabled"], {})
         self.assertNotIn("callback_data", selected)
         self.assertTrue(prompt["force_reply"])
 
-    def test_aiogram_compatibility_layer_removes_unknown_rich_blocks(self) -> None:
-        from rich_messages import aiogram_compatible_rich_html
-
-        html = (
-            '<h2>Панель</h2><tg-button-row align="center">'
-            '<tg-button type="callback_data" data="ui:home">Домой</tg-button>'
-            "</tg-button-row><blockquote expandable>Диагностика</blockquote>"
-            "<table><tr><td>Данные</td></tr></table>"
+    def test_aiogram_3_31_deserializes_bot_api_10_3_rich_blocks(self) -> None:
+        from aiogram.types import (
+            RichBlockButtons,
+            RichBlockExpandableBlockQuotation,
+            RichMessage,
         )
 
-        compatible = aiogram_compatible_rich_html(html)
+        message = RichMessage.model_validate(
+            {
+                "blocks": [
+                    {
+                        "type": "buttons",
+                        "buttons": [
+                            {
+                                "text": "Домой",
+                                "callback_data": "ui:home",
+                                "style": "primary",
+                            }
+                        ],
+                        "align": "center",
+                    },
+                    {
+                        "type": "expandable_blockquote",
+                        "text": "Диагностика",
+                    },
+                ]
+            }
+        )
 
-        self.assertNotIn("tg-button", compatible)
-        self.assertNotIn("expandable", compatible)
-        self.assertIn("<blockquote>Диагностика</blockquote>", compatible)
-        self.assertIn("<table>", compatible)
+        self.assertIsInstance(message.blocks[0], RichBlockButtons)
+        self.assertIsInstance(message.blocks[1], RichBlockExpandableBlockQuotation)
 
 
 class RichMessageDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_send_moves_rich_buttons_to_inline_keyboard(self) -> None:
+    async def test_send_keeps_native_rich_buttons(self) -> None:
         from rich_messages import send_rich_with_fallback
 
         bot = SimpleNamespace(send_rich_message=AsyncMock())
-        markup = SimpleNamespace(name="inline")
+        remove_keyboard = SimpleNamespace(name="remove")
+        fallback_markup = SimpleNamespace(name="inline")
 
         await send_rich_with_fallback(
             bot,
@@ -1456,14 +1476,15 @@ class RichMessageDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "</tg-button-row>"
             ),
             fallback_text="Панель",
-            fallback_reply_markup=markup,
+            reply_markup=remove_keyboard,
+            fallback_reply_markup=fallback_markup,
         )
 
         arguments = bot.send_rich_message.await_args.kwargs
-        self.assertNotIn("tg-button", arguments["rich_message"].html)
-        self.assertIs(arguments["reply_markup"], markup)
+        self.assertIn("tg-button", arguments["rich_message"].html)
+        self.assertIs(arguments["reply_markup"], remove_keyboard)
 
-    async def test_edit_sends_only_aiogram_compatible_rich_blocks(self) -> None:
+    async def test_edit_keeps_native_expandable_blockquote(self) -> None:
         from rich_messages import edit_rich_with_fallback
 
         bot = SimpleNamespace(edit_message_text=AsyncMock())
@@ -1481,9 +1502,9 @@ class RichMessageDeliveryTests(unittest.IsolatedAsyncioTestCase):
         arguments = bot.edit_message_text.await_args.kwargs
         self.assertEqual(
             arguments["rich_message"].html,
-            "<blockquote>Диагностика</blockquote>",
+            "<blockquote expandable>Диагностика</blockquote>",
         )
-        self.assertIs(arguments["reply_markup"], markup)
+        self.assertNotIn("reply_markup", arguments)
 
 
 class MovementRecoveryTests(unittest.TestCase):

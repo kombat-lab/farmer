@@ -1,2 +1,2 @@
 telethon>=1.36,<2
-aiogram>=3.29,<4
+aiogram>=3.31,<4

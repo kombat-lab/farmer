@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from aiogram import Bot
+from aiogram import __version__ as aiogram_version
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
@@ -50,10 +51,10 @@ async def main() -> None:
     supervisor = FarmerSupervisor(storage, notifier, settings)
     control_bot = ControlBot(bot, storage, supervisor, settings)
 
-    logger.info("Запуск панели управления FoG Farmer на aiogram")
+    logger.info("Запуск панели управления FoG Farmer на aiogram %s", aiogram_version)
     await storage.add_event(
         "APPLICATION_STARTED",
-        "Контейнерное приложение запущено на aiogram",
+        f"Контейнерное приложение запущено на aiogram {aiogram_version}",
     )
     await control_bot.start()
 

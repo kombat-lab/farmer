@@ -86,6 +86,14 @@ TELEGRAM_ACTION_MIN_INTERVAL = 1.0
 TELEGRAM_RECOVERY_LIMIT = 3
 TELEGRAM_RECOVERY_WINDOW = 10 * 60.0
 
+# Telegram may accept an RPC without returning FLOOD_WAIT while game-bot
+# callbacks and unsolicited updates stop arriving. After several unanswered
+# recovery probes, stop sending requests for a while instead of stopping the
+# farmer or continuing to poll. Repeated silent stalls lengthen the pause.
+TELEGRAM_SILENT_STALL_INCIDENT_WINDOW = 2 * 60 * 60.0
+TELEGRAM_SILENT_STALL_BACKOFF_BASE = 5 * 60.0
+TELEGRAM_SILENT_STALL_BACKOFF_MAX = 30 * 60.0
+
 # Ограничение Telegram никогда не останавливает фармер. Серверное ожидание
 # дополняется запасом, а повторные инциденты увеличивают минимальную паузу.
 TELEGRAM_FLOOD_WAIT_BUFFER = 2.0
@@ -94,6 +102,7 @@ TELEGRAM_FLOOD_BACKOFF_BASE = 15.0
 TELEGRAM_FLOOD_BACKOFF_MAX = 5 * 60.0
 TELEGRAM_CALLBACK_TIMEOUT_BASE = 30.0
 TELEGRAM_CALLBACK_TIMEOUT_MAX = 5 * 60.0
+TELEGRAM_CALLBACK_RPC_TIMEOUT = 30.0
 
 # Автоматический темп замедляется после реального инцидента Telegram и затем
 # осторожно возвращается к обычному значению. Сама по себе активная игра не

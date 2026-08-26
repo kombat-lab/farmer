@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from telethon.errors import BotResponseTimeoutError
 
@@ -58,6 +58,7 @@ from telegram_safety import (
     TelegramActionTelemetry,
     message_state_key,
 )
+from watchdog import ProgressWatchdog
 
 CHARACTER = "Kombat"
 TARGETS = ["Черная мушка"]
@@ -1860,6 +1861,34 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((second_pause, second_count), (15.0, 2))
         self.assertEqual((third_pause, third_count), (30.0, 3))
 
+    def test_repeated_silent_stalls_increase_quiet_period(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.telegram_silent_stall_incidents = deque()
+
+        self.assertEqual(farmer.silent_stall_pause(), (300.0, 1))
+        self.assertEqual(farmer.silent_stall_pause(), (600.0, 2))
+        self.assertEqual(farmer.silent_stall_pause(), (1200.0, 3))
+        self.assertEqual(farmer.silent_stall_pause(), (1800.0, 4))
+
+    async def test_recovery_limit_starts_cooldown_instead_of_stopping(self) -> None:
+        farmer = Farmer.__new__(Farmer)
+        farmer.event_queue = asyncio.Queue()
+        farmer.state = BotState.COMBAT
+        farmer.recovery_attempt_guard = RollingAttemptGuard(
+            max_attempts=1,
+            window_seconds=600.0,
+        )
+        farmer.watchdog = ProgressWatchdog()
+        farmer.request_map_refresh = AsyncMock(return_value=True)
+        farmer.pause_for_silent_stall = AsyncMock()
+        farmer.stop = AsyncMock()
+
+        self.assertTrue(await farmer.recover_latest_state("first probe"))
+        self.assertFalse(await farmer.recover_latest_state("still silent"))
+
+        farmer.pause_for_silent_stall.assert_awaited_once_with("still silent")
+        farmer.stop.assert_not_awaited()
+
     async def test_callback_timeout_pauses_without_retry_or_stop(self) -> None:
         with TemporaryDirectory() as directory:
             message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
@@ -1927,6 +1956,30 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(farmer.running)
             self.assertEqual(click_count, 1)
             await farmer.storage.close()
+
+    async def test_hanging_callback_is_bounded_by_application_timeout(self) -> None:
+        message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
+        never_finishes = asyncio.Event()
+
+        async def click(_row: int, _column: int) -> None:
+            await never_finishes.wait()
+
+        message.click = click
+        farmer = Farmer.__new__(Farmer)
+        farmer.running = True
+        farmer.telegram_cooldown_until = 0.0
+        farmer.latest_messages = {message.id: message}
+        farmer.latest_received_message = message
+        farmer.attempted_actions = BoundedKeyCache()
+        farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
+        farmer.record_telegram_action = lambda _kind: None
+        farmer.pause_for_callback_timeout = AsyncMock()
+
+        with patch("farmer.TELEGRAM_CALLBACK_RPC_TIMEOUT", 0.01):
+            clicked = await farmer.press_button(message, 0, 0, "атака")
+
+        self.assertFalse(clicked)
+        farmer.pause_for_callback_timeout.assert_awaited_once()
 
     def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
         now = 100.0

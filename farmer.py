@@ -57,6 +57,7 @@ from config import (
     SESSION_NAME,
     TARGET_SELECTION_TIMEOUT,
     TELEGRAM_ACTION_MIN_INTERVAL,
+    TELEGRAM_CALLBACK_RPC_TIMEOUT,
     TELEGRAM_CALLBACK_TIMEOUT_BASE,
     TELEGRAM_CALLBACK_TIMEOUT_MAX,
     TELEGRAM_FLOOD_BACKOFF_BASE,
@@ -69,6 +70,9 @@ from config import (
     TELEGRAM_PACING_MIN_FACTOR,
     TELEGRAM_RECOVERY_LIMIT,
     TELEGRAM_RECOVERY_WINDOW,
+    TELEGRAM_SILENT_STALL_BACKOFF_BASE,
+    TELEGRAM_SILENT_STALL_BACKOFF_MAX,
+    TELEGRAM_SILENT_STALL_INCIDENT_WINDOW,
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
@@ -188,6 +192,7 @@ class Farmer:
         self.telegram_cooldown_notified = False
         self.telegram_cooldown_changed = asyncio.Event()
         self.telegram_flood_incidents: deque[float] = deque()
+        self.telegram_silent_stall_incidents: deque[float] = deque()
 
         self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self.worker_task: asyncio.Task | None = None
@@ -777,6 +782,63 @@ class Farmer:
             severe=server_seconds >= 60 or incident_count >= 3,
         )
 
+    def silent_stall_pause(self) -> tuple[float, int]:
+        """Return an increasing quiet period for unanswered recovery probes."""
+        now = time.monotonic()
+        cutoff = now - TELEGRAM_SILENT_STALL_INCIDENT_WINDOW
+        while (
+            self.telegram_silent_stall_incidents
+            and self.telegram_silent_stall_incidents[0] <= cutoff
+        ):
+            self.telegram_silent_stall_incidents.popleft()
+        self.telegram_silent_stall_incidents.append(now)
+        count = len(self.telegram_silent_stall_incidents)
+        pause = min(
+            TELEGRAM_SILENT_STALL_BACKOFF_MAX,
+            TELEGRAM_SILENT_STALL_BACKOFF_BASE * (2 ** min(count - 1, 20)),
+        )
+        return pause, count
+
+    async def pause_for_silent_stall(self, reason: str) -> None:
+        pause, incident_count = self.silent_stall_pause()
+        await self.start_telegram_cooldown(
+            pause,
+            reason=(
+                "игра не отвечает на аварийные проверки; "
+                "возможно тихое ограничение Telegram"
+            ),
+            action=MAP_COMMAND,
+            resume_mode="refresh",
+            event_type="TELEGRAM_SILENT_STALL",
+            payload={
+                "recovery_reason": reason,
+                "unanswered_recoveries": TELEGRAM_RECOVERY_LIMIT,
+                "incident_count_2h": incident_count,
+            },
+            severe=True,
+        )
+
+    async def pause_for_callback_timeout(self, description: str, detail: str) -> None:
+        # The callback may already have reached the game. Never repeat the same
+        # semantic action blindly; pause and reconcile with one fresh state.
+        self.callback_timeout_count += 1
+        pause = min(
+            TELEGRAM_CALLBACK_TIMEOUT_MAX,
+            TELEGRAM_CALLBACK_TIMEOUT_BASE * (2 ** (self.callback_timeout_count - 1)),
+        )
+        await self.start_telegram_cooldown(
+            pause,
+            reason=(
+                f"{detail}: результат inline-действия неизвестен "
+                f"({self.callback_timeout_count} подряд)"
+            ),
+            action=description,
+            resume_mode="refresh",
+            event_type="TELEGRAM_CALLBACK_TIMEOUT",
+            payload={"consecutive_timeouts": self.callback_timeout_count},
+            severe=self.callback_timeout_count >= 2,
+        )
+
     async def reserve_telegram_action_slot(self, action: str) -> bool:
         """Smooths an immediate burst without imposing a rolling-window pause."""
         limiter_delay = await self.telegram_action_limiter.acquire()
@@ -826,7 +888,10 @@ class Farmer:
 
         try:
             self.record_telegram_action("inline_callback")
-            await message.click(row, column)
+            await asyncio.wait_for(
+                message.click(row, column),
+                timeout=TELEGRAM_CALLBACK_RPC_TIMEOUT,
+            )
             self.callback_timeout_count = 0
             return True
         except FloodWaitError as error:
@@ -841,24 +906,15 @@ class Farmer:
             )
             return False
         except BotResponseTimeoutError:
-            # The callback may already have reached the game. Never repeat it
-            # blindly; wait and reconcile with one fresh state instead.
-            self.callback_timeout_count += 1
-            pause = min(
-                TELEGRAM_CALLBACK_TIMEOUT_MAX,
-                TELEGRAM_CALLBACK_TIMEOUT_BASE * (2 ** (self.callback_timeout_count - 1)),
+            await self.pause_for_callback_timeout(
+                description,
+                "BOT_RESPONSE_TIMEOUT",
             )
-            await self.start_telegram_cooldown(
-                pause,
-                reason=(
-                    "BOT_RESPONSE_TIMEOUT: результат inline-действия неизвестен "
-                    f"({self.callback_timeout_count} подряд)"
-                ),
-                action=description,
-                resume_mode="refresh",
-                event_type="TELEGRAM_CALLBACK_TIMEOUT",
-                payload={"consecutive_timeouts": self.callback_timeout_count},
-                severe=self.callback_timeout_count >= 2,
+            return False
+        except TimeoutError:
+            await self.pause_for_callback_timeout(
+                description,
+                f"callback RPC не завершился за {TELEGRAM_CALLBACK_RPC_TIMEOUT:.0f} сек.",
             )
             return False
         except RPCError as error:
@@ -1916,10 +1972,7 @@ class Farmer:
             return False
 
         if not self.recovery_attempt_guard.allow():
-            await self.stop(
-                f"более {TELEGRAM_RECOVERY_LIMIT} аварийных восстановлений "
-                f"за {int(TELEGRAM_RECOVERY_WINDOW // 60)} минут; остановлено для защиты от флуда"
-            )
+            await self.pause_for_silent_stall(reason)
             return False
 
         attempt = self.watchdog.begin_recovery_attempt()
@@ -1927,7 +1980,7 @@ class Farmer:
         self.log(f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}")
 
         if attempt > MAX_RECOVERY_ATTEMPTS:
-            await self.stop(f"исчерпаны попытки восстановления: {reason}")
+            await self.pause_for_silent_stall(reason)
             return False
 
         # Telethon already delivered the newest state to the local cache.

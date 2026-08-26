@@ -11,6 +11,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramBadRequest
 from telethon.errors import BotResponseTimeoutError
 
 from blessing import BlessingManager
@@ -1505,6 +1506,36 @@ class RichMessageDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "<blockquote expandable>Диагностика</blockquote>",
         )
         self.assertNotIn("reply_markup", arguments)
+
+    async def test_uneditable_panel_is_replaced_without_second_edit_attempt(self) -> None:
+        from rich_messages import edit_rich_with_fallback
+
+        replacement = SimpleNamespace(message_id=8)
+        bot = SimpleNamespace(
+            edit_message_text=AsyncMock(
+                side_effect=TelegramBadRequest(
+                    method=None,
+                    message="Bad Request: message can't be edited",
+                )
+            ),
+            send_rich_message=AsyncMock(return_value=replacement),
+            send_message=AsyncMock(),
+            delete_message=AsyncMock(return_value=True),
+        )
+
+        result = await edit_rich_with_fallback(
+            bot,
+            chat_id=42,
+            message_id=7,
+            html="<h2>Новая панель</h2>",
+            fallback_text="Новая панель",
+            fallback_reply_markup=None,
+        )
+
+        self.assertIs(result, replacement)
+        bot.edit_message_text.assert_awaited_once()
+        bot.send_rich_message.assert_awaited_once()
+        bot.delete_message.assert_awaited_once_with(chat_id=42, message_id=7)
 
 
 class MovementRecoveryTests(unittest.TestCase):

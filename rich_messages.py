@@ -613,7 +613,42 @@ async def edit_rich_with_fallback(
     fallback_text: str,
     fallback_reply_markup: InlineKeyboardMarkup | None = None,
 ) -> Message | bool | None:
-    """Редактирует существующую панель без создания нового сообщения."""
+    """Редактирует панель или заменяет её, если Telegram запретил редактирование."""
+
+    def is_uneditable(error: TelegramBadRequest) -> bool:
+        error_text = str(error).casefold()
+        return any(
+            marker in error_text
+            for marker in (
+                "message can't be edited",
+                "message to edit not found",
+            )
+        )
+
+    async def replace_panel(error: TelegramBadRequest) -> Message:
+        logger.warning(
+            "Панель %s нельзя редактировать; отправляю замену: %s",
+            message_id,
+            error,
+        )
+        replacement = await send_rich_with_fallback(
+            bot,
+            chat_id=chat_id,
+            html=html,
+            fallback_text=fallback_text,
+            reply_markup=ReplyKeyboardRemove(),
+            fallback_reply_markup=fallback_reply_markup,
+        )
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramBadRequest as delete_error:
+            logger.warning(
+                "Старая панель %s осталась в чате: %s",
+                message_id,
+                delete_error,
+            )
+        return replacement
+
     try:
         return await bot.edit_message_text(
             chat_id=chat_id,
@@ -623,6 +658,8 @@ async def edit_rich_with_fallback(
     except TelegramBadRequest as error:
         if "message is not modified" in str(error).casefold():
             return None
+        if is_uneditable(error):
+            return await replace_panel(error)
         logger.warning("RichMessage нельзя отредактировать, использован fallback: %s", error)
         try:
             return await bot.edit_message_text(
@@ -634,4 +671,6 @@ async def edit_rich_with_fallback(
         except TelegramBadRequest as fallback_error:
             if "message is not modified" in str(fallback_error).casefold():
                 return None
-            raise
+            if not is_uneditable(fallback_error):
+                raise
+            return await replace_panel(fallback_error)

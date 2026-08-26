@@ -426,7 +426,7 @@ class ControlBot:
         panel_message_id = data.get("panel_message_id")
         view = await self._panel_view(screen, notice=notice)
         if panel_message_id is None:
-            await send_rich_with_fallback(
+            sent_panel = await send_rich_with_fallback(
                 self.bot,
                 chat_id=chat_id,
                 html=view.html,
@@ -434,8 +434,9 @@ class ControlBot:
                 reply_markup=ReplyKeyboardRemove(),
                 fallback_reply_markup=view.fallback_markup,
             )
+            await state.update_data(panel_message_id=sent_panel.message_id)
             return
-        await edit_rich_with_fallback(
+        result = await edit_rich_with_fallback(
             self.bot,
             chat_id=chat_id,
             message_id=int(panel_message_id),
@@ -443,6 +444,9 @@ class ControlBot:
             fallback_text=view.fallback_text,
             fallback_reply_markup=view.fallback_markup,
         )
+        replacement_id = getattr(result, "message_id", None)
+        if replacement_id is not None and int(replacement_id) != int(panel_message_id):
+            await state.update_data(panel_message_id=int(replacement_id))
 
     def _input_spec(self, kind: str) -> InputSpec:
         s = self.settings.values
@@ -532,7 +536,7 @@ class ControlBot:
             [[("Отменить", "input:cancel", "danger", False)]],
             force_reply=True,
         )
-        await edit_rich_with_fallback(
+        result = await edit_rich_with_fallback(
             self.bot,
             chat_id=message.chat.id,
             message_id=message.message_id,
@@ -540,6 +544,9 @@ class ControlBot:
             fallback_text=f"{spec.title}\n\n{spec.instruction}",
             fallback_reply_markup=fallback_markup,
         )
+        replacement_id = getattr(result, "message_id", None)
+        if replacement_id is not None and int(replacement_id) != message.message_id:
+            await state.update_data(panel_message_id=int(replacement_id))
 
     async def _retry_input(
         self,
@@ -552,7 +559,7 @@ class ControlBot:
         spec = self._input_spec(kind)
         panel_message_id = data.get("panel_message_id")
         if panel_message_id is not None:
-            await edit_rich_with_fallback(
+            result = await edit_rich_with_fallback(
                 self.bot,
                 chat_id=int(data.get("panel_chat_id") or message.chat.id),
                 message_id=int(panel_message_id),
@@ -568,6 +575,9 @@ class ControlBot:
                     force_reply=True,
                 ),
             )
+            replacement_id = getattr(result, "message_id", None)
+            if replacement_id is not None and int(replacement_id) != int(panel_message_id):
+                await state.update_data(panel_message_id=int(replacement_id))
         with suppress(TelegramBadRequest):
             await message.delete()
 

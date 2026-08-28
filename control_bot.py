@@ -265,6 +265,7 @@ class ControlBot:
                         ("❤️ Порог", "input:heal", "primary", False),
                         ("✨ Благословение", "settings:blessing", None, False),
                     ],
+                    [("🧠 Боевой движок", "settings:planner", "primary", False)],
                     [
                         (
                             "50%",
@@ -704,6 +705,21 @@ class ControlBot:
                 query,
                 "settings:combat",
                 notice=f"Благословение {'включено' if enabled else 'выключено'}.",
+            )
+
+        @r.callback_query(F.data == "settings:planner")
+        async def combat_planner_handler(query: CallbackQuery) -> None:
+            labels = {
+                "shadow": "Тень: только анализ",
+                "guarded": "Осторожный: только доказуемые замены",
+                "active": "Активный: экспериментальный планировщик",
+            }
+            await query.answer()
+            mode = await self.settings.cycle_combat_planner_mode()
+            await self._edit_panel(
+                query,
+                "settings:combat",
+                notice=labels[mode],
             )
 
         @r.callback_query(F.data == "targets:locations")

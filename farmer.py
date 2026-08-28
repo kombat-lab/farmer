@@ -14,7 +14,7 @@ from telethon import TelegramClient, events
 from telethon.errors import BotResponseTimeoutError, FloodWaitError, RPCError
 
 from blessing import BlessingManager
-from combat_learning import build_shadow_plan
+from combat_learning import build_shadow_plan, select_combat_planner_decision
 from combat_round import CombatRoundState, parse_combat_round
 from combat_strategy import (
     CombatDecisionTrace,
@@ -1709,10 +1709,6 @@ class Farmer:
             await self.recover_latest_state("не найден доступный навык")
             return
 
-        skill_name = decision.skill_name
-        self.combat.pending_skill = skill_name
-        self.combat.pending_target = decision.target
-        self.combat.pending_urgent = decision.urgent
         shadow_plan = build_shadow_plan(
             message,
             memory=self.combat,
@@ -1722,7 +1718,19 @@ class Farmer:
             round_state=round_state,
         )
         if shadow_plan is not None:
+            decision = select_combat_planner_decision(
+                shadow_plan,
+                self.settings.values.combat_planner_mode,
+            )
+            shadow_plan = shadow_plan.with_execution(
+                decision,
+                mode=self.settings.values.combat_planner_mode,
+            )
             self.log(shadow_plan.format_log())
+        skill_name = decision.skill_name
+        self.combat.pending_skill = skill_name
+        self.combat.pending_target = decision.target
+        self.combat.pending_urgent = decision.urgent
         decision_trace = build_decision_trace(
             created_at=utc_now(),
             telegram_message_id=int(message.id),
@@ -2521,6 +2529,10 @@ class Farmer:
             self.cycle_move_target,
         )
         logger.info("Цели: %s", self.settings.values.enabled_targets)
+        logger.info(
+            "Боевой планировщик: %s.",
+            self.settings.values.combat_planner_mode,
+        )
         logger.info(
             "Watchdog: движение %s сек., бой %s сек.",
             MOVE_PROGRESS_TIMEOUT,

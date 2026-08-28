@@ -8,6 +8,7 @@ from config import (
     DEFAULT_ATTACK_DELAY_MAX,
     DEFAULT_ATTACK_DELAY_MIN,
     DEFAULT_BATTLE_START_HP_PERCENT,
+    DEFAULT_COMBAT_PLANNER_MODE,
     DEFAULT_CYCLE_REST_MAX,
     DEFAULT_CYCLE_REST_MIN,
     DEFAULT_CYCLES_COUNT,
@@ -48,6 +49,7 @@ class FarmerSettings:
 
     heal_threshold: int = DEFAULT_HEAL_THRESHOLD
     battle_start_hp_percent: int = DEFAULT_BATTLE_START_HP_PERCENT
+    combat_planner_mode: str = DEFAULT_COMBAT_PLANNER_MODE
     blessing_enabled: bool = False
 
     move_delay_min: float = DEFAULT_MOVE_DELAY_MIN
@@ -92,6 +94,7 @@ class SettingsService:
             self.values.blessing_enabled,
             default=False,
         )
+        self._normalize_combat_planner_mode()
         normalized = asdict(self.values)
         await self.storage.set_settings(normalized)
         await self.storage.delete_settings(
@@ -121,6 +124,18 @@ class SettingsService:
         self.values.blessing_enabled = enabled
         await self.storage.set_setting("blessing_enabled", enabled)
         return enabled
+
+    async def cycle_combat_planner_mode(self) -> str:
+        modes = ("shadow", "guarded", "active")
+        current = self.values.combat_planner_mode
+        try:
+            next_index = (modes.index(current) + 1) % len(modes)
+        except ValueError:
+            next_index = 0
+        selected = modes[next_index]
+        self.values.combat_planner_mode = selected
+        await self.storage.set_setting("combat_planner_mode", selected)
+        return selected
 
     async def add_treatment_enemy_target(self, target: str) -> bool:
         normalized = target.strip()
@@ -252,6 +267,12 @@ class SettingsService:
         if battle_start_hp not in {50, 100}:
             battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
         self.values.battle_start_hp_percent = battle_start_hp
+
+    def _normalize_combat_planner_mode(self) -> None:
+        mode = str(self.values.combat_planner_mode or "").strip().casefold()
+        if mode not in {"shadow", "guarded", "active"}:
+            mode = DEFAULT_COMBAT_PLANNER_MODE
+        self.values.combat_planner_mode = mode
 
     def _upgrade_legacy_moves_setting(self, stored: dict[str, Any]) -> None:
         if (

@@ -363,6 +363,14 @@ def settings_rich(settings: SettingsService, *, notice: str | None = None) -> st
             ("Цели", len(s.enabled_targets or [])),
             ("Порог лечения", f"{s.heal_threshold} HP"),
             ("Перед боем", f"{s.battle_start_hp_percent}% HP"),
+            (
+                "Боевой движок",
+                {
+                    "shadow": "тень",
+                    "guarded": "осторожный",
+                    "active": "активный",
+                }.get(s.combat_planner_mode, "тень"),
+            ),
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),
             ("Темп", "по заданным задержкам"),
         ],
@@ -406,6 +414,11 @@ def farm_settings_rich(settings: SettingsService, *, notice: str | None = None) 
 
 def combat_settings_rich(settings: SettingsService, *, notice: str | None = None) -> str:
     s = settings.values
+    planner_labels = {
+        "shadow": "тень · только анализ",
+        "guarded": "осторожный · только доказуемые замены",
+        "active": "активный · экспериментальный",
+    }
     body = rich_notice(notice)
     body += rich_table(
         [
@@ -413,6 +426,7 @@ def combat_settings_rich(settings: SettingsService, *, notice: str | None = None
             ("HP перед новым боем", f"{s.battle_start_hp_percent}%"),
             ("Благословение", "включено" if s.blessing_enabled else "выключено"),
             ("Резерв маны", "4 для Лечения и Обновления"),
+            ("Боевой планировщик", planner_labels.get(s.combat_planner_mode, "тень")),
         ],
         headers=None,
     )
@@ -423,6 +437,13 @@ def combat_settings_rich(settings: SettingsService, *, notice: str | None = None
             "settings:blessing",
             style="success" if s.blessing_enabled else None,
         ),
+    )
+    body += rich_button_row(
+        rich_button(
+            f"🧠 Движок: {planner_labels.get(s.combat_planner_mode, 'тень')}",
+            "settings:planner",
+            style="success" if s.combat_planner_mode == "active" else "primary",
+        )
     )
     body += rich_button_row(
         rich_button(
@@ -440,7 +461,8 @@ def combat_settings_rich(settings: SettingsService, *, notice: str | None = None
     )
     body += (
         "<footer>HP перед боем определяет только вход в новый бой; "
-        "порог лечения работает внутри боя.</footer>"
+        "порог лечения работает внутри боя. Режим «тень» ничего не меняет; "
+        "«осторожный» принимает только доказуемо безопасные улучшения.</footer>"
     )
     body += rich_button_row(rich_button("← Настройки", "ui:settings", style="link"))
     return rich_document("❤️ Персонаж и бой", body)

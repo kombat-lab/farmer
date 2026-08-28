@@ -16,7 +16,7 @@ KNOWN_SKILLS = {
     "атака аколита",
 }
 
-COMBAT_MODEL_VERSION = 4
+COMBAT_MODEL_VERSION = 5
 
 PERIODIC_EFFECT_MARKERS = (
     "яд",

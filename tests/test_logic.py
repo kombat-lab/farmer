@@ -15,9 +15,15 @@ from aiogram.exceptions import TelegramBadRequest
 from telethon.errors import BotResponseTimeoutError
 
 from blessing import BlessingManager
-from combat_learning import build_shadow_plan
+from combat_learning import (
+    ActionProjection,
+    ShadowCombatPlan,
+    build_shadow_plan,
+    select_combat_planner_decision,
+)
 from combat_round import CombatSide, parse_combat_round
 from combat_strategy import (
+    COMBAT_MODEL_VERSION,
     CombatDecision,
     CombatMemory,
     ObservedRange,
@@ -30,6 +36,7 @@ from combat_strategy import (
 )
 from config import (
     DEFAULT_BATTLE_START_HP_PERCENT,
+    DEFAULT_COMBAT_PLANNER_MODE,
     DEFAULT_HEAL_THRESHOLD,
     DEFAULT_MOVES_PER_CYCLE_MAX,
     DEFAULT_MOVES_PER_CYCLE_MIN,
@@ -579,7 +586,7 @@ class CombatStrategyTests(unittest.TestCase):
     def test_shadow_planner_prefers_the_only_safe_three_turn_action(self) -> None:
         memory = CombatMemory(
             target_name="Пепельник",
-            enemy_current_hp=500,
+            enemy_current_hp=80,
             enemy_max_hp=920,
         )
         for _ in range(4):
@@ -598,7 +605,7 @@ class CombatStrategyTests(unittest.TestCase):
         plan = build_shadow_plan(
             message,
             memory=memory,
-            current_hp=250,
+            current_hp=130,
             max_hp=830,
             executed=CombatDecision(
                 "атака аколита", SkillTarget.ENEMY, "старое решение"
@@ -701,7 +708,7 @@ class CombatStrategyTests(unittest.TestCase):
     def test_shadow_planner_spends_mana_when_it_prevents_an_enemy_hit(self) -> None:
         memory = CombatMemory(
             target_name="Крапива-жгучка",
-            enemy_current_hp=140,
+            enemy_current_hp=85,
             enemy_max_hp=165,
         )
         for value in (21, 22, 23, 24):
@@ -780,6 +787,158 @@ class CombatStrategyTests(unittest.TestCase):
         self.assertLess(holy.expected_enemy_hits, basic.expected_enemy_hits)
         self.assertFalse(holy.mana_dominated)
         self.assertEqual(plan.recommendation.skill_name, "святое свечение")
+
+    def test_shadow_planner_proves_ash_bell_is_not_survivable_with_known_stats(
+        self,
+    ) -> None:
+        memory = CombatMemory(
+            target_name="Колокол пепла",
+            enemy_current_hp=1400,
+            enemy_max_hp=1400,
+        )
+        for value in (88, 90, 93, 104):
+            memory.incoming_damage.add(value)
+        for skill_name, values in {
+            "атака аколита": (40, 42),
+            "святое свечение": (42, 44),
+        }.items():
+            for value in values:
+                memory.outgoing_damage.setdefault(
+                    skill_name, ObservedRange()
+                ).add(value)
+        for value in (144, 144):
+            memory.direct_healing.add(value)
+        for value in (47, 47):
+            memory.renewal_healing.add(value)
+        executed = CombatDecision(
+            "святое свечение",
+            SkillTarget.ENEMY,
+            "прежнее решение",
+        )
+
+        plan = build_shadow_plan(
+            FakeMessage(
+                "🔷 Мана: 12/12",
+                [
+                    ["Лечение [Мана 4]"],
+                    ["Обновление [Мана 4]"],
+                    ["Святое свечение [Мана 3]"],
+                    ["Атака аколита"],
+                ],
+            ),
+            memory=memory,
+            current_hp=750,
+            max_hp=750,
+            executed=executed,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.horizon, 24)
+        self.assertFalse(plan.has_safe_candidate)
+        self.assertFalse(plan.confident)
+        self.assertIs(plan.recommendation, executed)
+        self.assertTrue(all(candidate.unsafe for candidate in plan.candidates))
+        self.assertIn("обновление→self", plan.candidates[0].sequence)
+        self.assertIn("лечение→self", plan.candidates[0].sequence)
+
+    def test_guarded_planner_only_replaces_an_unsafe_baseline(self) -> None:
+        memory = CombatMemory(
+            target_name="Пепельник",
+            enemy_current_hp=80,
+            enemy_max_hp=920,
+        )
+        for _ in range(4):
+            memory.incoming_damage.add(100)
+        for value in (40, 42):
+            memory.outgoing_damage.setdefault(
+                "атака аколита", ObservedRange()
+            ).add(value)
+        for value in (200, 200):
+            memory.direct_healing.add(value)
+        baseline = CombatDecision(
+            "атака аколита",
+            SkillTarget.ENEMY,
+            "прежнее решение",
+        )
+        plan = build_shadow_plan(
+            FakeMessage(
+                "🔷 Мана: 4/13",
+                [["Лечение [Мана 4]"], ["Атака аколита"]],
+            ),
+            memory=memory,
+            current_hp=130,
+            max_hp=830,
+            executed=baseline,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertTrue(plan.confident)
+        self.assertIs(select_combat_planner_decision(plan, "shadow"), baseline)
+        guarded = select_combat_planner_decision(plan, "guarded")
+        self.assertEqual(guarded.skill_name, "лечение")
+        self.assertIs(guarded.target, SkillTarget.SELF)
+        self.assertIs(
+            select_combat_planner_decision(plan, "active"),
+            plan.recommendation,
+        )
+        controlled = plan.with_execution(guarded, mode="guarded")
+        self.assertTrue(controlled.controls_action)
+        self.assertEqual(controlled.as_payload()["control_mode"], "guarded")
+
+    def test_guarded_planner_does_not_heal_only_for_a_larger_hp_reserve(
+        self,
+    ) -> None:
+        baseline = CombatDecision(
+            "атака аколита",
+            SkillTarget.ENEMY,
+            "безопасная атака",
+        )
+        healing = CombatDecision(
+            "лечение",
+            SkillTarget.SELF,
+            "больше запаса HP",
+        )
+
+        def projection(
+            decision: CombatDecision,
+            *,
+            survival_margin: int,
+        ) -> ActionProjection:
+            return ActionProjection(
+                skill_name=decision.skill_name,
+                target=decision.target,
+                mana_cost=0 if decision is baseline else 4,
+                score=float(survival_margin),
+                projected_player_hp=500,
+                projected_enemy_hp=300,
+                expected_enemy_hits=3,
+                projected_turns=4,
+                projected_mana=8,
+                survival_margin=survival_margin,
+                sequence=(f"{decision.skill_name}→{decision.target.value}",),
+                unsafe=False,
+                mana_dominated=False,
+                effect_samples=4,
+                unknown_actions=0,
+                reason="test",
+            )
+
+        plan = ShadowCombatPlan(
+            horizon=6,
+            recommendation=healing,
+            baseline=baseline,
+            executed=baseline,
+            confident=True,
+            candidates=(
+                projection(healing, survival_margin=200),
+                projection(baseline, survival_margin=20),
+            ),
+        )
+
+        self.assertIs(select_combat_planner_decision(plan, "guarded"), baseline)
+        self.assertIs(select_combat_planner_decision(plan, "active"), healing)
 
     def test_real_round_updates_local_damage_model(self) -> None:
         memory = CombatMemory()
@@ -2399,14 +2558,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 session_id=session_id,
                 target_name="Пепельник",
                 result="VICTORY",
-                combat_decisions=(trace(3, 101),),
+                combat_decisions=(trace(COMBAT_MODEL_VERSION - 1, 101),),
             )
             await storage.record_battle(
                 telegram_message_id=200,
                 session_id=session_id,
                 target_name="Пепельник",
                 result="VICTORY",
-                combat_decisions=(trace(4, 201),),
+                combat_decisions=(trace(COMBAT_MODEL_VERSION, 201),),
             )
             await storage.add_event("LOW_HP_WAIT_STARTED", "noise")
             await storage.add_event("WATCHDOG_TRIGGERED", "keep")
@@ -2420,7 +2579,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "FROM combat_decisions"
                 ).fetchall()
             ]
-            self.assertEqual(versions, [4])
+            self.assertEqual(versions, [COMBAT_MODEL_VERSION])
             self.assertEqual(cleanup["combat_decisions"], 1)
             self.assertEqual(cleanup["events"], 1)
             self.assertEqual(
@@ -2582,6 +2741,30 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await loaded.load()
             self.assertEqual(loaded.values.moves_per_cycle_min, 91)
             self.assertEqual(loaded.values.moves_per_cycle_max, 127)
+            await reopened.close()
+
+    async def test_combat_planner_mode_is_safe_and_persisted(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            storage = Storage(path)
+            await storage.set_setting("combat_planner_mode", "unsupported")
+            settings = SettingsService(storage)
+
+            await settings.load()
+
+            self.assertEqual(
+                settings.values.combat_planner_mode,
+                DEFAULT_COMBAT_PLANNER_MODE,
+            )
+            self.assertEqual(await settings.cycle_combat_planner_mode(), "guarded")
+            self.assertEqual(await settings.cycle_combat_planner_mode(), "active")
+            await storage.close()
+
+            reopened = Storage(path)
+            loaded = SettingsService(reopened)
+            await loaded.load()
+            self.assertEqual(loaded.values.combat_planner_mode, "active")
+            self.assertEqual(await loaded.cycle_combat_planner_mode(), "shadow")
             await reopened.close()
 
     async def test_runtime_control_setting_is_not_removed_by_ui_settings(self) -> None:

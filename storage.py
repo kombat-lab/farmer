@@ -3,31 +3,35 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import AsyncIterator, Iterable, Mapping
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Unpack, cast
 
 from combat_learning import battle_learning_summary, resolved_decision
 from combat_strategy import COMBAT_MODEL_VERSION
 from rewards import MIST_CRYSTAL_CODE, parse_item_stack
+from storage_types import (
+    BattleResult,
+    BattleTotals,
+    CombatDecisionRow,
+    DropSummary,
+    DropTotals,
+    EventSummary,
+    FarmerState,
+    JsonValue,
+    SessionSummary,
+    StatisticsDashboard,
+    TargetTotals,
+    TelegramActivityDay,
+)
+
+SCHEMA_VERSION = 1
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-@dataclass(frozen=True)
-class SessionSummary:
-    session_id: int | None
-    started_at: str | None
-    status: str
-    wins: int
-    defeats: int
-    xp: int
-    dust: int
-    runtime_seconds: int
 
 
 class Storage:
@@ -39,9 +43,21 @@ class Storage:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
-        self._create_schema()
+        try:
+            self._create_schema()
+        except Exception:
+            self.connection.close()
+            raise
 
     def _create_schema(self) -> None:
+        current_version = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                "Версия схемы SQLite новее поддерживаемой: "
+                f"{current_version} > {SCHEMA_VERSION}"
+            )
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +85,10 @@ class Storage:
             position_y INTEGER,
             FOREIGN KEY(session_id) REFERENCES sessions(id)
         );
+        CREATE INDEX IF NOT EXISTS idx_battles_happened_at
+            ON battles(happened_at);
+        CREATE INDEX IF NOT EXISTS idx_battles_session_id
+            ON battles(session_id);
 
         CREATE TABLE IF NOT EXISTS drops (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +98,8 @@ class Storage:
             is_card INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
         );
+        CREATE INDEX IF NOT EXISTS idx_drops_battle_id
+            ON drops(battle_id);
 
         CREATE TABLE IF NOT EXISTS battle_currencies (
             battle_id INTEGER NOT NULL,
@@ -142,6 +164,8 @@ class Storage:
         );
         CREATE INDEX IF NOT EXISTS idx_combat_analysis_profile_target
             ON combat_battle_analysis(profile_max_hp, target_name);
+        CREATE INDEX IF NOT EXISTS idx_combat_analysis_happened_at
+            ON combat_battle_analysis(happened_at);
 
         CREATE TABLE IF NOT EXISTS farmer_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -174,6 +198,11 @@ class Storage:
             message TEXT NOT NULL,
             payload_json TEXT
         );
+        CREATE INDEX IF NOT EXISTS idx_events_created_at
+            ON events(created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_status_ended_at
+            ON sessions(status, ended_at);
 
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -209,10 +238,21 @@ class Storage:
             rpc_errors INTEGER NOT NULL DEFAULT 0
         );
 
-        DROP TABLE IF EXISTS combat_policy_stats;
-        DROP TABLE IF EXISTS combat_strategy_stats;
         """)
+        if current_version < 1:
+            self.connection.executescript("""
+            DROP TABLE IF EXISTS combat_policy_stats;
+            DROP TABLE IF EXISTS combat_strategy_stats;
+            """)
+        self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.connection.commit()
+
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[None]:
+        """Serializes a write unit and rolls it back completely on failure."""
+        async with self.lock:
+            with self.connection:
+                yield
 
     def _close_abandoned_sessions(self) -> int:
         """Closes sessions left RUNNING by a killed container or an old defect."""
@@ -261,7 +301,7 @@ class Storage:
     async def cleanup_old_data(self, retention_days: int = 7) -> dict[str, int]:
         """Удаляет диагностические и статистические записи старше retention_days."""
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, retention_days))).isoformat()
-        async with self.lock:
+        async with self._transaction():
             deleted_events = self.connection.execute(
                 """DELETE FROM events
                    WHERE created_at < ?
@@ -383,9 +423,14 @@ class Storage:
     async def get_telegram_activity_daily(
         self,
         days: int = 14,
-    ) -> list[dict[str, int | str]]:
+    ) -> list[TelegramActivityDay]:
         """Returns compact Moscow-day totals; empty days are intentionally omitted."""
-        cutoff = (datetime.now(UTC) - timedelta(days=max(1, days) - 1)).date().isoformat()
+        moscow = timezone(timedelta(hours=3))
+        first_day = datetime.now(UTC).astimezone(moscow).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        first_day -= timedelta(days=max(1, days) - 1)
+        cutoff = first_day.astimezone(UTC).isoformat()
         async with self.lock:
             rows = self.connection.execute(
                 """
@@ -413,7 +458,7 @@ class Storage:
                 """,
                 (cutoff,),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [cast(TelegramActivityDay, dict(row)) for row in rows]
 
     async def compact_if_needed(
         self,
@@ -468,7 +513,9 @@ class Storage:
             self.connection.commit()
             return sid
 
-    async def finish_session(self, session_id, reason, runtime_seconds) -> None:
+    async def finish_session(
+        self, session_id: int | None, reason: str, runtime_seconds: int
+    ) -> None:
         async with self.lock:
             if session_id is not None:
                 self.connection.execute(
@@ -506,7 +553,7 @@ class Storage:
             finally:
                 self.connection.close()
 
-    async def update_state(self, **fields) -> None:
+    async def update_state(self, **fields: Unpack[FarmerState]) -> None:
         allowed = {
             "process_status",
             "game_state",
@@ -538,15 +585,15 @@ class Storage:
             )
             self.connection.commit()
 
-    async def get_state(self) -> dict:
+    async def get_state(self) -> FarmerState:
         async with self.lock:
             row = self.connection.execute("SELECT * FROM farmer_state WHERE singleton=1").fetchone()
-            return dict(row) if row else {}
+            return cast(FarmerState, dict(row)) if row else {}
 
-    async def set_setting(self, key: str, value) -> None:
+    async def set_setting(self, key: str, value: object) -> None:
         await self.set_settings({key: value})
 
-    async def set_settings(self, values: dict) -> None:
+    async def set_settings(self, values: Mapping[str, object]) -> None:
         if not values:
             return
         updated_at = utc_now()
@@ -554,7 +601,7 @@ class Storage:
             (key, json.dumps(value, ensure_ascii=False), updated_at)
             for key, value in values.items()
         ]
-        async with self.lock:
+        async with self._transaction():
             self.connection.executemany(
                 """
                 INSERT INTO settings(key,value_json,updated_at)
@@ -566,7 +613,6 @@ class Storage:
             """,
                 rows,
             )
-            self.connection.commit()
 
     async def delete_settings(self, keys: set[str] | frozenset[str]) -> int:
         if not keys:
@@ -580,16 +626,16 @@ class Storage:
             self.connection.commit()
             return max(0, cursor.rowcount)
 
-    async def get_settings(self) -> dict:
+    async def get_settings(self) -> dict[str, JsonValue]:
         async with self.lock:
             rows = self.connection.execute("SELECT key,value_json FROM settings").fetchall()
-            result = {}
+            result: dict[str, JsonValue] = {}
             for row in rows:
                 with suppress(json.JSONDecodeError):
                     result[row["key"]] = json.loads(row["value_json"])
             return result
 
-    async def get_setting(self, key: str, default=None):
+    async def get_setting(self, key: str, default: JsonValue = None) -> JsonValue:
         async with self.lock:
             row = self.connection.execute(
                 "SELECT value_json FROM settings WHERE key=?",
@@ -598,7 +644,7 @@ class Storage:
             if row is None:
                 return default
             try:
-                return json.loads(row["value_json"])
+                return cast(JsonValue, json.loads(row["value_json"]))
             except json.JSONDecodeError:
                 return default
 
@@ -658,7 +704,13 @@ class Storage:
             self.connection.commit()
             return max(0, cursor.rowcount)
 
-    async def add_event(self, event_type, message, level="INFO", payload=None) -> int:
+    async def add_event(
+        self,
+        event_type: str,
+        message: str,
+        level: str = "INFO",
+        payload: Mapping[str, object] | None = None,
+    ) -> int:
         async with self.lock:
             cur = self.connection.execute(
                 """
@@ -779,19 +831,19 @@ class Storage:
     async def record_battle(
         self,
         *,
-        telegram_message_id,
-        session_id,
-        target_name,
-        result,
-        xp=0,
-        dust=0,
-        crystals=0,
-        items=(),
-        position=None,
+        telegram_message_id: int,
+        session_id: int | None,
+        target_name: str,
+        result: BattleResult,
+        xp: int = 0,
+        dust: int = 0,
+        crystals: int = 0,
+        items: Iterable[str] = (),
+        position: tuple[int, int] | None = None,
         combat_decisions: tuple[dict[str, Any], ...] = (),
     ) -> tuple[bool, list[str]]:
         cards: list[str] = []
-        async with self.lock:
+        async with self._transaction():
             if self.connection.execute(
                 "SELECT 1 FROM battles WHERE telegram_message_id=?",
                 (telegram_message_id,),
@@ -889,13 +941,15 @@ class Storage:
             self.connection.commit()
             return True, cards
 
-    async def get_combat_decisions(self, target_name: str | None = None) -> list[dict]:
+    async def get_combat_decisions(
+        self, target_name: str | None = None
+    ) -> list[CombatDecisionRow]:
         query = """
             SELECT cd.*, b.result
             FROM combat_decisions cd
             JOIN battles b ON b.id=cd.battle_id
         """
-        params: tuple = ()
+        params: tuple[str, ...] = ()
         if target_name is not None:
             query += " WHERE cd.target_name=?"
             params = (target_name,)
@@ -903,12 +957,12 @@ class Storage:
 
         async with self.lock:
             rows = self.connection.execute(query, params).fetchall()
-            result: list[dict] = []
+            result: list[CombatDecisionRow] = []
             for row in rows:
                 item = dict(row)
                 with suppress(json.JSONDecodeError):
                     item["trace"] = json.loads(str(item.pop("trace_json")))
-                result.append(item)
+                result.append(cast(CombatDecisionRow, item))
             return result
 
     async def get_combat_learning_stats(
@@ -1047,7 +1101,7 @@ class Storage:
                 row["runtime_seconds"],
             )
 
-    async def get_drops(self, session_id=None) -> list[dict]:
+    async def get_drops(self, session_id: int | None = None) -> list[DropSummary]:
         query = """
             SELECT d.item_name,SUM(d.quantity) quantity,MAX(d.is_card) is_card
             FROM drops d JOIN battles b ON b.id=d.battle_id
@@ -1058,9 +1112,12 @@ class Storage:
             params = (session_id,)
         query += " GROUP BY d.item_name ORDER BY is_card DESC,quantity DESC,d.item_name"
         async with self.lock:
-            return [dict(r) for r in self.connection.execute(query, params).fetchall()]
+            return [
+                cast(DropSummary, dict(row))
+                for row in self.connection.execute(query, params).fetchall()
+            ]
 
-    async def get_events(self, limit=20) -> list[dict]:
+    async def get_events(self, limit: int = 20) -> list[EventSummary]:
         async with self.lock:
             rows = self.connection.execute(
                 """
@@ -1069,12 +1126,15 @@ class Storage:
             """,
                 (limit,),
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [cast(EventSummary, dict(row)) for row in rows]
 
-    async def get_statistics_dashboard(self) -> dict:
+    async def get_statistics_dashboard(self) -> StatisticsDashboard:
         session = await self.get_current_session()
         async with self.lock:
             sid = session.session_id
+            battle: BattleTotals
+            drops: DropTotals
+            targets: list[TargetTotals]
             if sid is None:
                 battle = {
                     "battles": 0,
@@ -1089,7 +1149,8 @@ class Storage:
             else:
                 row = self.connection.execute(
                     """SELECT COUNT(*) battles,
-                    SUM(b.result='VICTORY') wins, SUM(b.result='DEFEAT') defeats,
+                    COALESCE(SUM(b.result='VICTORY'),0) wins,
+                    COALESCE(SUM(b.result='DEFEAT'),0) defeats,
                     COALESCE(SUM(b.xp),0) xp, COALESCE(SUM(b.dust),0) dust,
                     COALESCE(SUM(c.amount),0) crystals
                     FROM battles b
@@ -1098,16 +1159,16 @@ class Storage:
                     WHERE b.session_id=?""",
                     (MIST_CRYSTAL_CODE, sid),
                 ).fetchone()
-                battle = dict(row)
+                battle = cast(BattleTotals, dict(row))
                 row = self.connection.execute(
                     """SELECT COALESCE(SUM(d.quantity),0) items,
                     COALESCE(SUM(CASE WHEN d.is_card=1 THEN d.quantity ELSE 0 END),0) cards
                     FROM drops d JOIN battles b ON b.id=d.battle_id WHERE b.session_id=?""",
                     (sid,),
                 ).fetchone()
-                drops = dict(row)
+                drops = cast(DropTotals, dict(row))
                 targets = [
-                    dict(r)
+                    cast(TargetTotals, dict(r))
                     for r in self.connection.execute(
                         """SELECT b.target_name, COUNT(*) battles,
                     SUM(b.result='VICTORY') wins, COALESCE(SUM(b.xp),0) xp,
@@ -1141,12 +1202,12 @@ class Storage:
             "battle": battle,
             "drops": drops,
             "targets": targets,
-            "state": dict(state or {}),
+            "state": cast(FarmerState, dict(state)) if state else {},
             "runtime_seconds": runtime,
         }
 
     @staticmethod
-    def format_statistics_text(data: dict) -> str:
+    def format_statistics_text(data: StatisticsDashboard) -> str:
         b, d, st = data["battle"], data["drops"], data["state"]
         seconds = int(data.get("runtime_seconds", 0))
         h, rem = divmod(seconds, 3600)

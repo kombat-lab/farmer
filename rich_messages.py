@@ -18,6 +18,13 @@ from aiogram.types import (
 
 if TYPE_CHECKING:
     from settings_service import SettingsService
+    from storage_types import (
+        DropSummary,
+        EventSummary,
+        RuntimeStatus,
+        StatisticsDashboard,
+        TelegramActivityDay,
+    )
 
 logger = logging.getLogger("fog_farmer")
 
@@ -157,7 +164,12 @@ def _control_buttons(running: bool, game_state: str) -> str:
     )
 
 
-def dashboard_rich(state: dict, data: dict, *, notice: str | None = None) -> str:
+def dashboard_rich(
+    state: RuntimeStatus,
+    data: StatisticsDashboard,
+    *,
+    notice: str | None = None,
+) -> str:
     running = bool(state.get("task_running"))
     game_state = str(state.get("game_state") or "STOPPED")
     icon = _state_icon(running, game_state)
@@ -226,9 +238,9 @@ def _duration(seconds: int) -> str:
 
 
 def stats_rich(
-    data: dict,
-    drop_items: list[dict] | None = None,
-    telegram_days: list[dict] | None = None,
+    data: StatisticsDashboard,
+    drop_items: Sequence[DropSummary] | None = None,
+    telegram_days: Sequence[TelegramActivityDay] | None = None,
     *,
     notice: str | None = None,
 ) -> str:
@@ -328,7 +340,7 @@ def stats_rich(
     return rich_document("📈 Статистика сессии", body)
 
 
-def events_rich(events: list[dict], *, notice: str | None = None) -> str:
+def events_rich(events: Sequence[EventSummary], *, notice: str | None = None) -> str:
     body = rich_notice(notice)
     if events:
         rows = []
@@ -711,7 +723,7 @@ async def edit_rich_with_fallback(
         )
 
     async def replace_panel(error: TelegramBadRequest) -> Message:
-        logger.warning(
+        logger.info(
             "Панель %s нельзя редактировать; отправляю замену: %s",
             message_id,
             error,

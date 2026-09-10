@@ -154,22 +154,30 @@ class SnakeNavigator:
     ) -> tuple[Position, ...]:
         x, y = position
 
-        if (y - self.min_y) % 2 == 0:
-            candidates = (
-                (x - 1, y),
-                (x, y + 1),
-                (x + 1, y),
-                (x, y - 1),
-            )
-        else:
-            candidates = (
-                (x + 1, y),
-                (x, y + 1),
-                (x - 1, y),
-                (x, y - 1),
-            )
-
+        # Keep the sweep preference, then include the remaining hex edges.
+        # A diagonal passage may connect otherwise separate rectangular areas.
+        preferred = (
+            ((x - 1, y), (x, y + 1), (x + 1, y), (x, y - 1))
+            if (y - self.min_y) % 2 == 0
+            else ((x + 1, y), (x, y + 1), (x - 1, y), (x, y - 1))
+        )
+        candidates = dict.fromkeys((*preferred, *self._transitions(position).values()))
         return tuple(candidate for candidate in candidates if self._available(candidate))
+
+    @staticmethod
+    def _transitions(position: Position) -> dict[str, Position]:
+        """The six real button destinations on the game's odd-row hex grid."""
+        x, y = position
+        left_diagonal = x - 1 if y % 2 == 0 else x
+        right_diagonal = left_diagonal + 1
+        return {
+            "⬅️": (x - 1, y),
+            "➡️": (x + 1, y),
+            "↖️": (left_diagonal, y - 1),
+            "↗️": (right_diagonal, y - 1),
+            "↙️": (left_diagonal, y + 1),
+            "↘️": (right_diagonal, y + 1),
+        }
 
     def _build_route(self) -> tuple[Position, ...]:
         if not self.obstacle_mode:
@@ -322,32 +330,9 @@ class SnakeNavigator:
         origin: Position,
         destination: Position,
     ) -> str:
-        origin_x, origin_y = origin
-        destination_x, destination_y = destination
-
-        delta_x = destination_x - origin_x
-        delta_y = destination_y - origin_y
-
-        if delta_y == 0:
-            if delta_x == 1:
-                return "➡️"
-            if delta_x == -1:
-                return "⬅️"
-
-        # The game uses an odd-row offset hex grid. A vertical transition in
-        # the displayed coordinates is therefore performed by different
-        # diagonal buttons depending on the parity of the origin row:
-        #
-        #   even row: NE keeps x when moving up, SE keeps x when moving down
-        #   odd row:  NW keeps x when moving up, SW keeps x when moving down
-        #
-        # Choosing by the horizontal map edge used to send the character to
-        # an adjacent column and made valid cells look like obstacles.
-        if delta_x == 0 and delta_y == 1:
-            return "↘️" if origin_y % 2 == 0 else "↙️"
-
-        if delta_x == 0 and delta_y == -1:
-            return "↗️" if origin_y % 2 == 0 else "↖️"
+        for button, actual_destination in SnakeNavigator._transitions(origin).items():
+            if actual_destination == destination:
+                return button
 
         raise ValueError(f"Нельзя определить кнопку перехода {origin} → {destination}.")
 

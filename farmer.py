@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from collections import Counter, defaultdict, deque
-from contextlib import suppress
+from collections.abc import Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from statistics import FarmStatistics, format_report
-from typing import Any
+from typing import cast
 
 from telethon import TelegramClient, events
 from telethon.errors import BotResponseTimeoutError, FloodWaitError, RPCError
@@ -41,10 +41,8 @@ from config import (
     DEATH_RECOVERY_MIN_WAIT,
     GAME_BOT,
     GENERAL_PROGRESS_TIMEOUT,
-    LOG_BACKUP_COUNT,
     LOG_DIRECTORY,
     LOG_FILENAME,
-    LOG_MAX_BYTES,
     LOG_RETENTION_DAYS,
     MAP_MAX_X,
     MAP_MAX_Y,
@@ -65,11 +63,13 @@ from config import (
     WATCHDOG_CHECK_INTERVAL,
 )
 from event_cache import BoundedKeyCache
+from farm_statistics import FarmStatistics, format_report
+from game_message import GameMessage
 from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
-from logger_setup import setup_logging
 from models import (
     ActionType,
     BotState,
+    ButtonPosition,
     MapInfo,
     MessageKind,
     RuntimeContext,
@@ -88,34 +88,35 @@ from rewards import parse_battle_reward
 from settings_service import SettingsService
 from skills import enough_health_for_battle
 from storage import Storage, utc_now
+from storage_types import FarmerState, TelegramSafetyStatus
 from targeting import analyze_map_targets, select_combat_target
 from telegram_buttons import find_button, get_button_texts
 from telegram_safety import (
+    MessageFactKey,
+    MessageStateKey,
     RollingAttemptGuard,
     StateRefreshGate,
     TelegramActionLimiter,
     TelegramActionTelemetry,
+    message_fact_key,
     message_state_key,
 )
 from watchdog import ProgressWatchdog
 
-logger = setup_logging(
-    log_directory=LOG_DIRECTORY,
-    log_filename=LOG_FILENAME,
-    max_bytes=LOG_MAX_BYTES,
-    backup_count=LOG_BACKUP_COUNT,
-)
+logger = logging.getLogger("fog_farmer")
 
 
 ATTACK_BUTTON = "⚔️ Напасть"
 BACK_TO_MAP_BUTTON = "↩️ К карте"
 LOOK_BUTTON = "👀 Осмотреться"
 MAP_COMMAND = "Карта"
+TELEGRAM_MAP_RPC_TIMEOUT = 10.0
 
 MAX_FAILED_MOVE_ATTEMPTS = len(SnakeNavigator.ALL_MOVE_BUTTONS)
 EVENT_QUEUE_SIZE = 200
 PROCESSED_EVENT_CACHE_SIZE = 500
 LATEST_MESSAGE_CACHE_SIZE = 200
+SHUTDOWN_STEP_TIMEOUT = 5.0
 
 class Farmer:
     def __init__(self, storage: Storage, notifier: Notifier, settings: SettingsService) -> None:
@@ -124,6 +125,11 @@ class Farmer:
         self.settings = settings
         self.session_id: int | None = None
         self.stop_reason: str | None = None
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_complete = False
+        self._run_task: asyncio.Task[None] | None = None
+        self._background_error: Exception | None = None
+        self._owned_tasks: set[asyncio.Task[None]] = set()
 
         self.client = TelegramClient(
             SESSION_NAME,
@@ -134,7 +140,7 @@ class Farmer:
             flood_sleep_threshold=0,
         )
 
-        self.game_bot: Any | None = None
+        self.game_bot: object | None = None
         self.state = BotState.STARTING
         self.running = True
 
@@ -158,17 +164,17 @@ class Farmer:
         )
 
         self.watchdog = ProgressWatchdog()
-        self.watchdog_task: asyncio.Task | None = None
-        self.recovery_task: asyncio.Task | None = None
+        self.watchdog_task: asyncio.Task[None] | None = None
+        self.recovery_task: asyncio.Task[None] | None = None
         self.recovery_started_at: float | None = None
         self.recovery_refresh_requested = False
         self.pause_requested = False
         self.current_cycle = 1
         self.moves_in_cycle = 0
         self.cycle_move_target = self.choose_cycle_move_target()
-        self.rest_task: asyncio.Task | None = None
-        self.activity_break_task: asyncio.Task | None = None
-        self.progress_persist_task: asyncio.Task | None = None
+        self.rest_task: asyncio.Task[None] | None = None
+        self.activity_break_task: asyncio.Task[None] | None = None
+        self.progress_persist_task: asyncio.Task[None] | None = None
         self.pending_progress_reason: str | None = None
         self.intentional_waits = 0
         self.telegram_cooldown_until = 0.0
@@ -176,24 +182,32 @@ class Farmer:
         self.telegram_cooldown_reason: str | None = None
         self.telegram_cooldown_action: str | None = None
         self.telegram_cooldown_resume_mode = "reprocess"
-        self.telegram_cooldown_task: asyncio.Task | None = None
+        self.telegram_cooldown_task: asyncio.Task[None] | None = None
         self.telegram_cooldown_notified = False
         self.telegram_cooldown_changed = asyncio.Event()
         self.telegram_flood_incidents: deque[float] = deque()
         self.telegram_metrics_pending: dict[str, Counter[str]] = defaultdict(Counter)
-        self.telegram_metrics_flush_task: asyncio.Task | None = None
+        self.telegram_metrics_flush_task: asyncio.Task[None] | None = None
         self.telegram_metrics_flush_lock = asyncio.Lock()
         self.silent_stall_generation: int | None = None
 
-        self.event_queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
-        self.worker_task: asyncio.Task | None = None
+        self.event_queue: asyncio.Queue[GameMessage] = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self._ingress_lock = asyncio.Lock()
+        self.worker_task: asyncio.Task[None] | None = None
 
-        self.processed_events = BoundedKeyCache(PROCESSED_EVENT_CACHE_SIZE)
-        self.latest_messages: dict[int, Any] = {}
-        self.latest_received_message: Any | None = None
+        self.observed_events: BoundedKeyCache[MessageFactKey] = BoundedKeyCache(
+            PROCESSED_EVENT_CACHE_SIZE
+        )
+        self._last_observed_prompt: MessageFactKey | None = None
+        self.completed_battles: BoundedKeyCache[int] = BoundedKeyCache(PROCESSED_EVENT_CACHE_SIZE)
+        self.latest_messages: dict[int, GameMessage] = {}
+        self.latest_received_message: GameMessage | None = None
         self.callback_timeout_count = 0
-        self.attempted_actions = BoundedKeyCache(PROCESSED_EVENT_CACHE_SIZE)
+        self.attempted_actions: BoundedKeyCache[tuple[int, MessageFactKey]] = BoundedKeyCache(
+            PROCESSED_EVENT_CACHE_SIZE
+        )
         self.inbound_generation = 0
+        self._map_generation = 0
         self.state_refresh_gate = StateRefreshGate()
         self.recovery_attempt_guard = RollingAttemptGuard(
             max_attempts=TELEGRAM_RECOVERY_LIMIT,
@@ -204,6 +218,28 @@ class Farmer:
         )
         self.telegram_action_telemetry = TelegramActionTelemetry()
         self.blessing = BlessingManager()
+
+    def _start_background(
+        self, coroutine: Coroutine[object, object, None], *, name: str
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(coroutine, name=name)
+        self._owned_tasks.add(task)
+        task.add_done_callback(self._background_finished)
+        return task
+
+    def _background_finished(self, task: asyncio.Task[None]) -> None:
+        self._owned_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None or not self.running:
+            return
+        logger.error("Фоновая задача %s завершилась с ошибкой: %s", task.get_name(), error)
+        if isinstance(error, Exception) and self._background_error is None:
+            self._background_error = error
+        runner = self._run_task
+        if runner is not None and not runner.done():
+            runner.cancel()
 
     def choose_cycle_move_target(self) -> int:
         values = self.settings.values
@@ -252,7 +288,7 @@ class Farmer:
         self.telegram_metrics_pending[self.telegram_metric_bucket()][metric] += amount
         task = self.telegram_metrics_flush_task
         if task is None or task.done():
-            self.telegram_metrics_flush_task = asyncio.create_task(
+            self.telegram_metrics_flush_task = self._start_background(
                 self._flush_telegram_metrics_after_delay(),
                 name="telegram-telemetry-flush",
             )
@@ -417,14 +453,16 @@ class Farmer:
         if self.running and (
             self.progress_persist_task is None or self.progress_persist_task.done()
         ):
-            self.progress_persist_task = asyncio.create_task(self._persist_progress())
+            self.progress_persist_task = self._start_background(
+                self._persist_progress(), name="persist-progress"
+            )
 
     def _state_snapshot(
         self,
         reason: str,
         *,
         pause_requested: bool | None = None,
-    ) -> dict[str, Any]:
+    ) -> FarmerState:
         position = self.context.current_position
         return {
             "game_state": self.state.name,
@@ -472,10 +510,10 @@ class Farmer:
             raise ValueError("Не выбран ни один моб для нападения.")
 
     @staticmethod
-    def event_key(message) -> tuple:
+    def event_key(message: GameMessage) -> MessageStateKey:
         return message_state_key(message)
 
-    def cache_latest_message(self, message) -> bool:
+    def cache_latest_message(self, message: GameMessage) -> bool:
         """Stores an inbound update and rejects older revisions of the same message."""
         previous = self.latest_messages.get(message.id)
         if previous is not None:
@@ -491,84 +529,53 @@ class Farmer:
         self.latest_messages[message.id] = message
         return True
 
-    def is_latest_message(self, message) -> bool:
+    def is_latest_message(self, message: GameMessage) -> bool:
         latest_for_id = self.latest_messages.get(message.id)
         latest_global = self.latest_received_message
         return (
             latest_for_id is not None
-            and latest_global is not None
-            and self.event_key(latest_for_id) == self.event_key(message)
-            and self.event_key(latest_global) == self.event_key(message)
-        )
-
-    def is_latest_revision(self, message) -> bool:
-        latest_for_id = self.latest_messages.get(message.id)
-        return (
-            latest_for_id is not None
+            and latest_global is message
             and self.event_key(latest_for_id) == self.event_key(message)
         )
 
-    def remember_event(self, message) -> bool:
-        return self.processed_events.remember(self.event_key(message))
-
-    async def enqueue_message(
-        self,
-        message,
-    ) -> None:
-        if not self.running:
-            return
-
-        is_latest = self.cache_latest_message(message)
-        if not is_latest:
-            return
-
-        is_new_state = self.remember_event(message)
-        if not is_new_state:
-            if (
-                self.latest_received_message is not None
-                and self.latest_received_message.id == message.id
-                and self.event_key(self.latest_received_message) == self.event_key(message)
-            ):
+    async def enqueue_message(self, message: GameMessage) -> None:
+        # Backpressure preserves battle facts; never silently discard a full queue.
+        # Serialize producers so delayed put() calls cannot reorder updates.
+        async with self._ingress_lock:
+            previous = self.latest_messages.get(message.id)
+            if not self.running or not self.cache_latest_message(message):
+                return
+            is_map = parse_map(
+                message.raw_text or "", self.settings.values.enabled_targets, CHARACTER_NAME
+            ) is not None
+            previous_prompt = self.latest_received_message
+            changed_prompt = (
+                previous_prompt is None
+                or message_fact_key(previous_prompt) != message_fact_key(message)
+            )
+            if previous is not None and self.event_key(previous) == self.event_key(message):
+                # A genuinely newer edit may bring an older map message back after
+                # another map. Duplicate deliveries and countdown edits stay inert.
+                newer_edit = message.edit_date is not None and (
+                    previous.edit_date is None or message.edit_date > previous.edit_date
+                )
+                if not (is_map and changed_prompt and newer_edit):
+                    return
+            self.record_telegram_metric("incoming_semantic_states")
+            if not is_passive_health_notification(message.raw_text or ""):
+                if is_map and changed_prompt:
+                    self._map_generation += 1
                 self.latest_received_message = message
-            return
-        self.record_telegram_metric("incoming_semantic_states")
-        if not is_passive_health_notification(message.raw_text or ""):
-            self.latest_received_message = message
-            self.inbound_generation += 1
-
-        try:
-            self.event_queue.put_nowait(message)
-        except asyncio.QueueFull:
-            # Preserve the newest revision instead of crashing during a burst
-            # of message edits. Latest-message caches still protect semantic
-            # processing from the discarded stale item.
-            with suppress(asyncio.QueueEmpty):
-                self.event_queue.get_nowait()
-                self.event_queue.task_done()
-            with suppress(asyncio.QueueFull):
-                self.event_queue.put_nowait(message)
-            self.log("Очередь Telegram-событий уплотнена: удалена устаревшая запись.")
+                self.inbound_generation += 1
+            await self.event_queue.put(message)
 
     async def event_worker(self) -> None:
         while self.running:
             message = await self.event_queue.get()
-
             try:
-                # While an older revision was waiting in the queue, Telethon
-                # may already have delivered a newer edit. Only the newest
-                # revision is allowed to make a decision or press a button.
-                if not self.is_latest_revision(message):
-                    continue
-                if (
-                    not is_passive_health_notification(message.raw_text or "")
-                    and not self.is_latest_message(message)
-                ):
-                    continue
+                # All accepted facts are consumed in order. Only action dispatch
+                # is restricted to the latest prompt, including across revisions.
                 await self.handle_message(message)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                await self.stop(f"ошибка обработки сообщения: {type(error).__name__}: {error}")
             finally:
                 self.event_queue.task_done()
 
@@ -605,7 +612,7 @@ class Farmer:
     def telegram_cooldown_remaining(self) -> float:
         return max(0.0, self.telegram_cooldown_until - time.monotonic())
 
-    def telegram_safety_status(self) -> dict[str, object]:
+    def telegram_safety_status(self) -> TelegramSafetyStatus:
         snapshot = self.telegram_action_telemetry.snapshot()
         return {
             "telegram_cooldown_remaining": int(self.telegram_cooldown_remaining()),
@@ -650,7 +657,7 @@ class Farmer:
         self.telegram_cooldown_resume_mode = "refresh"
         self.telegram_cooldown_notified = False
         self.log(f"Восстановлена Telegram-пауза ещё на {remaining:.0f} сек.")
-        self.telegram_cooldown_task = asyncio.create_task(
+        self.telegram_cooldown_task = self._start_background(
             self.telegram_cooldown_loop(), name="telegram-cooldown"
         )
 
@@ -709,7 +716,7 @@ class Farmer:
             )
             self.telegram_cooldown_notified = True
         if self.telegram_cooldown_task is None or self.telegram_cooldown_task.done():
-            self.telegram_cooldown_task = asyncio.create_task(
+            self.telegram_cooldown_task = self._start_background(
                 self.telegram_cooldown_loop(), name="telegram-cooldown"
             )
         self.telegram_cooldown_changed.set()
@@ -764,11 +771,7 @@ class Farmer:
         message = self.latest_received_message
         if message is None:
             return
-        if self.event_queue.full():
-            with suppress(asyncio.QueueEmpty):
-                self.event_queue.get_nowait()
-                self.event_queue.task_done()
-        with suppress(asyncio.QueueFull):
+        if not self.event_queue.full():
             self.event_queue.put_nowait(message)
 
     def flood_wait_pause(self, server_seconds: int) -> tuple[float, int]:
@@ -855,7 +858,7 @@ class Farmer:
 
     async def press_button(
         self,
-        message,
+        message: GameMessage,
         row: int,
         column: int,
         description: str,
@@ -864,10 +867,16 @@ class Farmer:
             self.log(f"Действие отложено до завершения Telegram-паузы: {description}")
             return False
 
-        # One semantic prompt may produce only one outgoing callback. The
-        # description is deliberately excluded: recalculating strategy must not
-        # allow a different button to be pressed for the same game turn.
-        action_key = self.event_key(message)
+        if not self.running or not self.is_latest_message(message):
+            return False
+
+        # A confirmed map transition permits a new action on a revisited cell.
+        # Combat keeps historical keys: returning UI cannot retry an uncertain
+        # callback from the same turn. Keyboard-only edits never reset either key.
+        is_map = parse_map(
+            message.raw_text or "", self.settings.values.enabled_targets, CHARACTER_NAME
+        ) is not None
+        action_key = (self._map_generation if is_map else 0, message_fact_key(message))
         if action_key in self.attempted_actions:
             reason = (
                 "игра не обновила состояние после inline-действия; "
@@ -886,8 +895,13 @@ class Farmer:
             self.attempted_actions.discard(action_key)
             return False
 
-        if not self.running or not self.is_latest_message(message):
-            self.log(f"Отменено устаревшее действие: {description}")
+        if (
+            not self.running
+            or self.telegram_cooldown_remaining() > 0
+            or not self.is_latest_message(message)
+        ):
+            self.attempted_actions.discard(action_key)
+            self.log(f"Отменено отложенное или устаревшее действие: {description}")
             return False
 
         try:
@@ -932,13 +946,14 @@ class Farmer:
 
     async def click_button(
         self,
-        message,
+        message: GameMessage,
         *,
         action_type: ActionType,
         description: str,
         exact: str | None = None,
         contains: tuple[str, ...] = (),
         exclude: tuple[str, ...] = (),
+        position: ButtonPosition | None = None,
         urgent: bool = False,
         remaining_seconds: int | None = None,
     ) -> bool:
@@ -961,12 +976,13 @@ class Farmer:
             self.log(f"Отменено устаревшее действие: {description}")
             return False
 
-        position = find_button(
-            message,
-            exact=exact,
-            contains=contains,
-            exclude=exclude,
-        )
+        if position is None:
+            position = find_button(
+                message,
+                exact=exact,
+                contains=contains,
+                exclude=exclude,
+            )
         if position is None:
             self.log(
                 f"Кнопка «{description}» больше недоступна. "
@@ -1199,7 +1215,9 @@ class Farmer:
             f"Перемещений: {self.moves_in_cycle}\n"
             f"Передышка: {int(rest_seconds // 60)} мин. {int(rest_seconds % 60)} сек."
         )
-        self.rest_task = asyncio.create_task(self.rest_between_cycles(rest_seconds))
+        self.rest_task = self._start_background(
+            self.rest_between_cycles(rest_seconds), name="cycle-rest"
+        )
 
     async def start_activity_break(self) -> None:
         seconds = self.activity_break_planner.duration(
@@ -1218,7 +1236,7 @@ class Farmer:
             f"Начат длительный перерыв на {seconds / 60:.1f} мин. "
             f"после {self.moves_in_cycle} перемещений."
         )
-        self.activity_break_task = asyncio.create_task(
+        self.activity_break_task = self._start_background(
             self.finish_activity_break(seconds),
             name="activity-break",
         )
@@ -1276,7 +1294,7 @@ class Farmer:
         )
         await self.process_latest_state()
 
-    async def try_refresh_blessing_from_map(self, message) -> bool:
+    async def try_refresh_blessing_from_map(self, message: GameMessage) -> bool:
         if not self.settings.values.blessing_enabled:
             self.blessing.cancel()
             return False
@@ -1287,7 +1305,7 @@ class Farmer:
             mark_progress=self.mark_progress,
         )
 
-    async def handle_blessing_menu(self, message) -> bool:
+    async def handle_blessing_menu(self, message: GameMessage) -> bool:
         if not self.settings.values.blessing_enabled:
             if self.blessing.cancel():
                 returned = await self.click_button(
@@ -1317,7 +1335,7 @@ class Farmer:
             mark_progress=self.mark_progress,
         )
 
-    async def handle_map(self, message, map_info: MapInfo) -> None:
+    async def _observe_map(self, map_info: MapInfo) -> None:
         geometry_changed = bool(
             map_info.width
             and map_info.height
@@ -1377,6 +1395,14 @@ class Farmer:
                     f"Изучено препятствие: {self.navigator.location_name} "
                     f"{learned_obstacle}. Маршрут перестроен локально."
                 )
+
+    async def handle_map(
+        self, message: GameMessage, map_info: MapInfo, *, observe: bool = True
+    ) -> None:
+        if observe:
+            await self._observe_map(map_info)
+        if not self.is_latest_message(message):
+            return
 
         if self.state is BotState.RECOVERY:
             await self.handle_recovery_map(message, map_info)
@@ -1508,7 +1534,7 @@ class Farmer:
 
     async def handle_target_selection(
         self,
-        message,
+        message: GameMessage,
     ) -> None:
         self.state = BotState.TARGET_SELECTION
         self.mark_progress("список целей получен")
@@ -1544,15 +1570,14 @@ class Farmer:
         found_target = analysis.selected_target
         target_counts = analysis.target_counts
 
-        if found_target is not None:
+        if found_target is not None and analysis.selected_position is not None:
             self.context.active_target = found_target
             self.context.battle_target = found_target
             self.context.checked_empty_position = None
 
             clicked = await self.click_button(
                 message,
-                contains=(found_target,),
-                exclude=("pvp:", "занят"),
+                position=analysis.selected_position,
                 action_type=ActionType.SELECT_TARGET,
                 description=f"выбор цели {found_target}",
             )
@@ -1603,7 +1628,7 @@ class Farmer:
 
     async def handle_combat_target_selection(
         self,
-        message,
+        message: GameMessage,
     ) -> None:
         self.state = BotState.COMBAT
         self.mark_progress("получен список целей навыка")
@@ -1680,7 +1705,7 @@ class Farmer:
         elif self.running:
             await self.recover_latest_state("не удалось выбрать цель навыка")
 
-    async def handle_combat_turn(self, message) -> None:
+    async def handle_combat_turn(self, message: GameMessage) -> None:
         self.state = BotState.COMBAT
         self.mark_progress("ход игрока")
 
@@ -1830,7 +1855,9 @@ class Farmer:
         if self.recovery_task:
             self.recovery_task.cancel()
 
-        self.recovery_task = asyncio.create_task(self.death_recovery_loop())
+        self.recovery_task = self._start_background(
+            self.death_recovery_loop(), name="death-recovery"
+        )
 
     async def death_recovery_loop(self) -> None:
         await asyncio.sleep(DEATH_RECOVERY_MIN_WAIT)
@@ -1865,8 +1892,8 @@ class Farmer:
 
     async def handle_recovery_map(
         self,
-        message,
-        map_info,
+        message: GameMessage,
+        map_info: MapInfo,
     ) -> None:
         elapsed = time.monotonic() - (self.recovery_started_at or time.monotonic())
 
@@ -1898,7 +1925,7 @@ class Farmer:
                 self.recovery_task.cancel()
                 self.recovery_task = None
 
-            await self.handle_map(message, map_info)
+            await self.handle_map(message, map_info, observe=False)
         else:
             # The map can be newer than the preceding HP notification. Wait
             # for another inbound health update instead of polling Telegram.
@@ -1926,85 +1953,77 @@ class Farmer:
 
         await self.request_map_refresh()
 
-    async def request_map_refresh(self, *, force: bool = False) -> bool:
-        if self.telegram_cooldown_remaining() > 0:
-            self.log("Запрос карты подавлен до завершения Telegram-паузы.")
+    async def request_map_refresh(
+        self, *, force: bool = False, recovery_reason: str | None = None
+    ) -> bool:
+        if not self.running or self.telegram_cooldown_remaining() > 0:
             return False
-        if not force and not self.event_queue.empty():
-            self.log("Запрос карты не нужен: входящее состояние уже ждёт локального разбора.")
+        if not self.event_queue.empty():
+            self.log("Запрос карты отложен: входящее состояние ещё обрабатывается.")
             return False
-
-        # One semantic inbound state may cause several local recovery paths.
-        # Only the first of them is allowed to reach Telegram.
         generation = self.inbound_generation
-        if not force and not self.state_refresh_gate.reserve(generation):
-            self.log("Повторный запрос карты для того же состояния подавлен.")
+        if not self.state_refresh_gate.reserve(generation, force=force):
             return False
 
-        message = self.latest_received_message
-        if (
-            not force
-            and message is not None
-            and self.is_latest_message(message)
-            and find_button(message, exact=LOOK_BUTTON) is not None
-        ):
-            return await self.click_button(
-                message,
-                exact=LOOK_BUTTON,
-                action_type=ActionType.OPEN_ATTACK,
-                description=LOOK_BUTTON,
-            )
-
-        if not await self.reserve_telegram_action_slot(MAP_COMMAND):
-            return False
-        if not self.running or (not force and self.inbound_generation != generation):
-            self.log("Запрос карты отменён: уже получено новое состояние.")
-            return False
+        sent = False
         try:
+            if not await self.reserve_telegram_action_slot(MAP_COMMAND):
+                return False
+            if (
+                not self.running
+                or self.telegram_cooldown_remaining() > 0
+                or self.inbound_generation != generation
+                or not self.event_queue.empty()
+            ):
+                return False
+            if recovery_reason is not None:
+                if self.watchdog.recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+                    await self.record_silent_stall(recovery_reason)
+                    await self.stop(f"состояние игры не восстановлено: {recovery_reason}")
+                    return False
+                if not self.recovery_attempt_guard.allow():
+                    await self.record_silent_stall(recovery_reason)
+                    return False
+                attempt = self.watchdog.begin_recovery_attempt()
+                self.record_telegram_metric("recovery_attempts")
+                self.log(
+                    f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): "
+                    f"{recovery_reason}"
+                )
+            # Refresh uses a new command, never an already attempted inline button.
+            # On timeout delivery is uncertain: observe the retry deadline as well.
+            sent = True
             self.record_telegram_action("map_message")
-            await self.client.send_message(
-                self.game_bot,
-                MAP_COMMAND,
+            await asyncio.wait_for(
+                self.client.send_message(self.game_bot, MAP_COMMAND),
+                timeout=TELEGRAM_MAP_RPC_TIMEOUT,
             )
             return True
         except FloodWaitError as error:
-            await self.pause_for_flood_wait(
-                error,
-                MAP_COMMAND,
-                resume_mode="refresh",
+            sent = False
+            await self.pause_for_flood_wait(error, MAP_COMMAND, resume_mode="refresh")
+            return False
+        except (OSError, TimeoutError, RPCError) as error:
+            self.record_telegram_metric("rpc_errors")
+            self.log(f"Запрос карты не подтверждён: {type(error).__name__}: {error}")
+            await self.storage.add_event(
+                "STATE_REFRESH_FAILED",
+                f"{type(error).__name__}: {error}",
+                level="WARNING",
             )
             return False
+        finally:
+            self.state_refresh_gate.finish(sent=sent)
 
-    async def recover_latest_state(
-        self,
-        reason: str,
-    ) -> bool:
-        if not self.event_queue.empty():
-            self.log(
-                f"Восстановление «{reason}» не требуется: новое состояние уже в локальной очереди."
-            )
-            return False
-
-        within_observation_window = self.recovery_attempt_guard.allow()
-        self.record_telegram_metric("recovery_attempts")
-
-        attempt = self.watchdog.begin_recovery_attempt()
-
-        self.log(f"Восстановление состояния ({attempt}/{MAX_RECOVERY_ATTEMPTS}): {reason}")
-
-        if not within_observation_window or attempt > MAX_RECOVERY_ATTEMPTS:
-            await self.record_silent_stall(reason)
-
-        # Telethon already delivered the newest state to the local cache.
-        # Reading history here adds an RPC and risks replaying an old inline UI.
-        return await self.request_map_refresh()
+    async def recover_latest_state(self, reason: str) -> bool:
+        return await self.request_map_refresh(recovery_reason=reason)
 
     def watchdog_diagnostic_payload(
         self,
         *,
         elapsed: float,
         timeout: float,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         pending_move = self.context.pending_move
         latest_message = self.latest_received_message
         return {
@@ -2102,27 +2121,12 @@ class Farmer:
                 payload=diagnostic,
             )
 
-    async def handle_message(self, message) -> None:
-        if not self.running:
-            return
-
-        text = message.raw_text or ""
-        hp_changed = self.update_hp(text)
-        self.confirm_blessing_from_text(text)
-
-        map_info = parse_map(
-            text,
-            self.settings.values.enabled_targets,
-            CHARACTER_NAME,
-        )
-        kind = classify_message(
-            text,
-            self.settings.values.enabled_targets,
-            CHARACTER_NAME,
-            is_map=map_info is not None,
-        )
-        round_state = parse_combat_round(text, get_button_texts(message))
-
+    async def _observe_combat_message(
+        self,
+        text: str,
+        kind: MessageKind,
+        round_state: CombatRoundState | None,
+    ) -> None:
         if kind is MessageKind.COMBAT_STARTED:
             self.activate_combat_profile(self.context.max_hp)
         elif self.combat.target_name and self.active_combat_profile_max_hp is None:
@@ -2219,30 +2223,6 @@ class Farmer:
                 self.pending_combat_decision = None
         self.combat.observe(text, CHARACTER_NAME, round_state)
 
-        if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
-            await self.maybe_request_recovery_map()
-        if self.state is BotState.RECOVERY and kind is MessageKind.OTHER:
-            return
-
-        if self.state is BotState.WAITING_FOR_HEALTH:
-            active_battle_kinds = {
-                MessageKind.TARGET_SELECTION,
-                MessageKind.COMBAT_TARGET_SELECTION,
-                MessageKind.COMBAT_STARTED,
-                MessageKind.PLAYER_TURN,
-                MessageKind.BATTLE_FINISHED,
-            }
-            if kind not in active_battle_kinds:
-                if not self.has_battle_health():
-                    return
-                self.finish_battle_health_wait()
-                if kind is not MessageKind.MAP:
-                    await self.request_map_refresh()
-                    return
-
-        if await self.handle_blessing_menu(message):
-            return
-
         for defeated_enemy in defeated_enemies:
             self.context.remove_combat_enemy(defeated_enemy)
             self.log(f"Противник повержен: {defeated_enemy}")
@@ -2260,24 +2240,6 @@ class Farmer:
                     )
                 else:
                     self.combat.reset()
-
-        if kind is MessageKind.MAP:
-            assert map_info is not None
-            await self.handle_map(message, map_info)
-            return
-
-        if kind is MessageKind.MOVE_STARTED:
-            self.state = BotState.MOVING
-            self.mark_progress("сервер подтвердил движение")
-            return
-
-        if kind is MessageKind.TARGET_SELECTION:
-            await self.handle_target_selection(message)
-            return
-
-        if kind is MessageKind.COMBAT_TARGET_SELECTION:
-            await self.handle_combat_target_selection(message)
-            return
 
         if kind is MessageKind.COMBAT_STARTED:
             combat_target = extract_combat_target(text)
@@ -2313,6 +2275,148 @@ class Farmer:
             self.state = BotState.COMBAT
             return
 
+    async def _record_battle_result(self, message: GameMessage) -> None:
+        text = message.raw_text or ""
+        if "Победа" in text:
+            target_name = self.resolved_battle_target()
+            reward = parse_battle_reward(text)
+
+            added = self.statistics.add_victory(
+                message.id,
+                reward,
+            )
+            _, cards = await self.storage.record_battle(
+                telegram_message_id=message.id,
+                session_id=self.session_id,
+                target_name=target_name,
+                result="VICTORY",
+                xp=reward.xp,
+                dust=reward.dust,
+                crystals=reward.crystals,
+                items=reward.items,
+                position=self.context.current_position,
+                combat_decisions=tuple(
+                    trace.as_payload() for trace in self.combat_decisions
+                ),
+            )
+            await self.persist_combat_knowledge()
+            for card in cards:
+                await self.storage.add_event(
+                    "MOB_CARD_DROPPED",
+                    card,
+                    payload={"position": self.context.current_position},
+                )
+                await self.notifier.card_drop(
+                    card,
+                    self.context.current_position,
+            )
+            if added:
+                logger.info(
+                    "\n%s",
+                    format_report(
+                        "СТАТИСТИКА ТЕКУЩЕЙ СЕССИИ",
+                        self.statistics.session_report(),
+                    ),
+                )
+
+            self.completed_battles.remember(message.id)
+            self.context.clear_combat()
+            self.combat.reset()
+            self.combat_decisions.clear()
+            self.pending_combat_decision = None
+            self.mark_progress("бой завершён победой")
+            return
+
+        if "Поражение" in text:
+            await self.enter_death_recovery(message.id)
+            self.completed_battles.remember(message.id)
+            return
+
+
+    async def handle_message(self, message: GameMessage) -> None:
+        if not self.running:
+            return
+        text = message.raw_text or ""
+        map_info = parse_map(text, self.settings.values.enabled_targets, CHARACTER_NAME)
+        kind = classify_message(
+            text,
+            self.settings.values.enabled_targets,
+            CHARACTER_NAME,
+            is_map=map_info is not None,
+        )
+        if kind is MessageKind.BATTLE_FINISHED and message.id in self.completed_battles:
+            return
+        fact_key = message_fact_key(message)
+        if kind is MessageKind.MAP:
+            # Maps describe current state and can legitimately recur. Combat
+            # facts remain deduplicated historically to avoid learning twice.
+            first_observation = fact_key != self._last_observed_prompt
+        else:
+            first_observation = self.observed_events.remember(fact_key)
+        if not is_passive_health_notification(text):
+            self._last_observed_prompt = fact_key
+        hp_changed = False
+        if first_observation:
+            hp_changed = self.update_hp(text)
+            self.confirm_blessing_from_text(text)
+            round_state = parse_combat_round(text, get_button_texts(message))
+            await self._observe_combat_message(text, kind, round_state)
+        elif self.is_latest_message(message):
+            # Refresh castable skills from changed UI without learning the round twice.
+            round_state = parse_combat_round(text, get_button_texts(message))
+            if round_state is not None:
+                self.combat.latest_round = round_state
+        if kind is MessageKind.BATTLE_FINISHED:
+            await self._record_battle_result(message)
+            return
+        if (
+            kind not in {MessageKind.MAP, MessageKind.MOVE_STARTED}
+            and not is_passive_health_notification(text)
+            and not self.is_latest_message(message)
+        ):
+            return
+        if self.state is BotState.RECOVERY and hp_changed and kind is not MessageKind.MAP:
+            await self.maybe_request_recovery_map()
+        if self.state is BotState.RECOVERY and kind is MessageKind.OTHER:
+            return
+
+        if self.state is BotState.WAITING_FOR_HEALTH:
+            active_battle_kinds = {
+                MessageKind.TARGET_SELECTION,
+                MessageKind.COMBAT_TARGET_SELECTION,
+                MessageKind.COMBAT_STARTED,
+                MessageKind.PLAYER_TURN,
+                MessageKind.BATTLE_FINISHED,
+            }
+            if kind not in active_battle_kinds:
+                if not self.has_battle_health():
+                    return
+                self.finish_battle_health_wait()
+                if kind is not MessageKind.MAP:
+                    await self.request_map_refresh()
+                    return
+
+        if await self.handle_blessing_menu(message):
+            return
+
+        if kind is MessageKind.MAP:
+            assert map_info is not None
+            await self.handle_map(message, map_info, observe=first_observation)
+            return
+
+        if kind is MessageKind.MOVE_STARTED:
+            self.state = BotState.MOVING
+            self.mark_progress("сервер подтвердил движение")
+            return
+
+        if kind is MessageKind.TARGET_SELECTION:
+            await self.handle_target_selection(message)
+            return
+
+        if kind is MessageKind.COMBAT_TARGET_SELECTION:
+            await self.handle_combat_target_selection(message)
+            return
+
         if kind is MessageKind.PLAYER_TURN:
             await self.handle_combat_turn(message)
             return
@@ -2325,60 +2429,6 @@ class Farmer:
             await self.handle_target_gone()
             return
 
-        if kind is MessageKind.BATTLE_FINISHED:
-            if "Победа" in text:
-                target_name = self.resolved_battle_target()
-                reward = parse_battle_reward(text)
-
-                added = self.statistics.add_victory(
-                    message.id,
-                    reward,
-                )
-                _, cards = await self.storage.record_battle(
-                    telegram_message_id=message.id,
-                    session_id=self.session_id,
-                    target_name=target_name,
-                    result="VICTORY",
-                    xp=reward.xp,
-                    dust=reward.dust,
-                    crystals=reward.crystals,
-                    items=reward.items,
-                    position=self.context.current_position,
-                    combat_decisions=tuple(
-                        trace.as_payload() for trace in self.combat_decisions
-                    ),
-                )
-                await self.persist_combat_knowledge()
-                for card in cards:
-                    await self.storage.add_event(
-                        "MOB_CARD_DROPPED",
-                        card,
-                        payload={"position": self.context.current_position},
-                    )
-                    await self.notifier.card_drop(
-                        card,
-                        self.context.current_position,
-                )
-                if added:
-                    logger.info(
-                        "\n%s",
-                        format_report(
-                            "СТАТИСТИКА ТЕКУЩЕЙ СЕССИИ",
-                            self.statistics.session_report(),
-                        ),
-                    )
-
-                self.context.clear_combat()
-                self.combat.reset()
-                self.combat_decisions.clear()
-                self.pending_combat_decision = None
-                self.mark_progress("бой завершён победой")
-                return
-
-            if "Поражение" in text:
-                await self.enter_death_recovery(message.id)
-                return
-
     async def process_latest_state(self) -> None:
         # Historical inline messages may belong to an old location or an
         # already completed turn. One fresh map command is both cheaper than a
@@ -2386,22 +2436,44 @@ class Farmer:
         self.mark_progress("при запуске запрошено свежее состояние")
         await self.request_map_refresh()
 
-    async def stop(self, reason: str) -> None:
-        if not self.running:
-            return
+    def _background_tasks(self) -> list[asyncio.Task[None]]:
+        tasks = self._owned_tasks | {
+            task
+            for task in (
+                self.worker_task,
+                self.watchdog_task,
+                self.recovery_task,
+                self.rest_task,
+                self.activity_break_task,
+                self.telegram_cooldown_task,
+                self.telegram_metrics_flush_task,
+                self.progress_persist_task,
+            )
+            if task is not None
+        }
+        return [task for task in tasks if not task.done()]
 
-        self.stop_reason = reason
-        self.running = False
-        self.state = BotState.STOPPED
-        self.pending_progress_reason = None
+    @property
+    def shutdown_complete(self) -> bool:
+        return self._shutdown_complete and not self._background_tasks()
 
-        if self.progress_persist_task and self.progress_persist_task is not asyncio.current_task():
-            self.progress_persist_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.progress_persist_task
+    async def _cancel_background_tasks(
+        self, *, exclude: asyncio.Task[None] | None = None
+    ) -> None:
+        tasks = [task for task in self._background_tasks() if task is not exclude]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=SHUTDOWN_STEP_TIMEOUT)
+            for task in done:
+                if not task.cancelled():
+                    error = task.exception()
+                    if error is not None:
+                        logger.error("Фоновая задача завершилась с ошибкой: %s", error)
+            if pending:
+                raise TimeoutError("Фоновые задачи не завершились после отмены")
 
-        # Отложенная запись прогресса могла быть отменена строками выше.
-        # Сохраняем фактические счётчики синхронно до завершения сессии.
+    async def _persist_stop(self, reason: str) -> None:
         await self.storage.update_state(
             **self._state_snapshot(reason, pause_requested=False)
         )
@@ -2431,32 +2503,83 @@ class Farmer:
             },
         )
         await self.persist_combat_knowledge()
-        metrics_flush_task = getattr(self, "telegram_metrics_flush_task", None)
-        if metrics_flush_task:
-            metrics_flush_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await metrics_flush_task
-            self.telegram_metrics_flush_task = None
-        if hasattr(self, "telegram_metrics_pending"):
-            await self.flush_telegram_metrics()
+        await self.flush_telegram_metrics()
         await self.storage.checkpoint()
-        for task in (
-            self.worker_task,
-            self.watchdog_task,
-            self.recovery_task,
-            self.rest_task,
-            self.activity_break_task,
-            getattr(self, "telegram_cooldown_task", None),
-            self.progress_persist_task,
-        ):
-            if task and task is not asyncio.current_task():
-                task.cancel()
 
-        if self.client.is_connected():
-            await self.client.disconnect()
+    async def _shutdown(
+        self, reason: str, initiator: asyncio.Task[None] | None
+    ) -> None:
+        # Never let failed statistics writes keep a Telegram session connected.
+        # The initiating worker is excluded because it may be awaiting this task.
+        try:
+            await self._cancel_background_tasks(exclude=initiator)
+            try:
+                async with asyncio.timeout(SHUTDOWN_STEP_TIMEOUT):
+                    await self._persist_stop(reason)
+            except Exception:
+                logger.exception("Не удалось сохранить итог остановки фармера")
+        finally:
+            async with asyncio.timeout(SHUTDOWN_STEP_TIMEOUT):
+                # Disconnect also closes the session file before the lease is released.
+                await self.client.disconnect()
+        self._shutdown_complete = True
+
+    async def stop(self, reason: str) -> None:
+        if self.stop_reason is None:
+            self.stop_reason = reason
+        self.running = False
+        self.state = BotState.STOPPED
+        self.pending_progress_reason = None
+        current_task = asyncio.current_task()
+        shutdown_task = self._shutdown_task
+        if shutdown_task is None or (
+            shutdown_task.done() and not self._shutdown_complete
+        ):
+            shutdown_task = asyncio.create_task(
+                self._shutdown(self.stop_reason, current_task), name="farmer-shutdown"
+            )
+            self._shutdown_task = shutdown_task
+        try:
+            await asyncio.shield(shutdown_task)
+        except asyncio.CancelledError:
+            # Cleanup may itself be waiting for a cancelled worker to exit.
+            # Other callers still join the shielded cleanup before propagating cancellation.
+            if current_task not in self._background_tasks():
+                await asyncio.shield(shutdown_task)
+            raise
+        # A stop initiated inside a worker could not join that worker itself.
+        # The runner joins it here before the supervisor releases the session lease.
+        await self._cancel_background_tasks(exclude=current_task)
 
     async def run(self) -> None:
+        self._run_task = asyncio.current_task()
+        reason = "Telegram-соединение завершено"
+        try:
+            await self._run_session()
+        except asyncio.CancelledError:
+            if self._background_error is not None:
+                error = self._background_error
+                reason = f"ошибка фоновой задачи: {type(error).__name__}: {error}"
+                raise error from None
+            reason = "задача фармера отменена"
+            raise
+        except Exception as error:
+            reason = f"аварийное завершение: {type(error).__name__}: {error}"
+            raise
+        finally:
+            try:
+                await self.stop(self.stop_reason or reason)
+            finally:
+                self._run_task = None
+
+    async def _run_session(self) -> None:
         self.validate_config()
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            raise RuntimeError(
+                "Telethon-сессия не авторизована. Выполните python authorize.py "
+                "в интерактивном терминале с тем же FOG_DATA_DIR."
+            )
         await self.ensure_navigation_model()
         await self.load_combat_knowledge()
         for target in self.settings.values.treatment_enemy_targets:
@@ -2508,7 +2631,6 @@ class Farmer:
             f"Первый цикл: {self.cycle_move_target} ходов"
         )
 
-        await self.client.start()
         # Uses the Telethon entity cache and avoids fetching the full entity on
         # every restart once the peer is known to the session.
         self.game_bot = await self.client.get_input_entity(GAME_BOT)
@@ -2550,22 +2672,24 @@ class Farmer:
         )
         logger.info("=" * 72)
 
-        async def accept_game_message(event, metric: str) -> None:
+        async def accept_game_message(event: events.NewMessage.Event, metric: str) -> None:
             if event.message.out:
                 return
             self.record_telegram_metric(metric)
-            await self.enqueue_message(event.message)
+            await self.enqueue_message(cast(GameMessage, event.message))
 
-        @self.client.on(events.NewMessage(chats=self.game_bot))
-        async def on_game_message(event) -> None:
+        async def on_game_message(event: events.NewMessage.Event) -> None:
             await accept_game_message(event, "incoming_new_messages")
 
-        @self.client.on(events.MessageEdited(chats=self.game_bot))
-        async def on_game_message_edit(event) -> None:
+        async def on_game_message_edit(event: events.MessageEdited.Event) -> None:
             await accept_game_message(event, "incoming_message_edits")
 
-        self.worker_task = asyncio.create_task(self.event_worker())
-        self.watchdog_task = asyncio.create_task(self.watchdog_loop())
+        self.client.add_event_handler(on_game_message, events.NewMessage(chats=self.game_bot))
+        self.client.add_event_handler(
+            on_game_message_edit, events.MessageEdited(chats=self.game_bot)
+        )
+        self.worker_task = self._start_background(self.event_worker(), name="game-events")
+        self.watchdog_task = self._start_background(self.watchdog_loop(), name="progress-watchdog")
 
         await self.restore_telegram_cooldown()
         await self.process_latest_state()

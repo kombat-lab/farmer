@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 
 from combat_round import CombatRoundState, parse_combat_round, parse_starting_health
+from game_message import GameMessage
 from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
@@ -30,6 +31,17 @@ def is_periodic_effect(name: str | None) -> bool:
     normalized = normalize(name or "")
     normalized = normalized.removesuffix("[добивание]").strip()
     return any(marker in normalized for marker in PERIODIC_EFFECT_MARKERS)
+
+
+def apply_start_of_turn_effects(
+    current_hp: int,
+    max_hp: int,
+    *,
+    renewal_healing: int,
+    periodic_damage: int,
+) -> int:
+    """Apply the same pending tick order in the baseline and search model."""
+    return max(0, min(max_hp, current_hp + renewal_healing) - periodic_damage)
 
 
 class SkillTarget(Enum):
@@ -582,7 +594,9 @@ class CombatMemory:
             return 0
         return observed.minimum or 0
 
-    def predicted_incoming(self, *, after_current_tick: bool = False) -> int | None:
+    def predicted_incoming(
+        self, *, after_current_tick: bool = False, include_periodic: bool = True
+    ) -> int | None:
         normal = self.incoming_damage
         critical = self.critical_incoming_damage
         if normal.samples <= 0 and critical.samples <= 0:
@@ -602,10 +616,16 @@ class CombatMemory:
             estimates.append(math.ceil(critical.maximum * uncertainty))
         direct = max(estimates)
         required_turns = 1 if after_current_tick else 0
-        periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
+        periodic = (
+            self.periodic_damage
+            if include_periodic and self.periodic_damage_turns > required_turns
+            else 0
+        )
         return direct + periodic
 
-    def expected_incoming(self, *, after_current_tick: bool = False) -> int | None:
+    def expected_incoming(
+        self, *, after_current_tick: bool = False, include_periodic: bool = True
+    ) -> int | None:
         normal = self.incoming_damage
         critical = self.critical_incoming_damage
         total_samples = normal.samples + critical.samples
@@ -617,7 +637,11 @@ class CombatMemory:
         average = (normal.total + critical.total) / total_samples
         direct = max(1, math.ceil(average * uncertainty))
         required_turns = 1 if after_current_tick else 0
-        periodic = self.periodic_damage if self.periodic_damage_turns > required_turns else 0
+        periodic = (
+            self.periodic_damage
+            if include_periodic and self.periodic_damage_turns > required_turns
+            else 0
+        )
         return direct + periodic
 
     def renewal_tick(self) -> int | None:
@@ -871,7 +895,7 @@ def _estimated_enemy_turns(
 
 
 def choose_combat_action(
-    message,
+    message: GameMessage,
     *,
     memory: CombatMemory,
     current_hp: int | None,
@@ -919,7 +943,9 @@ def choose_combat_action(
     renewal_tick = memory.renewal_tick() or 0
     renewal_credit = renewal_tick if memory.renewal_turns > 0 else 0
     periodic_now = memory.periodic_damage if memory.periodic_damage_turns > 0 else 0
-    effective_hp = max(0, min(max_hp, current_hp + renewal_credit) - periodic_now)
+    effective_hp = apply_start_of_turn_effects(
+        current_hp, max_hp, renewal_healing=renewal_credit, periodic_damage=periodic_now
+    )
     missing_hp = max_hp - effective_hp
     enemy_turns = _estimated_enemy_turns(memory)
     future_renewal = max(0, memory.renewal_turns - 1) * renewal_tick

@@ -5,14 +5,20 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from combat_round import CombatRoundState
-from combat_strategy import CombatDecision, CombatMemory, SkillTarget
+from combat_strategy import (
+    CombatDecision,
+    CombatMemory,
+    SkillTarget,
+    apply_start_of_turn_effects,
+)
+from game_message import GameMessage
 from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
 SHADOW_HORIZON = 6
 SHADOW_MAX_HORIZON = 24
 SHADOW_BEAM_WIDTH = 64
-SHADOW_PLAN_VERSION = 4
+SHADOW_PLAN_VERSION = 5
 BASIC_ATTACK_MANA_RESTORE = 2
 RENEWAL_DURATION = 3
 COMBAT_PLANNER_MODES = ("shadow", "guarded", "active")
@@ -516,11 +522,28 @@ def _apply_skill(
     periodic_damage: int,
     margin: int,
 ) -> _SearchState:
-    hp = state.hp
     renewal_turns = state.renewal_turns
-    if renewal_turns > 0 and renewal_tick > 0:
-        hp = min(max_hp, hp + renewal_tick)
-        renewal_turns -= 1
+    periodic_turns = state.periodic_turns
+    hp = apply_start_of_turn_effects(
+        state.hp,
+        max_hp,
+        renewal_healing=renewal_tick if renewal_turns > 0 else 0,
+        periodic_damage=periodic_damage if periodic_turns > 0 else 0,
+    )
+    renewal_turns = max(0, renewal_turns - 1)
+    periodic_turns = max(0, periodic_turns - 1)
+    if hp <= 0:
+        # A lethal pending tick prevents the action, including healing. Do not
+        # let a simulated heal or finishing attack resurrect the player.
+        return replace(
+            state,
+            hp=0,
+            renewal_turns=renewal_turns,
+            periodic_turns=periodic_turns,
+            turns=state.turns + 1,
+            minimum_safety_margin=-margin,
+            unsafe_events=state.unsafe_events + 1,
+        )
 
     mana = state.mana
     if mana is not None:
@@ -544,7 +567,6 @@ def _apply_skill(
     cooldowns[model.name] = model.cooldown
 
     enemy_hits = state.enemy_hits
-    periodic_turns = state.periodic_turns
     minimum_safety_margin = state.minimum_safety_margin
     unsafe_events = state.unsafe_events
     if enemy_hp != 0:
@@ -809,7 +831,7 @@ def select_combat_planner_decision(
 
 
 def build_shadow_plan(
-    message: object,
+    message: GameMessage,
     *,
     memory: CombatMemory,
     current_hp: int | None,
@@ -841,8 +863,11 @@ def build_shadow_plan(
         else None
     )
     max_mana = parsed_max_mana or current_mana
-    expected_incoming = memory.expected_incoming(after_current_tick=True)
-    worst_incoming = memory.predicted_incoming(after_current_tick=True)
+    # The search consumes individual effect ticks from its own state. Passing
+    # an incoming estimate that already includes poison would count it again
+    # and keep charging it even after the effect expires.
+    expected_incoming = memory.expected_incoming(include_periodic=False)
+    worst_incoming = memory.predicted_incoming(include_periodic=False)
     enemy_hp = memory.enemy_current_hp
     sustainable_damage = memory.sustainable_damage_floor()
     renewal_tick = memory.renewal_tick() or 0
@@ -872,7 +897,7 @@ def build_shadow_plan(
         enemy_hp=enemy_hp,
         mana=current_mana,
         renewal_turns=max(0, memory.renewal_turns),
-        periodic_turns=max(0, memory.periodic_damage_turns - 1),
+        periodic_turns=max(0, memory.periodic_damage_turns),
         cooldowns=tuple(sorted(initial_cooldowns.items())),
     )
     projections: list[ActionProjection] = []

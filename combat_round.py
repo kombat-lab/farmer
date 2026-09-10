@@ -141,7 +141,7 @@ class CombatRoundState:
         expected = normalize(name)
         for combatant in self.combatants:
             actual = normalize(combatant.name)
-            if actual == expected or expected in actual:
+            if actual == expected:
                 return combatant
         return None
 
@@ -189,13 +189,14 @@ def _parse_combatants(lines: list[str]) -> tuple[CombatantState, ...]:
             if not nearby:
                 break
             effect_match = EFFECT_RE.match(nearby)
-            if effect_match:
-                effects.append(
-                    CombatEffect(
-                        name=effect_match.group(1).strip(),
-                        turns=int(effect_match.group(2)),
-                    )
+            if effect_match is None:
+                break
+            effects.append(
+                CombatEffect(
+                    name=effect_match.group(1).strip(),
+                    turns=int(effect_match.group(2)),
                 )
+            )
 
         result.append(
             CombatantState(

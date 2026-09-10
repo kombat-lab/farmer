@@ -42,7 +42,7 @@ class ProgressWatchdog:
     def should_recover(
         self,
         state: BotState,
-        **timeouts,
+        **timeouts: float,
     ) -> bool:
         return self.elapsed() >= self.timeout_for_state(
             state,

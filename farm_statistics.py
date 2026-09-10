@@ -37,7 +37,7 @@ class FarmStatistics:
     def elapsed_seconds(self) -> int:
         return int(time.monotonic() - self.started_at)
 
-    def add_victory(self, message_id, reward: BattleReward):
+    def add_victory(self, message_id: int, reward: BattleReward) -> bool:
         if message_id in self._battle_ids:
             return False
         self._battle_ids.add(message_id)
@@ -50,14 +50,14 @@ class FarmStatistics:
             self.session_drops[name] += quantity
         return True
 
-    def add_defeat(self, message_id):
+    def add_defeat(self, message_id: int) -> bool:
         if message_id in self._battle_ids:
             return False
         self._battle_ids.add(message_id)
         self.session_defeats += 1
         return True
 
-    def session_report(self):
+    def session_report(self) -> SessionReport:
         return SessionReport(
             self.elapsed_seconds(),
             self.session_wins,

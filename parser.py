@@ -89,7 +89,7 @@ def extract_player_hp(
 
     escaped_name = re.escape(character_name)
     map_match = re.search(
-        rf"{escaped_name}\s*\((\d+)\s*/\s*(\d+)\)",
+        rf"(?<!\w){escaped_name}\s*\((\d+)\s*/\s*(\d+)\)",
         text,
         re.IGNORECASE,
     )
@@ -99,17 +99,16 @@ def extract_player_hp(
             int(map_match.group(2)),
         )
 
-    lines = [line.strip() for line in text.splitlines()]
-    for index, line in enumerate(lines):
-        if character_name.casefold() not in line.casefold():
+    # Combat health belongs to the participant heading directly preceding it.
+    # An action line mentioning the player must not claim the enemy's HP.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for name_line, hp_line in zip(lines, lines[1:], strict=False):
+        if normalize(name_line) != normalize(character_name):
             continue
-        for nearby_line in lines[index + 1 : index + 4]:
-            hp_match = HEART_HP_RE.search(nearby_line)
-            if hp_match:
-                return (
-                    int(hp_match.group(1)),
-                    int(hp_match.group(2)),
-                )
+        hp_match = HEART_HP_RE.search(hp_line)
+        if hp_match:
+            return int(hp_match.group(1)), int(hp_match.group(2))
+
     return None
 
 

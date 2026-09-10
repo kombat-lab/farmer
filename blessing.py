@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 
+from game_message import GameMessage
 from models import ActionType
 from parser import normalize
 
@@ -42,7 +43,7 @@ class BlessingManager:
 
     async def try_open_from_map(
         self,
-        message,
+        message: GameMessage,
         *,
         click_button: ClickButton,
         log: Log,
@@ -69,7 +70,7 @@ class BlessingManager:
 
     async def handle_menu(
         self,
-        message,
+        message: GameMessage,
         *,
         find_button: FindButton,
         click_button: ClickButton,

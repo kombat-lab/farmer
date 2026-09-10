@@ -4,21 +4,24 @@ import os
 from pathlib import Path
 
 
-def _required(name: str) -> str:
+def _optional_int(name: str) -> int:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Не задана переменная окружения {name}")
-    return value
+        return 0
+    try:
+        return int(value)
+    except ValueError as error:
+        raise RuntimeError(f"Переменная окружения {name} должна быть целым числом") from error
 
 
 # Секретные значения — только через переменные окружения.
-API_ID = int(_required("TELEGRAM_API_ID"))
-API_HASH = _required("TELEGRAM_API_HASH")
-CONTROL_BOT_TOKEN = _required("CONTROL_BOT_TOKEN")
-ADMIN_TELEGRAM_ID = int(_required("ADMIN_TELEGRAM_ID"))
+API_ID = _optional_int("TELEGRAM_API_ID")
+API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+CONTROL_BOT_TOKEN = os.getenv("CONTROL_BOT_TOKEN", "").strip()
+ADMIN_TELEGRAM_ID = _optional_int("ADMIN_TELEGRAM_ID")
 
 # Пути контейнера.
-DATA_DIR = Path("/app/data")
+DATA_DIR = Path(os.getenv("FOG_DATA_DIR", "/app/data")).expanduser()
 DB_DIR = DATA_DIR / "db_farmer"
 DATABASE_PATH = DB_DIR / "fog_farmer.sqlite3"
 SESSION_DIR = DATA_DIR / "telegram"
@@ -27,7 +30,7 @@ LOG_DIRECTORY = str(DATA_DIR / "logs")
 LOG_FILENAME = "farmer.log"
 
 GAME_BOT = "@fogmmobot"
-CHARACTER_NAME = "Kombat"
+CHARACTER_NAME = os.getenv("FOG_CHARACTER_NAME", "Kombat").strip() or "Kombat"
 
 # Safe initial map bounds. They are replaced with the dimensions parsed from
 # the current game message as soon as the farmer receives a map.
@@ -95,9 +98,23 @@ LOG_BACKUP_COUNT = 3
 DATA_RETENTION_DAYS = 7
 LOG_RETENTION_DAYS = 7
 
-for directory in (
-    DB_DIR,
-    SESSION_DIR,
-    Path(LOG_DIRECTORY),
-):
-    directory.mkdir(parents=True, exist_ok=True)
+def validate_runtime_config() -> None:
+    missing = [
+        name
+        for name, value in (
+            ("TELEGRAM_API_ID", API_ID),
+            ("TELEGRAM_API_HASH", API_HASH),
+            ("CONTROL_BOT_TOKEN", CONTROL_BOT_TOKEN),
+            ("ADMIN_TELEGRAM_ID", ADMIN_TELEGRAM_ID),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Не заданы обязательные переменные окружения: " + ", ".join(missing)
+        )
+
+
+def prepare_runtime_directories() -> None:
+    for directory in (DB_DIR, SESSION_DIR, Path(LOG_DIRECTORY)):
+        directory.mkdir(parents=True, exist_ok=True)

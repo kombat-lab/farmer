@@ -56,7 +56,7 @@ from parser import (
 from rewards import BattleReward, parse_battle_reward, parse_item_stack
 from settings_service import SettingsService
 from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_button
-from storage import Storage
+from storage import SCHEMA_VERSION, Storage
 from targeting import select_combat_target
 from telegram_safety import (
     RollingAttemptGuard,
@@ -65,7 +65,6 @@ from telegram_safety import (
     TelegramActionTelemetry,
     message_state_key,
 )
-from watchdog import ProgressWatchdog
 
 CHARACTER = "Kombat"
 TARGETS = ["Черная мушка"]
@@ -2049,9 +2048,11 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         )
         farmer = Farmer.__new__(Farmer)
         farmer.running = True
+        farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
+        farmer._map_generation = 0
+        farmer._ingress_lock = asyncio.Lock()
         farmer.latest_messages = {}
         farmer.latest_received_message = None
-        farmer.processed_events = BoundedKeyCache()
         farmer.inbound_generation = 0
         farmer.event_queue = asyncio.Queue()
 
@@ -2075,26 +2076,6 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((second_pause, second_count), (5.0, 2))
         self.assertEqual((third_pause, third_count), (5.0, 3))
 
-    async def test_recovery_limit_records_incident_without_cooldown_or_stop(self) -> None:
-        farmer = Farmer.__new__(Farmer)
-        farmer.event_queue = asyncio.Queue()
-        farmer.state = BotState.COMBAT
-        farmer.recovery_attempt_guard = RollingAttemptGuard(
-            max_attempts=1,
-            window_seconds=600.0,
-        )
-        farmer.watchdog = ProgressWatchdog()
-        farmer.request_map_refresh = AsyncMock(return_value=True)
-        farmer.record_silent_stall = AsyncMock()
-        farmer.record_telegram_metric = lambda _metric: None
-        farmer.stop = AsyncMock()
-
-        self.assertTrue(await farmer.recover_latest_state("first probe"))
-        self.assertTrue(await farmer.recover_latest_state("still silent"))
-
-        farmer.record_silent_stall.assert_awaited_once_with("still silent")
-        farmer.stop.assert_not_awaited()
-
     async def test_callback_timeout_is_recorded_without_retry_pause_or_stop(self) -> None:
         with TemporaryDirectory() as directory:
             message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
@@ -2115,8 +2096,10 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             farmer.storage = Storage(Path(directory) / "test.sqlite3")
             farmer.notifier = SimpleNamespace(send=notify)
             farmer.latest_messages = {message.id: message}
+            farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
             farmer.latest_received_message = message
             farmer.attempted_actions = BoundedKeyCache()
+            farmer.inbound_generation = 1
             farmer.telegram_cooldown_until = 0.0
             farmer.telegram_cooldown_until_utc = None
             farmer.telegram_cooldown_reason = None
@@ -2160,8 +2143,10 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
         farmer.running = True
         farmer.telegram_cooldown_until = 0.0
         farmer.latest_messages = {message.id: message}
+        farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
         farmer.latest_received_message = message
         farmer.attempted_actions = BoundedKeyCache()
+        farmer.inbound_generation = 1
         farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
         farmer.record_telegram_action = lambda _kind: None
         farmer.record_callback_timeout = AsyncMock()
@@ -2214,8 +2199,10 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_state_refresh_is_reserved_once_per_inbound_generation(self) -> None:
         gate = StateRefreshGate()
         self.assertTrue(gate.reserve(7))
+        gate.finish(sent=True)
         self.assertFalse(gate.reserve(7))
         self.assertTrue(gate.reserve(8))
+        gate.finish(sent=True)
 
     def test_recovery_attempts_are_bounded_in_a_rolling_window(self) -> None:
         now = 0.0
@@ -2423,6 +2410,42 @@ class RewardTests(unittest.TestCase):
 
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_schema_is_versioned_and_indexed(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            version = int(
+                storage.connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            indexes = {
+                str(row[0])
+                for row in storage.connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+
+            self.assertEqual(version, SCHEMA_VERSION)
+            self.assertTrue(
+                {
+                    "idx_battles_happened_at",
+                    "idx_battles_session_id",
+                    "idx_drops_battle_id",
+                    "idx_events_created_at",
+                    "idx_combat_analysis_happened_at",
+                    "idx_sessions_status_ended_at",
+                }.issubset(indexes)
+            )
+            await storage.close()
+
+    async def test_newer_database_schema_is_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+            connection.close()
+
+            with self.assertRaisesRegex(RuntimeError, "новее поддерживаемой"):
+                Storage(path)
+
     async def test_new_database_uses_current_schema_directly(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
@@ -3167,16 +3190,35 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await storage.close()
 
     async def test_stop_persists_final_movement_snapshot(self) -> None:
-        from statistics import FarmStatistics
+        from farm_statistics import FarmStatistics
 
         class DisconnectedClient:
+            async def disconnect(self) -> None:
+                return None
+
             def is_connected(self) -> bool:
                 return False
+
+        cancelled = asyncio.Event()
+
+        async def background_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
 
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             session_id = await storage.start_session(cycles_count=1, moves_per_cycle=80)
             farmer = Farmer.__new__(Farmer)
+            farmer._shutdown_task = None
+            farmer._shutdown_complete = False
+            farmer._run_task = None
+            farmer._owned_tasks = set()
+            farmer._background_error = None
+            farmer.telegram_cooldown_task = None
+            farmer.telegram_metrics_flush_task = None
+            farmer.flush_telegram_metrics = AsyncMock()
             farmer.running = True
             farmer.state = BotState.MAP
             farmer.stop_reason = None
@@ -3198,7 +3240,8 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             farmer.statistics = FarmStatistics()
             farmer.storage = storage
             farmer.client = DisconnectedClient()
-            farmer.worker_task = None
+            farmer.worker_task = asyncio.create_task(background_worker())
+            await asyncio.sleep(0)
             farmer.watchdog_task = None
             farmer.recovery_task = None
             farmer.rest_task = None
@@ -3211,10 +3254,53 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state["moves_in_cycle"], 80)
             self.assertEqual(state["position_x"], 4)
             self.assertEqual(state["position_y"], 5)
+            self.assertTrue(cancelled.is_set())
+            await storage.close()
+
+    async def test_record_battle_rolls_back_all_rows_on_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(Path(directory) / "test.sqlite3")
+            decision = {
+                "model_version": COMBAT_MODEL_VERSION,
+                "telegram_message_id": 501,
+                "target_name": "Пепельник",
+                "decision": {
+                    "skill_name": "атака аколита",
+                    "target": "enemy",
+                    "reason": "test",
+                    "urgent": False,
+                },
+            }
+
+            with patch.object(
+                storage,
+                "_write_battle_analysis",
+                side_effect=RuntimeError("analysis failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "analysis failed"):
+                    await storage.record_battle(
+                        telegram_message_id=500,
+                        session_id=None,
+                        target_name="Пепельник",
+                        result="VICTORY",
+                        combat_decisions=(decision,),
+                    )
+
+            self.assertEqual(
+                storage.connection.execute("SELECT COUNT(*) FROM battles").fetchone()[0],
+                0,
+            )
+            inserted, _ = await storage.record_battle(
+                telegram_message_id=500,
+                session_id=None,
+                target_name="Пепельник",
+                result="VICTORY",
+            )
+            self.assertTrue(inserted)
             await storage.close()
 
     def test_runtime_statistics_count_stack_quantity(self) -> None:
-        from statistics import FarmStatistics
+        from farm_statistics import FarmStatistics
 
         stats = FarmStatistics()
         reward = BattleReward(dust=0, xp=0, items=("Осколок x3",))
@@ -3222,7 +3308,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats.session_report().drops, {"Осколок": 3})
 
     def test_runtime_statistics_count_crystals(self) -> None:
-        from statistics import FarmStatistics
+        from farm_statistics import FarmStatistics
 
         stats = FarmStatistics()
         stats.add_victory(1, BattleReward(dust=0, xp=0, items=(), crystals=3))

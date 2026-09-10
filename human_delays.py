@@ -5,6 +5,8 @@ import re
 import time
 from collections.abc import Callable
 
+from numeric_validation import finite_range
+
 REMAINING_SECONDS_RE = re.compile(r"Осталось:\s*(\d+)\s*сек", re.IGNORECASE)
 TURN_SAFETY_SECONDS = 6.0
 
@@ -37,8 +39,7 @@ class HumanDelayModel:
         urgent: bool = False,
         remaining_seconds: int | None = None,
     ) -> float:
-        minimum = max(0.0, float(minimum))
-        maximum = max(minimum, float(maximum))
+        minimum, maximum = finite_range(minimum, maximum)
         self._advance_tempo()
 
         effective_maximum = maximum
@@ -57,7 +58,7 @@ class HumanDelayModel:
 
     def should_take_long_pause(self, configured_chance: float) -> bool:
         """Clusters pauses after several moves instead of independent coin flips."""
-        chance = min(1.0, max(0.0, float(configured_chance)))
+        chance, _ = finite_range(configured_chance, configured_chance, limit=1.0)
         self.moves_since_long_pause += 1
         if chance <= 0.0 or self.moves_since_long_pause < 3:
             return False
@@ -132,8 +133,9 @@ class ActivityBreakPlanner:
         return True
 
     def duration(self, minimum: float, maximum: float) -> float:
-        minimum = max(1.0, float(minimum))
-        maximum = max(minimum, float(maximum))
+        minimum, maximum = finite_range(minimum, maximum)
+        minimum = max(1.0, minimum)
+        maximum = max(minimum, maximum)
         return self.rng.triangular(minimum, maximum, minimum + (maximum - minimum) * 0.4)
 
     def complete(

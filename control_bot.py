@@ -40,7 +40,13 @@ from rich_messages import (
     stats_rich,
     targets_rich,
 )
-from settings_service import SettingsService
+from settings_service import (
+    MAX_CYCLES_COUNT,
+    MAX_HEAL_THRESHOLD,
+    MAX_MOVES_PER_CYCLE,
+    DelayKind,
+    SettingsService,
+)
 from storage import Storage
 from supervisor import FarmerSupervisor
 
@@ -133,7 +139,7 @@ class ControlBot:
         self.settings = settings
         self.router = Router(name="control")
         self.dispatcher = Dispatcher(storage=MemoryStorage())
-        self.polling_task: asyncio.Task | None = None
+        self.polling_task: asyncio.Task[None] | None = None
         middleware = AdminOnlyMiddleware(ADMIN_TELEGRAM_ID)
         self.router.message.outer_middleware(middleware)
         self.router.callback_query.outer_middleware(middleware)
@@ -485,7 +491,7 @@ class ControlBot:
             return InputSpec(
                 SettingsInput.cycles_count,
                 "🔄 Количество циклов",
-                "Введите целое число больше нуля. Например: 1",
+                f"Введите целое число от 1 до {MAX_CYCLES_COUNT}. Например: 1",
                 s.cycles_count,
                 "settings:farm",
             )
@@ -493,7 +499,7 @@ class ControlBot:
             return InputSpec(
                 SettingsInput.moves_per_cycle,
                 "👣 Диапазон ходов",
-                "Введите минимум и максимум через пробел. Например: 80 120",
+                f"Введите минимум и максимум от 1 до {MAX_MOVES_PER_CYCLE}. Например: 80 120",
                 f"{s.moves_per_cycle_min}–{s.moves_per_cycle_max}",
                 "settings:farm",
             )
@@ -501,7 +507,7 @@ class ControlBot:
             return InputSpec(
                 SettingsInput.character_value,
                 "❤️ Порог лечения",
-                "Введите целое количество HP, при котором разрешено Лечение.",
+                f"Введите порог лечения от 1 до {MAX_HEAL_THRESHOLD} HP.",
                 s.heal_threshold,
                 "settings:combat",
             )
@@ -525,14 +531,15 @@ class ControlBot:
             }
             if key not in labels:
                 raise ValueError("Неизвестная задержка")
-            minimum = getattr(s, f"{key}_min")
-            maximum = getattr(s, f"{key}_max")
-            divisor = 60 if key == "cycle_rest" else 1
+            delay_kind = DelayKind(key)
+            minimum, maximum = self.settings.get_delay_range(delay_kind)
+            divisor = delay_kind.input_multiplier
             unit = "минуты" if key == "cycle_rest" else "секунды"
             return InputSpec(
                 SettingsInput.delay_range,
                 f"⏱ {labels[key]}",
-                f"Введите минимум и максимум через пробел ({unit}). Например: 5 15",
+                f"Введите минимум и максимум от 0 до "
+                f"{delay_kind.limit_seconds / divisor:g} ({unit}). Например: 5 15",
                 f"{minimum / divisor:g}–{maximum / divisor:g}",
                 "settings:delays",
             )
@@ -800,12 +807,10 @@ class ControlBot:
         async def cycles_input(message: Message, state: FSMContext) -> None:
             try:
                 value = int(message.text or "")
-                if value < 1:
-                    raise ValueError
-            except ValueError:
-                await self._retry_input(message, state, "Введите целое число больше нуля.")
+                await self.settings.set_cycles_count(value)
+            except ValueError as error:
+                await self._retry_input(message, state, str(error))
                 return
-            await self.settings.set_value("cycles_count", value)
             await self._finish_input(message, state, f"Количество циклов: {value}.")
 
         @r.message(SettingsInput.moves_per_cycle)
@@ -826,53 +831,37 @@ class ControlBot:
         async def character_input(message: Message, state: FSMContext) -> None:
             try:
                 value = int(message.text or "")
-                self.settings.validate_character_value(value)
-            except ValueError:
-                await self._retry_input(message, state, "Введите целое число больше нуля.")
+                await self.settings.set_heal_threshold(value)
+            except ValueError as error:
+                await self._retry_input(message, state, str(error))
                 return
-            await self.settings.set_value("heal_threshold", value)
             await self._finish_input(message, state, f"Порог лечения: {value} HP.")
 
         @r.message(SettingsInput.delay_range)
         async def delay_input(message: Message, state: FSMContext) -> None:
-            try:
-                values = (message.text or "").replace(",", ".").split()
-                if len(values) != 2:
-                    raise ValueError
-                minimum, maximum = map(float, values)
-                self.settings.validate_range(minimum, maximum)
-            except ValueError:
-                await self._retry_input(
-                    message,
-                    state,
-                    "Введите два числа: минимум и максимум.",
-                )
-                return
             data = await state.get_data()
-            kind = str(data["input_kind"])
-            key = kind.removeprefix("delay:")
-            display_minimum, display_maximum = minimum, maximum
-            if key == "cycle_rest":
-                minimum *= 60
-                maximum *= 60
-            await self.settings.set_value(f"{key}_min", minimum)
-            await self.settings.set_value(f"{key}_max", maximum)
+            try:
+                kind = DelayKind(str(data["input_kind"]).removeprefix("delay:"))
+                minimum, maximum = self.settings.parse_delay_range(kind, message.text or "")
+                await self.settings.set_delay_range(kind, minimum, maximum)
+            except ValueError as error:
+                await self._retry_input(message, state, str(error))
+                return
             await self._finish_input(
                 message,
                 state,
-                f"Диапазон сохранён: {display_minimum:g}–{display_maximum:g}.",
+                f"Диапазон сохранён: {minimum / kind.input_multiplier:g}–"
+                f"{maximum / kind.input_multiplier:g}.",
             )
 
         @r.message(SettingsInput.long_pause_chance)
         async def chance_input(message: Message, state: FSMContext) -> None:
             try:
                 value = float((message.text or "").replace(",", "."))
-                if not 0 <= value <= 100:
-                    raise ValueError
+                await self.settings.set_long_pause_chance(value / 100)
             except ValueError:
                 await self._retry_input(message, state, "Введите число от 0 до 100.")
                 return
-            await self.settings.set_value("long_pause_chance", value / 100)
             await self._finish_input(message, state, f"Шанс короткой паузы: {value:g}%.")
 
         @r.message()
@@ -894,6 +883,9 @@ class ControlBot:
             self.dispatcher.start_polling(
                 self.bot,
                 allowed_updates=self.dispatcher.resolve_used_update_types(),
+                # A single administrator's updates must finish in order. This also
+                # lets stop_polling cancel/join the active handler before DB shutdown.
+                handle_as_tasks=False,
                 handle_signals=False,
                 close_bot_session=False,
             ),
@@ -901,9 +893,27 @@ class ControlBot:
         )
 
     async def stop(self) -> None:
-        if self.polling_task is None:
+        self.supervisor.begin_shutdown()
+        polling_task = self.polling_task
+        if polling_task is None:
             return
-        await self.dispatcher.stop_polling()
-        with suppress(asyncio.CancelledError):
-            await self.polling_task
-        self.polling_task = None
+        if not polling_task.done():
+            # start() schedules polling; give it a chance to acquire its running lock.
+            await asyncio.sleep(0)
+            if not polling_task.done():
+                try:
+                    await self.dispatcher.stop_polling()
+                except RuntimeError:
+                    # The dispatcher never acquired its lock, so there are no child
+                    # polling tasks to drain. Cancelling an active dispatcher directly
+                    # would skip aiogram's public graceful-stop path.
+                    polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Polling панели управления завершился с ошибкой")
+        finally:
+            if polling_task.done():
+                self.polling_task = None

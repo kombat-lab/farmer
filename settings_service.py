@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from config import (
@@ -26,7 +27,33 @@ from config import (
     DEFAULT_TARGET_DELAY_MIN,
 )
 from game_catalog import ALL_MONSTER_NAMES, get_monster_names
+from numeric_validation import MAX_WAIT_SECONDS, bounded_integer, finite_number, finite_range
 from storage import Storage
+
+MAX_CYCLES_COUNT = 10_000
+MAX_MOVES_PER_CYCLE = 1_000_000
+MAX_HEAL_THRESHOLD = 1_000_000
+
+
+class DelayKind(StrEnum):
+    MOVE = "move_delay"
+    ATTACK = "attack_delay"
+    TARGET = "target_delay"
+    SKILL = "skill_delay"
+    LONG_PAUSE = "long_pause"
+    CYCLE_REST = "cycle_rest"
+
+    @property
+    def limit_seconds(self) -> float:
+        if self is DelayKind.CYCLE_REST:
+            return MAX_WAIT_SECONDS
+        if self is DelayKind.LONG_PAUSE:
+            return 3600.0
+        return 300.0
+
+    @property
+    def input_multiplier(self) -> float:
+        return 60.0 if self is DelayKind.CYCLE_REST else 1.0
 
 NON_UI_SETTING_KEYS = frozenset(
     {
@@ -79,9 +106,10 @@ class SettingsService:
 
     async def load(self) -> None:
         stored = await self.storage.get_settings()
+        self.values = FarmerSettings()
 
         for key, value in stored.items():
-            if hasattr(self.values, key):
+            if key in FarmerSettings.__dataclass_fields__:
                 setattr(self.values, key, value)
 
         self._upgrade_legacy_moves_setting(stored)
@@ -90,6 +118,7 @@ class SettingsService:
         self._normalize_treatment_enemy_targets()
         self._normalize_character()
         self._normalize_moves_range()
+        self._normalize_numeric_settings()
         self.values.blessing_enabled = self._normalize_bool(
             self.values.blessing_enabled,
             default=False,
@@ -101,23 +130,114 @@ class SettingsService:
             set(stored) - set(normalized) - NON_UI_SETTING_KEYS
         )
 
-    async def set_value(self, key: str, value: Any) -> None:
-        if not hasattr(self.values, key):
+    async def set_value(self, key: str, value: object) -> None:
+        """Validated compatibility API; paired ranges are written together."""
+        if key not in FarmerSettings.__dataclass_fields__:
             raise KeyError(key)
-
-        setattr(self.values, key, value)
+        for kind in DelayKind:
+            minimum, maximum = self.get_delay_range(kind)
+            if key == f"{kind}_min":
+                await self.set_delay_range(kind, finite_number(value), maximum)
+                return
+            if key == f"{kind}_max":
+                await self.set_delay_range(kind, minimum, finite_number(value))
+                return
+        if key in {"moves_per_cycle_min", "moves_per_cycle_max"}:
+            number = bounded_integer(value, maximum=MAX_MOVES_PER_CYCLE)
+            minimum_moves = (
+                number if key.endswith("_min") else self.values.moves_per_cycle_min
+            )
+            maximum_moves = (
+                number if key.endswith("_max") else self.values.moves_per_cycle_max
+            )
+            await self.set_moves_range(minimum_moves, maximum_moves)
+            return
+        if key == "cycles_count":
+            value = bounded_integer(value, maximum=MAX_CYCLES_COUNT)
+        elif key == "heal_threshold":
+            value = bounded_integer(value, maximum=MAX_HEAL_THRESHOLD)
+        elif key == "long_pause_chance":
+            value = finite_number(value)
+            finite_range(value, value, limit=1.0)
+        elif key == "battle_start_hp_percent":
+            value = bounded_integer(value, maximum=100)
+            if value not in {50, 100}:
+                raise ValueError("Начальный HP должен быть 50 или 100 процентов.")
+        elif key == "combat_planner_mode":
+            if not isinstance(value, str) or value not in {"shadow", "guarded", "active"}:
+                raise ValueError("Неизвестный режим боевого планировщика.")
+        elif key == "blessing_enabled":
+            if not isinstance(value, bool):
+                raise ValueError("Благословение должно быть включено или выключено.")
+        elif key in {"enabled_targets", "treatment_enemy_targets"}:
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError("Нужен список названий целей.")
+            if key == "enabled_targets" and any(item not in ALL_MONSTER_NAMES for item in value):
+                raise ValueError("Неизвестная цель.")
+            value = list(dict.fromkeys(value))
         await self.storage.set_setting(key, value)
+        setattr(self.values, key, value)
+
+    async def set_cycles_count(self, value: int) -> None:
+        await self.set_value("cycles_count", value)
+
+    async def set_heal_threshold(self, value: int) -> None:
+        await self.set_value("heal_threshold", value)
+
+    async def set_long_pause_chance(self, value: float) -> None:
+        await self.set_value("long_pause_chance", value)
+
+    def get_delay_range(self, kind: DelayKind) -> tuple[float, float]:
+        s = self.values
+        ranges: dict[DelayKind, tuple[float, float]] = {
+            DelayKind.MOVE: (s.move_delay_min, s.move_delay_max),
+            DelayKind.ATTACK: (s.attack_delay_min, s.attack_delay_max),
+            DelayKind.TARGET: (s.target_delay_min, s.target_delay_max),
+            DelayKind.SKILL: (s.skill_delay_min, s.skill_delay_max),
+            DelayKind.LONG_PAUSE: (s.long_pause_min, s.long_pause_max),
+            DelayKind.CYCLE_REST: (s.cycle_rest_min, s.cycle_rest_max),
+        }
+        return ranges[kind]
+
+    @staticmethod
+    def parse_delay_range(kind: DelayKind, text: str) -> tuple[float, float]:
+        parts = text.replace(",", ".").split()
+        if len(parts) != 2:
+            raise ValueError("Введите два числа: минимум и максимум.")
+        # Validate stored seconds after converting minutes, including overflow.
+        try:
+            minimum, maximum = (finite_number(part) * kind.input_multiplier for part in parts)
+            return finite_range(minimum, maximum, limit=kind.limit_seconds)
+        except ValueError as error:
+            unit = "мин." if kind is DelayKind.CYCLE_REST else "сек."
+            raise ValueError(
+                f"Введите конечные числа от 0 до "
+                f"{kind.limit_seconds / kind.input_multiplier:g} {unit}; "
+                "максимум не меньше минимума."
+            ) from error
+
+    async def set_delay_range(
+        self,
+        kind: DelayKind,
+        minimum: float,
+        maximum: float,
+    ) -> None:
+        low, high = finite_range(minimum, maximum, limit=kind.limit_seconds)
+        values = {f"{kind}_min": low, f"{kind}_max": high}
+        await self.storage.set_settings(values)
+        for key, value in values.items():
+            setattr(self.values, key, value)
 
     async def set_moves_range(self, minimum: int, maximum: int) -> None:
         self.validate_moves_range(minimum, maximum)
-        self.values.moves_per_cycle_min = minimum
-        self.values.moves_per_cycle_max = maximum
         await self.storage.set_settings(
             {
                 "moves_per_cycle_min": minimum,
                 "moves_per_cycle_max": maximum,
             }
         )
+        self.values.moves_per_cycle_min = minimum
+        self.values.moves_per_cycle_max = maximum
 
     async def toggle_blessing(self) -> bool:
         enabled = not self.values.blessing_enabled
@@ -255,14 +375,14 @@ class SettingsService:
 
     def _normalize_character(self) -> None:
         try:
-            threshold = int(self.values.heal_threshold)
-        except (TypeError, ValueError):
-            threshold = 1
-        self.values.heal_threshold = max(1, threshold)
+            threshold = bounded_integer(self.values.heal_threshold, maximum=MAX_HEAL_THRESHOLD)
+        except ValueError:
+            threshold = DEFAULT_HEAL_THRESHOLD
+        self.values.heal_threshold = threshold
 
         try:
-            battle_start_hp = int(self.values.battle_start_hp_percent)
-        except (TypeError, ValueError):
+            battle_start_hp = bounded_integer(self.values.battle_start_hp_percent, maximum=100)
+        except ValueError:
             battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
         if battle_start_hp not in {50, 100}:
             battle_start_hp = DEFAULT_BATTLE_START_HP_PERCENT
@@ -282,22 +402,45 @@ class SettingsService:
         ):
             return
         try:
-            previous = max(1, int(stored["moves_per_cycle"]))
-        except (TypeError, ValueError):
+            previous = bounded_integer(stored["moves_per_cycle"], maximum=MAX_MOVES_PER_CYCLE)
+        except ValueError:
             previous = 100
         self.values.moves_per_cycle_min = max(1, previous - 20)
         self.values.moves_per_cycle_max = previous + 20
 
     def _normalize_moves_range(self) -> None:
         try:
-            minimum = int(self.values.moves_per_cycle_min)
-            maximum = int(self.values.moves_per_cycle_max)
+            minimum = bounded_integer(self.values.moves_per_cycle_min, maximum=MAX_MOVES_PER_CYCLE)
+            maximum = bounded_integer(self.values.moves_per_cycle_max, maximum=MAX_MOVES_PER_CYCLE)
             self.validate_moves_range(minimum, maximum)
         except (TypeError, ValueError):
             minimum = DEFAULT_MOVES_PER_CYCLE_MIN
             maximum = DEFAULT_MOVES_PER_CYCLE_MAX
         self.values.moves_per_cycle_min = minimum
         self.values.moves_per_cycle_max = maximum
+
+    def _normalize_numeric_settings(self) -> None:
+        defaults = FarmerSettings()
+        try:
+            self.values.cycles_count = bounded_integer(
+                self.values.cycles_count, maximum=MAX_CYCLES_COUNT
+            )
+        except ValueError:
+            self.values.cycles_count = defaults.cycles_count
+        try:
+            chance = finite_number(self.values.long_pause_chance)
+            finite_range(chance, chance, limit=1.0)
+            self.values.long_pause_chance = chance
+        except ValueError:
+            self.values.long_pause_chance = defaults.long_pause_chance
+        for kind in DelayKind:
+            try:
+                low, high = finite_range(*self.get_delay_range(kind), limit=kind.limit_seconds)
+            except ValueError:
+                low = getattr(defaults, f"{kind}_min")
+                high = getattr(defaults, f"{kind}_max")
+            setattr(self.values, f"{kind}_min", low)
+            setattr(self.values, f"{kind}_max", high)
 
     @staticmethod
     def _normalize_bool(value: object, *, default: bool) -> bool:
@@ -315,12 +458,13 @@ class SettingsService:
 
     @staticmethod
     def validate_character_value(value: int) -> None:
-        if value < 1:
-            raise ValueError("Значение должно быть больше нуля.")
+        bounded_integer(value, maximum=MAX_HEAL_THRESHOLD)
 
     @staticmethod
     def validate_moves_range(minimum: int, maximum: int) -> None:
-        if minimum < 1 or maximum < minimum:
+        bounded_integer(minimum, maximum=MAX_MOVES_PER_CYCLE)
+        bounded_integer(maximum, maximum=MAX_MOVES_PER_CYCLE)
+        if maximum < minimum:
             raise ValueError("Минимум должен быть больше нуля, максимум — не меньше минимума.")
 
     @classmethod
@@ -337,5 +481,4 @@ class SettingsService:
 
     @staticmethod
     def validate_range(minimum: float, maximum: float) -> None:
-        if minimum < 0 or maximum < minimum:
-            raise ValueError("Минимум должен быть >= 0, максимум >= минимума.")
+        finite_range(minimum, maximum)

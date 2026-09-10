@@ -1,28 +1,29 @@
 from __future__ import annotations
 
+from game_message import GameMessage
 from models import ButtonPosition
 from parser import normalize
 
 
-def get_button_texts(message) -> list[str]:
-    if not getattr(message, "buttons", None):
+def get_button_texts(message: GameMessage) -> list[str]:
+    if not message.buttons:
         return []
     return [
-        getattr(button, "text", "")
+        button.text
         for row in message.buttons
         for button in row
-        if getattr(button, "text", "")
+        if button.text
     ]
 
 
 def find_button(
-    message,
+    message: GameMessage,
     *,
     exact: str | None = None,
     contains: tuple[str, ...] = (),
     exclude: tuple[str, ...] = (),
 ) -> ButtonPosition | None:
-    if not getattr(message, "buttons", None):
+    if not message.buttons:
         return None
 
     normalized_contains = tuple(normalize(value) for value in contains)
@@ -30,7 +31,7 @@ def find_button(
 
     for row_index, row in enumerate(message.buttons):
         for column_index, button in enumerate(row):
-            button_text = getattr(button, "text", "")
+            button_text = button.text
             if exact is not None and button_text == exact:
                 return row_index, column_index
 

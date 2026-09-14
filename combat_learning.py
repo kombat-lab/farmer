@@ -11,7 +11,7 @@ from combat_strategy import (
     SkillTarget,
     apply_start_of_turn_effects,
 )
-from game_message import GameMessage
+from game_message import ReadableGameMessage
 from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
@@ -831,7 +831,7 @@ def select_combat_planner_decision(
 
 
 def build_shadow_plan(
-    message: GameMessage,
+    message: ReadableGameMessage,
     *,
     memory: CombatMemory,
     current_hp: int | None,

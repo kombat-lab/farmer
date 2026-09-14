@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, NotRequired, TypeAlias, TypedDict
+from typing import TypedDict
 
-JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
-BattleResult: TypeAlias = Literal["VICTORY", "DEFEAT"]
+# Compatibility re-export; new domain/persistence callers import battle_records directly.
+from battle_records import BattleResult as BattleResult
+from json_types import JsonValue as JsonValue
 
 
 @dataclass(frozen=True)
@@ -19,10 +20,33 @@ class SessionSummary:
     runtime_seconds: int
 
 
-class FarmerState(TypedDict, total=False):
-    """Persisted singleton fields; optional keys also describe partial updates."""
+class FarmerState(TypedDict):
+    """Complete persisted singleton; nullable columns remain required keys."""
 
     singleton: int
+    process_status: str
+    game_state: str
+    position_x: int | None
+    position_y: int | None
+    current_hp: int | None
+    max_hp: int | None
+    active_target: str | None
+    moves: int
+    last_action: str | None
+    last_progress_at: str | None
+    last_error: str | None
+    session_id: int | None
+    current_cycle: int
+    cycles_count: int
+    moves_in_cycle: int
+    moves_per_cycle: int
+    rest_until: str | None
+    pause_requested: int
+
+
+class FarmerStatePatch(TypedDict, total=False):
+    """Writable fields only; omitted keys preserve their persisted values."""
+
     process_status: str
     game_state: str
     position_x: int | None
@@ -51,16 +75,11 @@ class TelegramSafetyStatus(TypedDict):
     telegram_actions_10m: int
 
 
-class RuntimeStatus(FarmerState, total=False):
-    """Control-panel state augmented with process-local observations."""
+class RuntimeStatus(FarmerState, TelegramSafetyStatus):
+    """Complete control-panel state augmented with process-local observations."""
 
     task_running: bool
     location_name: str | None
-    telegram_cooldown_remaining: int
-    telegram_cooldown_until: str | None
-    telegram_cooldown_reason: str | None
-    telegram_actions_1m: int
-    telegram_actions_10m: int
 
 
 class BattleTotals(TypedDict):
@@ -126,20 +145,3 @@ class TelegramActivityDay(TypedDict):
     silent_stalls: int
     manual_restriction_marks: int
     rpc_errors: int
-
-
-class CombatDecisionRow(TypedDict):
-    id: int
-    battle_id: int
-    sequence_number: int
-    created_at: str
-    telegram_message_id: int
-    target_name: str
-    round_number: int | None
-    chosen_skill: str
-    chosen_target: str
-    reason: str
-    urgent: int
-    result: BattleResult
-    # Trace payload schemas vary by combat-model version in persisted data.
-    trace: NotRequired[JsonValue]

@@ -5,8 +5,14 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
-from combat_round import CombatRoundState, parse_combat_round, parse_starting_health
-from game_message import GameMessage
+from bounded_values import INT64_MAX
+from combat_round import (
+    CombatRoundState,
+    parse_combat_round,
+    parse_starting_health,
+    same_combatant_name,
+)
+from game_message import ReadableGameMessage
 from parser import normalize
 from skills import HEALING_MANA_RESERVE, SkillButton, available_skills, parse_current_mana
 
@@ -18,6 +24,7 @@ KNOWN_SKILLS = {
 }
 
 COMBAT_MODEL_VERSION = 5
+COMBAT_KNOWLEDGE_SCHEMA_VERSION = 1
 
 PERIODIC_EFFECT_MARKERS = (
     "яд",
@@ -234,7 +241,7 @@ class ObservedRange:
     total: int = 0
 
     def add(self, value: int) -> None:
-        if value <= 0:
+        if type(value) is not int or not 0 < value <= INT64_MAX:
             return
         self.minimum = value if self.minimum is None else min(self.minimum, value)
         self.maximum = value if self.maximum is None else max(self.maximum, value)
@@ -258,16 +265,31 @@ class RecentCombatKnowledge:
     renewal_healing: list[int] = field(default_factory=list)
     treatment_enemy_targets: set[str] = field(default_factory=set)
 
+    def __post_init__(self) -> None:
+        if type(self.sample_limit) is not int or not 1 <= self.sample_limit <= 100:
+            raise ValueError("Combat knowledge sample_limit must be an integer in [1, 100]")
+
+    @staticmethod
+    def _canonical_key(value: object) -> str | None:
+        if type(value) is not str:
+            return None
+        normalized = normalize(value)
+        return normalized or None
+
     @staticmethod
     def _sample_list(value: object, limit: int) -> list[int]:
         if not isinstance(value, list):
             return []
-        samples = [int(item) for item in value if isinstance(item, int) and item > 0]
+        samples = [
+            item
+            for item in value
+            if type(item) is int and 0 < item <= INT64_MAX
+        ]
         return samples[-limit:]
 
     def as_payload(self) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": COMBAT_KNOWLEDGE_SCHEMA_VERSION,
             "sample_limit": self.sample_limit,
             "incoming": self.incoming,
             "critical_incoming": self.critical_incoming,
@@ -282,9 +304,16 @@ class RecentCombatKnowledge:
     def from_payload(cls, payload: object) -> RecentCombatKnowledge:
         if not isinstance(payload, dict):
             return cls()
+        # Versionless legacy snapshots use the original v1 schema. Unknown
+        # versions must never be interpreted as current combat knowledge.
+        version = payload.get("version", COMBAT_KNOWLEDGE_SCHEMA_VERSION)
+        if type(version) is not int or version != COMBAT_KNOWLEDGE_SCHEMA_VERSION:
+            return cls()
         raw_limit = payload.get("sample_limit", 12)
         sample_limit = (
-            max(1, min(100, raw_limit)) if isinstance(raw_limit, int) else 12
+            raw_limit
+            if type(raw_limit) is int and 1 <= raw_limit <= 100
+            else 12
         )
         knowledge = cls(sample_limit=sample_limit)
 
@@ -292,32 +321,41 @@ class RecentCombatKnowledge:
             raw_mapping = payload.get(field_name)
             if not isinstance(raw_mapping, dict):
                 continue
-            parsed = {
-                normalize(str(target)): cls._sample_list(values, sample_limit)
-                for target, values in raw_mapping.items()
-            }
-            setattr(knowledge, field_name, {key: value for key, value in parsed.items() if value})
+            parsed: dict[str, list[int]] = {}
+            for target, values in raw_mapping.items():
+                key = cls._canonical_key(target)
+                samples = cls._sample_list(values, sample_limit)
+                if key is not None and samples:
+                    parsed[key] = samples
+            setattr(knowledge, field_name, parsed)
 
         raw_outgoing = payload.get("outgoing")
         if isinstance(raw_outgoing, dict):
             for target, raw_skills in raw_outgoing.items():
                 if not isinstance(raw_skills, dict):
                     continue
-                skills = {
-                    normalize(str(skill)): cls._sample_list(values, sample_limit)
-                    for skill, values in raw_skills.items()
-                }
-                skills = {key: value for key, value in skills.items() if value}
+                target_key = cls._canonical_key(target)
+                if target_key is None:
+                    continue
+                skills: dict[str, list[int]] = {}
+                for skill, values in raw_skills.items():
+                    skill_key = cls._canonical_key(skill)
+                    samples = cls._sample_list(values, sample_limit)
+                    if skill_key is not None and samples:
+                        skills[skill_key] = samples
                 if skills:
-                    knowledge.outgoing[normalize(str(target))] = skills
+                    knowledge.outgoing[target_key] = skills
 
         raw_cooldowns = payload.get("skill_cooldowns")
         if isinstance(raw_cooldowns, dict):
-            knowledge.skill_cooldowns = {
-                normalize(str(name)): max(0, int(value))
-                for name, value in raw_cooldowns.items()
-                if isinstance(value, int)
-            }
+            for name, value in raw_cooldowns.items():
+                key = cls._canonical_key(name)
+                if (
+                    key is not None
+                    and type(value) is int
+                    and 0 <= value <= INT64_MAX
+                ):
+                    knowledge.skill_cooldowns[key] = value
         knowledge.direct_healing = cls._sample_list(
             payload.get("direct_healing"), sample_limit
         )
@@ -327,12 +365,14 @@ class RecentCombatKnowledge:
         raw_targets = payload.get("treatment_enemy_targets")
         if isinstance(raw_targets, list):
             knowledge.treatment_enemy_targets = {
-                normalize(str(target)) for target in raw_targets if str(target).strip()
+                key
+                for target in raw_targets
+                if (key := cls._canonical_key(target)) is not None
             }
         return knowledge
 
     def _append(self, samples: list[int], value: int) -> None:
-        if value <= 0:
+        if type(value) is not int or not 0 < value <= INT64_MAX:
             return
         samples.append(value)
         del samples[: max(0, len(samples) - self.sample_limit)]
@@ -345,13 +385,13 @@ class RecentCombatKnowledge:
         critical: bool = False,
     ) -> None:
         target = normalize(target_name or "")
-        if target:
+        if target and type(value) is int and 0 < value <= INT64_MAX:
             collection = self.critical_incoming if critical else self.incoming
             self._append(collection.setdefault(target, []), value)
 
     def observe_cooldown(self, skill_name: str, cooldown: int) -> None:
         normalized = normalize(skill_name)
-        if normalized:
+        if normalized and type(cooldown) is int and 0 <= cooldown <= INT64_MAX:
             self.skill_cooldowns[normalized] = max(
                 cooldown,
                 self.skill_cooldowns.get(normalized, 0),
@@ -359,7 +399,7 @@ class RecentCombatKnowledge:
 
     def add_outgoing(self, target_name: str | None, skill_name: str, value: int) -> None:
         target = normalize(target_name or "")
-        if not target:
+        if not target or type(value) is not int or not 0 < value <= INT64_MAX:
             return
         skills = self.outgoing.setdefault(target, {})
         self._append(skills.setdefault(skill_name, []), value)
@@ -468,16 +508,16 @@ class CombatMemory:
         previous_enemy_hp = self.enemy_current_hp
         self.latest_round = parsed
         self.round_history.append(parsed)
-        character = normalize(character_name)
         used_skills = [
             normalize(skill.skill)
             for skill in parsed.skill_uses
-            if character in normalize(skill.actor) and normalize(skill.skill) in KNOWN_SKILLS
+            if same_combatant_name(character_name, skill.actor)
+            and normalize(skill.skill) in KNOWN_SKILLS
         ]
         failed_player_skills = [
             normalize(skill.skill)
             for skill in parsed.failed_skill_uses
-            if character in normalize(skill.actor)
+            if same_combatant_name(character_name, skill.actor)
         ]
         player_skill = (
             used_skills[-1]
@@ -496,9 +536,8 @@ class CombatMemory:
             self.knowledge.observe_cooldown(skill_name, skill.cooldown)
 
         for damage_event in parsed.damage:
-            recipient = normalize(damage_event.target)
             effect = normalize(damage_event.effect or "")
-            if character in recipient:
+            if same_combatant_name(character_name, damage_event.target):
                 if is_periodic_effect(effect):
                     self.periodic_damage = damage_event.amount
                 elif damage_event.critical:
@@ -521,7 +560,7 @@ class CombatMemory:
                 # damage, and must not reduce the learned damage floor.
                 target_is_current_enemy = bool(
                     self.target_name
-                    and normalize(self.target_name) in recipient
+                    and same_combatant_name(self.target_name, damage_event.target)
                 )
                 finishing_hit_is_capped = bool(
                     target_is_current_enemy
@@ -541,7 +580,7 @@ class CombatMemory:
 
         player = parsed.combatant(character_name)
         for healing_event in parsed.healing:
-            if character not in normalize(healing_event.target):
+            if not same_combatant_name(character_name, healing_event.target):
                 continue
             effect = normalize(healing_event.effect or "")
             if effect in {"обновление", "renew"}:
@@ -761,18 +800,16 @@ def resolve_decision_trace(
     character_name: str,
 ) -> CombatDecisionTrace:
     """Adds the observed target and effect without overwriting the plan."""
-    character = normalize(character_name)
     skill_name = normalize(trace.decision.skill_name)
-    enemy = normalize(trace.target_name)
 
-    if any(enemy and enemy in normalize(target) for target in round_state.dodged):
+    if any(same_combatant_name(trace.target_name, target) for target in round_state.dodged):
         return replace(
             trace,
             actual_target=SkillTarget.ENEMY,
             actual_effect="dodged",
             actual_amount=0,
         )
-    if any(enemy and enemy in normalize(target) for target in round_state.blocked):
+    if any(same_combatant_name(trace.target_name, target) for target in round_state.blocked):
         return replace(
             trace,
             actual_target=SkillTarget.ENEMY,
@@ -784,7 +821,7 @@ def resolve_decision_trace(
         direct_healing = [
             event.amount
             for event in round_state.healing
-            if character in normalize(event.target)
+            if same_combatant_name(character_name, event.target)
             and normalize(event.effect or "") not in {"обновление", "renew"}
         ]
         if direct_healing:
@@ -798,7 +835,7 @@ def resolve_decision_trace(
         enemy_damage = [
             event.amount
             for event in round_state.damage
-            if character not in normalize(event.target)
+            if not same_combatant_name(character_name, event.target)
             and not is_periodic_effect(event.effect)
         ]
         if enemy_damage:
@@ -827,7 +864,7 @@ def resolve_decision_trace(
     enemy_damage = [
         event.amount
         for event in round_state.damage
-        if character not in normalize(event.target)
+        if not same_combatant_name(character_name, event.target)
         and not is_periodic_effect(event.effect)
     ]
     return replace(
@@ -895,7 +932,7 @@ def _estimated_enemy_turns(
 
 
 def choose_combat_action(
-    message: GameMessage,
+    message: ReadableGameMessage,
     *,
     memory: CombatMemory,
     current_hp: int | None,

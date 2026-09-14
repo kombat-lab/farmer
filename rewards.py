@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from battle_records import MIST_CRYSTAL_CODE as MIST_CRYSTAL_CODE
+
 DUST_RE = re.compile(
     r"•\s*\+\s*(\d+)\s*ед\."
     r"(?:\s*\([^)]*\))?\s*"
@@ -20,7 +22,6 @@ MIST_CRYSTALS_RE = re.compile(
     r"(?:[•·]\s*)?(?:💎\s*)?Туманн(?:ые|ых)\s+кристалл(?:ы|ов)\s*:\s*(\d+)",
     re.IGNORECASE,
 )
-MIST_CRYSTAL_CODE = "mist_crystals"
 
 ITEMS_HEADER = "Предметы:"
 ITEM_STACK_RE = re.compile(

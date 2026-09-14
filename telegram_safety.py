@@ -104,14 +104,17 @@ class RollingAttemptGuard:
         self.clock = clock
         self._timestamps: deque[float] = deque()
 
-    def allow(self) -> bool:
-        now = self.clock()
-        cutoff = now - self.window_seconds
+    def can_attempt(self) -> bool:
+        """Check capacity without charging a request that may still be deferred."""
+        cutoff = self.clock() - self.window_seconds
         while self._timestamps and self._timestamps[0] <= cutoff:
             self._timestamps.popleft()
-        if len(self._timestamps) >= self.max_attempts:
+        return len(self._timestamps) < self.max_attempts
+
+    def allow(self) -> bool:
+        if not self.can_attempt():
             return False
-        self._timestamps.append(now)
+        self._timestamps.append(self.clock())
         return True
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from game_message import GameMessage
+from game_message import ReadableGameMessage
 from parser import normalize
 from telegram_buttons import get_button_texts
 
@@ -101,7 +101,7 @@ def parse_skill_button(text: str) -> SkillButton:
     )
 
 
-def available_skills(message: GameMessage) -> dict[str, SkillButton]:
+def available_skills(message: ReadableGameMessage) -> dict[str, SkillButton]:
     current_mana = parse_current_mana(getattr(message, "raw_text", "") or "")
     result: dict[str, SkillButton] = {}
 

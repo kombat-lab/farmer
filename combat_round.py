@@ -153,6 +153,15 @@ class CombatRoundState:
         }
 
 
+def same_combatant_name(left: str | None, right: str | None) -> bool:
+    """Compare complete participant identities after canonical text normalization."""
+
+    if not left or not right:
+        return False
+    left_name = normalize(left)
+    return bool(left_name) and left_name == normalize(right)
+
+
 def _match_int(pattern: re.Pattern[str], text: str, group: int = 1) -> int | None:
     match = pattern.search(text)
     return int(match.group(group)) if match else None

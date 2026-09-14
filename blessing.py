@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Awaitable, Callable
 
-from game_message import GameMessage
+from game_input import ActionOutcome
 from models import ActionType
 from parser import normalize
 
@@ -14,10 +14,24 @@ BLESSING_BUTTON = "Благословение"
 BLESSING_STATUS_MARKER = "благословение: +5 ко всем характеристикам на 30 мин"
 
 
-ClickButton = Callable[..., Awaitable[bool]]
+ClickButton = Callable[..., Awaitable[ActionOutcome]]
 FindButton = Callable[..., object | None]
 Log = Callable[[str], None]
 MarkProgress = Callable[[str], None]
+
+_DISPATCHED_OUTCOMES = frozenset(
+    {
+        ActionOutcome.SENT,
+        ActionOutcome.DELIVERY_UNKNOWN,
+        ActionOutcome.DUPLICATE,
+    }
+)
+
+
+def _validated_outcome(value: object) -> ActionOutcome:
+    if not isinstance(value, ActionOutcome):
+        raise ValueError("Blessing callback must return ActionOutcome")
+    return value
 
 
 class BlessingManager:
@@ -43,7 +57,6 @@ class BlessingManager:
 
     async def try_open_from_map(
         self,
-        message: GameMessage,
         *,
         click_button: ClickButton,
         log: Log,
@@ -52,25 +65,30 @@ class BlessingManager:
         if not self.refresh_due():
             return False
 
-        clicked = await click_button(
-            message,
-            contains=(NON_COMBAT_SKILLS_BUTTON,),
-            action_type=ActionType.OPEN_ATTACK,
-            description=NON_COMBAT_SKILLS_BUTTON,
+        outcome = _validated_outcome(
+            await click_button(
+                contains=(NON_COMBAT_SKILLS_BUTTON,),
+                action_type=ActionType.OPEN_ATTACK,
+                description=NON_COMBAT_SKILLS_BUTTON,
+            )
         )
-        if not clicked:
+        if outcome in _DISPATCHED_OUTCOMES:
+            self.refresh_in_progress = True
             self.next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
-            log("Не удалось открыть небоевые навыки. Повторю попытку через 5 минут.")
-            return False
+            mark_progress("отправлен запрос открыть меню небоевых навыков")
+            return True
+        if outcome in {ActionOutcome.DEFERRED, ActionOutcome.STALE}:
+            # This map event must not dispatch a second callback. A future fresh
+            # event or the cooldown reprocessor may safely try again.
+            return True
 
-        self.refresh_in_progress = True
         self.next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
-        mark_progress("открыто меню небоевых навыков")
-        return True
+        log("Не удалось открыть небоевые навыки. Повторю попытку через 5 минут.")
+        return False
 
     async def handle_menu(
         self,
-        message: GameMessage,
+        message: object,
         *,
         find_button: FindButton,
         click_button: ClickButton,
@@ -82,16 +100,20 @@ class BlessingManager:
         if find_button(message, contains=(BLESSING_BUTTON,)) is None:
             return False
 
-        clicked = await click_button(
-            message,
-            contains=(BLESSING_BUTTON,),
-            action_type=ActionType.USE_SKILL,
-            description=BLESSING_BUTTON,
+        outcome = _validated_outcome(
+            await click_button(
+                contains=(BLESSING_BUTTON,),
+                action_type=ActionType.USE_SKILL,
+                description=BLESSING_BUTTON,
+            )
         )
-        if clicked:
-            mark_progress("использовано Благословение")
-        else:
+        if outcome in _DISPATCHED_OUTCOMES:
+            mark_progress("отправлен запрос использовать Благословение")
+        elif outcome is ActionOutcome.REJECTED:
             self.refresh_in_progress = False
+            self.next_attempt_at = time.monotonic() + BLESSING_RETRY_INTERVAL
+        # DEFERRED and STALE preserve the pending flow. They consume this menu
+        # event without pretending that the callback failed or retrying it here.
         return True
 
     def confirm_from_text(

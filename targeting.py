@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-from game_message import GameMessage
+from game_message import ReadableGameMessage
 from models import ButtonPosition
 from parser import normalize
 
@@ -56,7 +56,7 @@ class MapTargetAnalysis:
 
 
 def analyze_map_targets(
-    message: GameMessage,
+    message: ReadableGameMessage,
     configured_targets: Iterable[str],
 ) -> MapTargetAnalysis:
     target_counts: dict[str, tuple[int, int]] = {}
@@ -90,7 +90,7 @@ def analyze_map_targets(
 
 
 def select_combat_target(
-    message: GameMessage,
+    message: ReadableGameMessage,
     priorities: Iterable[str],
     active_target: str | None = None,
     *,

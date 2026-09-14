@@ -4,6 +4,9 @@ import re
 from collections.abc import Iterable
 
 from models import MapInfo, MessageKind
+from text_normalization import normalize_text
+
+normalize = normalize_text
 
 POSITION_RE = re.compile(
     r"Позиция:\s*\((\d+)\s*,\s*(\d+)\)",
@@ -38,23 +41,6 @@ SIZE_RE = re.compile(
 def is_passive_health_notification(text: str) -> bool:
     """Уведомление обновляет HP, но не заменяет сообщение с игровыми кнопками."""
     return HEALTH_RESTORED_RE.search(text) is not None
-
-
-def normalize(value: str) -> str:
-    """
-    Нормализует текст для сравнений.
-
-    Служебные эмодзи и значки в начале названия не учитываются:
-    «💎 Туманный Жгун» и «Туманный Жгун» считаются одним именем.
-    """
-    normalized = " ".join(value.casefold().strip().split())
-    normalized = re.sub(
-        r"^[^\wа-яё]+",
-        "",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    return normalized.strip()
 
 
 def parse_monsters(

@@ -5,16 +5,23 @@ import random
 import sqlite3
 import unittest
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.exceptions import TelegramBadRequest
 from telethon.errors import BotResponseTimeoutError
 
+from automation_policy import (
+    DelayRange,
+    IntegerRange,
+    LegacyMapPolicy,
+)
 from blessing import BlessingManager
+from combat_knowledge_namespace import LEGACY_COMBAT_KNOWLEDGE_NAMESPACE
 from combat_learning import (
     ActionProjection,
     ShadowCombatPlan,
@@ -44,9 +51,15 @@ from config import (
 from event_cache import BoundedKeyCache
 from farmer import Farmer
 from game_catalog import ALL_MONSTER_NAMES, LOCATION_NAMES, get_location, get_monster_names
+from game_input import ActionOutcome
+from game_mechanisms import CycleDescriptor
 from human_delays import ActivityBreakPlanner, HumanDelayModel, parse_remaining_seconds
+from legacy_combat_diagnostics import LegacyCombatDiagnostics
+from legacy_fog_mechanisms import LegacyFoGMechanismRuntime
+from legacy_map_controller import LegacyMapController
 from models import ActionType, BotState, RuntimeContext
 from navigator import SnakeNavigator
+from notifications import Notifier
 from parser import (
     classify_message,
     extract_player_hp,
@@ -54,7 +67,7 @@ from parser import (
     parse_map,
 )
 from rewards import BattleReward, parse_battle_reward, parse_item_stack
-from settings_service import SettingsService
+from settings_service import FarmerSettings, SettingsService
 from skills import HEALING_MANA_RESERVE, enough_health_for_battle, parse_skill_button
 from storage import SCHEMA_VERSION, Storage
 from targeting import select_combat_target
@@ -65,6 +78,9 @@ from telegram_safety import (
     TelegramActionTelemetry,
     message_state_key,
 )
+from tests.legacy_fog_factory import legacy_farmer, legacy_runtime
+from tests.map_runtime_harness import MapRuntimeHarness
+from tests.storage_fixtures import record_legacy_battle
 
 CHARACTER = "Kombat"
 TARGETS = ["Черная мушка"]
@@ -88,6 +104,15 @@ class FakeMessage:
         self.edit_date = edit_date
         self.raw_text = text
         self.buttons = [[FakeButton(button) for button in row] for row in buttons]
+
+
+def make_offline_farmer(storage: Storage, client: object | None = None) -> Farmer:
+    if client is None:
+        client = MagicMock()
+        client.disconnect = AsyncMock()
+        client.is_connected.return_value = False
+    with patch("tests.legacy_fog_factory.create_test_client", return_value=client):
+        return legacy_farmer(storage, MagicMock(spec=Notifier), SettingsService(storage))
 
 
 class ParserTests(unittest.TestCase):
@@ -1478,21 +1503,32 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(second.combat_enemies, [])
 
     def test_cycle_move_target_uses_configured_range(self) -> None:
-        farmer = Farmer.__new__(Farmer)
-        farmer.settings = SimpleNamespace(
-            values=SimpleNamespace(
-                moves_per_cycle_min=97,
-                moves_per_cycle_max=97,
-            )
+        policy = LegacyMapPolicy(
+            moves_per_cycle=IntegerRange(97, 97),
+            blessing_enabled=False,
+            move_delay=DelayRange(0, 0),
+            open_attack_delay=DelayRange(0, 0),
+            target_selection_delay=DelayRange(0, 0),
         )
+        runtime = LegacyFoGMechanismRuntime.__new__(LegacyFoGMechanismRuntime)
+        runtime._settings = SimpleNamespace(legacy_map_policy=lambda: policy)
+        runtime._initialized = True
+        runtime._cycle = None
+        runtime.moves_in_cycle = 12
 
-        self.assertEqual(farmer.choose_cycle_move_target(), 97)
+        descriptor = runtime.start_cycle(1)
+        self.assertEqual(descriptor.target, 97)
+        self.assertEqual((descriptor.minimum, descriptor.maximum), (97, 97))
+        self.assertEqual(runtime.moves_in_cycle, 0)
 
 
 class RichMessagePanelTests(unittest.TestCase):
     @staticmethod
-    def _settings() -> SettingsService:
-        return SettingsService(Storage.__new__(Storage))
+    def _settings(snapshot: FarmerSettings | None = None) -> SettingsService:
+        settings = SettingsService(Storage.__new__(Storage))
+        if snapshot is not None:
+            settings._snapshot = snapshot
+        return settings
 
     def test_dashboard_uses_bot_api_10_3_controls_and_compact_tables(self) -> None:
         from rich_messages import dashboard_rich
@@ -1534,8 +1570,9 @@ class RichMessagePanelTests(unittest.TestCase):
     def test_active_targets_are_collapsed_and_selected_values_are_disabled(self) -> None:
         from rich_messages import combat_settings_rich, settings_rich
 
-        settings = self._settings()
-        settings.values.battle_start_hp_percent = 100
+        settings = self._settings(
+            replace(FarmerSettings(), battle_start_hp_percent=100)
+        )
 
         root = settings_rich(settings)
         combat = combat_settings_rich(settings)
@@ -1787,20 +1824,17 @@ class MovementRecoveryTests(unittest.TestCase):
         self.assertEqual(navigator.coverage_total, 144)
 
     def test_second_enemy_is_inferred_from_the_received_round(self) -> None:
-        farmer = Farmer.__new__(Farmer)
-        farmer.settings = SimpleNamespace(
-            values=SimpleNamespace(enabled_targets=["Пенёк", "Летучая мышь"])
+        from automation_policy import TargetPolicy
+        from legacy_combat_controller import LegacyCombatController
+        from tests.combat_runtime_harness import Context, Runtime
+
+        runtime = Runtime(
+            targets=TargetPolicy(("Пенёк", "Летучая мышь")),
+            context=Context(active_target="Пенёк", battle_target="Пенёк",
+                            combat_enemies=["Пенёк"]),
         )
-        farmer.context = RuntimeContext(
-            active_target="Пенёк",
-            battle_target="Пенёк",
-            combat_enemies=["Пенёк"],
-        )
-        farmer.combat = CombatMemory()
-        farmer.combat.begin("Пенёк")
-        farmer.pending_combat_decision = None
-        messages: list[str] = []
-        farmer.log = messages.append
+        controller = LegacyCombatController(runtime, character_name=CHARACTER)
+        controller.memory.begin("Пенёк")
         round_state = parse_combat_round(
             """⚔️ Раун 31
 🪬🧙Kombat
@@ -1812,18 +1846,18 @@ class MovementRecoveryTests(unittest.TestCase):
             ["Атака аколита"],
         )
 
-        enemies = farmer.observed_combat_enemies(round_state)
+        enemies = controller.observed_combat_enemies(round_state)
         self.assertEqual(enemies, ("Летучая мышь",))
         self.assertTrue(
-            farmer.switch_combat_enemy(
+            controller.switch_combat_enemy(
                 enemies[0],
                 reason="тест",
             )
         )
-        self.assertEqual(farmer.combat.target_name, "Летучая мышь")
-        self.assertEqual(farmer.context.active_target, "Летучая мышь")
-        self.assertIn("Летучая мышь", farmer.context.combat_enemies)
-        self.assertIn("Боевая модель переключена", messages[0])
+        self.assertEqual(controller.memory.target_name, "Летучая мышь")
+        self.assertEqual(runtime.context.active_target, "Летучая мышь")
+        self.assertIn("Летучая мышь", runtime.context.combat_enemies)
+        self.assertIn("Боевая модель переключена", runtime.logs[0])
 
     def test_9x9_sweep_from_mid_map_reaches_every_cell(self) -> None:
         for start in ((0, 0), (0, 1), (0, 4), (2, 1), (4, 4), (8, 8)):
@@ -1993,20 +2027,18 @@ class MovementRecoveryTests(unittest.TestCase):
         self.assertEqual(navigator.plan((11, 0)).origin, (11, 0))
 
     def test_recovered_move_counts_toward_current_cycle(self) -> None:
-        farmer = Farmer.__new__(Farmer)
-        farmer.navigator = SnakeNavigator(0, 8, 0, 8)
-        farmer.context = RuntimeContext()
-        farmer.context.pending_move = farmer.navigator.plan((8, 0))
-        farmer.moves_in_cycle = 7
-        farmer.mark_progress = lambda _reason: None
-        farmer.log = lambda _message: None
+        runtime = MapRuntimeHarness(moves_in_cycle=7)
+        legacy = LegacyMapController(
+            runtime, character_name=CHARACTER, min_x=0, max_x=8, min_y=0, max_y=8
+        )
+        runtime.context.pending_move = legacy.navigator.plan((8, 0))
 
         actual_position = (6, 0)
-        self.assertNotEqual(actual_position, farmer.context.pending_move.destination)
-        farmer.confirm_pending_move(actual_position)
+        self.assertNotEqual(actual_position, runtime.context.pending_move.destination)
+        legacy.confirm_pending_move(actual_position)
 
-        self.assertEqual(farmer.context.move_count, 1)
-        self.assertEqual(farmer.moves_in_cycle, 8)
+        self.assertEqual(runtime.context.move_count, 1)
+        self.assertEqual(runtime.moves_in_cycle, 8)
 
 
 class NavigationModelUpgradeTests(unittest.IsolatedAsyncioTestCase):
@@ -2015,10 +2047,11 @@ class NavigationModelUpgradeTests(unittest.IsolatedAsyncioTestCase):
             storage = Storage(Path(directory) / "test.sqlite3")
             await storage.remember_map_obstacle("Мертвый лес", (1, 10))
             await storage.remember_map_obstacle("Мертвый лес", (5, 11))
-            farmer = Farmer.__new__(Farmer)
-            farmer.storage = storage
+            with patch("tests.legacy_fog_factory.create_test_client", return_value=MagicMock()):
+                farmer = legacy_farmer(storage, MagicMock(), SettingsService(storage))
+            discovery = legacy_runtime(farmer).discovery
 
-            self.assertEqual(await farmer.ensure_navigation_model(), 2)
+            self.assertEqual(await discovery.initialize(), 2)
             self.assertEqual(await storage.get_map_obstacles("Мертвый лес"), set())
             self.assertEqual(
                 await storage.get_setting("navigation_model_version"),
@@ -2026,7 +2059,7 @@ class NavigationModelUpgradeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             await storage.remember_map_obstacle("Мертвый лес", (4, 11))
-            self.assertEqual(await farmer.ensure_navigation_model(), 0)
+            self.assertEqual(await discovery.initialize(), 0)
             self.assertEqual(
                 await storage.get_map_obstacles("Мертвый лес"),
                 {(4, 11)},
@@ -2046,23 +2079,18 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             [],
             message_id=11,
         )
-        farmer = Farmer.__new__(Farmer)
-        farmer.running = True
-        farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
-        farmer._map_generation = 0
-        farmer._ingress_lock = asyncio.Lock()
-        farmer.latest_messages = {}
-        farmer.latest_received_message = None
-        farmer.inbound_generation = 0
-        farmer.event_queue = asyncio.Queue()
-
-        await farmer.enqueue_message(map_message)
-        await farmer.enqueue_message(health_message)
-
-        self.assertIs(farmer.latest_received_message, map_message)
-        self.assertTrue(farmer.is_latest_message(map_message))
-        self.assertEqual(farmer.inbound_generation, 1)
-        self.assertEqual(farmer.event_queue.qsize(), 2)
+        farmer = make_offline_farmer(AsyncMock(spec=Storage))
+        try:
+            await farmer.enqueue_message(map_message)
+            await farmer.enqueue_message(health_message)
+            latest = farmer.latest_received_message
+            assert latest is not None
+            self.assertEqual(latest.id, map_message.id)
+            self.assertTrue(farmer.is_latest_message(map_message))
+            self.assertEqual(farmer.ingress.generation, 1)
+            self.assertEqual(farmer.ingress.qsize(), 2)
+        finally:
+            await farmer.stop("test cleanup")
 
     def test_flood_wait_uses_only_server_delay_and_small_buffer(self) -> None:
         farmer = Farmer.__new__(Farmer)
@@ -2086,50 +2114,26 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
                 click_count += 1
                 raise BotResponseTimeoutError(request=None)
 
-            async def notify(_text: str) -> None:
-                return None
-
             message.click = click
-            farmer = Farmer.__new__(Farmer)
-            farmer.running = True
+            storage = Storage(Path(directory) / "test.sqlite3")
+            farmer = make_offline_farmer(storage)
             farmer.state = BotState.COMBAT
-            farmer.storage = Storage(Path(directory) / "test.sqlite3")
-            farmer.notifier = SimpleNamespace(send=notify)
-            farmer.latest_messages = {message.id: message}
-            farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
-            farmer.latest_received_message = message
-            farmer.attempted_actions = BoundedKeyCache()
-            farmer.inbound_generation = 1
-            farmer.telegram_cooldown_until = 0.0
-            farmer.telegram_cooldown_until_utc = None
-            farmer.telegram_cooldown_reason = None
-            farmer.telegram_cooldown_action = None
-            farmer.telegram_cooldown_resume_mode = "reprocess"
-            farmer.telegram_cooldown_task = None
-            farmer.telegram_cooldown_notified = False
-            farmer.telegram_cooldown_changed = asyncio.Event()
-            farmer.telegram_action_limiter = TelegramActionLimiter(
-                min_interval=0.0,
-            )
-            farmer.telegram_action_telemetry = TelegramActionTelemetry()
-            farmer.event_queue = asyncio.Queue()
-            farmer.callback_timeout_count = 0
-            farmer.mark_progress = lambda _message: None
-            farmer.log = lambda _message: None
-
-            clicked = await farmer.press_button(message, 0, 0, "атака")
-
-            self.assertFalse(clicked)
-            self.assertTrue(farmer.running)
-            self.assertEqual(click_count, 1)
-            self.assertEqual(farmer.telegram_cooldown_remaining(), 0.0)
-            self.assertIsNone(await farmer.storage.get_setting("telegram_cooldown_until"))
-
-            repeated = await farmer.press_button(message, 0, 0, "другая атака")
-            self.assertFalse(repeated)
-            self.assertTrue(farmer.running)
-            self.assertEqual(click_count, 1)
-            await farmer.storage.close()
+            farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
+            try:
+                await farmer.enqueue_message(message)
+                clicked = await farmer.press_button(message, 0, 0, "атака")
+                self.assertFalse(clicked)
+                self.assertTrue(farmer.running)
+                self.assertEqual(click_count, 1)
+                self.assertEqual(farmer.telegram_cooldown_remaining(), 0.0)
+                self.assertIsNone(await storage.get_setting("telegram_cooldown_until"))
+                repeated = await farmer.press_button(message, 0, 0, "другая атака")
+                self.assertFalse(repeated)
+                self.assertTrue(farmer.running)
+                self.assertEqual(click_count, 1)
+            finally:
+                await farmer.stop("test cleanup")
+                await storage.close()
 
     async def test_hanging_callback_is_bounded_by_application_timeout(self) -> None:
         message = FakeMessage("🎯 Раунд 8\nХод Kombat", [["Атака"]])
@@ -2139,23 +2143,17 @@ class TelegramSafetyTests(unittest.IsolatedAsyncioTestCase):
             await never_finishes.wait()
 
         message.click = click
-        farmer = Farmer.__new__(Farmer)
-        farmer.running = True
-        farmer.telegram_cooldown_until = 0.0
-        farmer.latest_messages = {message.id: message}
-        farmer.settings = SimpleNamespace(values=SimpleNamespace(enabled_targets=()))
-        farmer.latest_received_message = message
-        farmer.attempted_actions = BoundedKeyCache()
-        farmer.inbound_generation = 1
-        farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
-        farmer.record_telegram_action = lambda _kind: None
-        farmer.record_callback_timeout = AsyncMock()
-
         with patch("farmer.TELEGRAM_CALLBACK_RPC_TIMEOUT", 0.01):
-            clicked = await farmer.press_button(message, 0, 0, "атака")
-
-        self.assertFalse(clicked)
-        farmer.record_callback_timeout.assert_awaited_once()
+            farmer = make_offline_farmer(AsyncMock(spec=Storage))
+            farmer.telegram_action_limiter = TelegramActionLimiter(min_interval=0.0)
+            farmer.record_callback_timeout = AsyncMock()
+            try:
+                await farmer.enqueue_message(message)
+                clicked = await farmer.press_button(message, 0, 0, "атака")
+                self.assertFalse(clicked)
+                farmer.record_callback_timeout.assert_awaited_once()
+            finally:
+                await farmer.stop("test cleanup")
 
     def test_outgoing_action_telemetry_uses_only_local_clock(self) -> None:
         now = 100.0
@@ -2316,20 +2314,11 @@ class HumanDelayTests(unittest.TestCase):
     def test_observation_mode_keeps_configured_action_delays(self) -> None:
         farmer = Farmer.__new__(Farmer)
         farmer.delay_model = HumanDelayModel(random.Random(9))
-        farmer.settings = SimpleNamespace(
-            values=SimpleNamespace(
-                move_delay_min=10.0,
-                move_delay_max=20.0,
-                attack_delay_min=10.0,
-                attack_delay_max=20.0,
-                target_delay_min=10.0,
-                target_delay_max=20.0,
-                skill_delay_min=10.0,
-                skill_delay_max=20.0,
-            )
-        )
-
-        delays = [farmer.action_delay(action) for action in ActionType]
+        delay = DelayRange(10, 20)
+        delays = [
+            farmer.action_delay(delay_range=delay)
+            for _action in ActionType
+        ]
 
         self.assertTrue(all(10.0 <= delay <= 20.0 for delay in delays))
 
@@ -2338,12 +2327,11 @@ class SharedComponentTests(unittest.IsolatedAsyncioTestCase):
         manager = BlessingManager()
         actions: list[str] = []
 
-        async def click_button(message, **kwargs) -> bool:
+        async def click_button(**kwargs) -> ActionOutcome:
             actions.append(str(kwargs["description"]))
-            return True
+            return ActionOutcome.SENT
 
         opened = await manager.try_open_from_map(
-            object(),
             click_button=click_button,
             log=lambda text: None,
             mark_progress=lambda text: None,
@@ -2430,7 +2418,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "idx_battles_session_id",
                     "idx_drops_battle_id",
                     "idx_events_created_at",
-                    "idx_combat_analysis_happened_at",
                     "idx_sessions_status_ended_at",
                 }.issubset(indexes)
             )
@@ -2480,9 +2467,9 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-            self.assertIn("combat_decisions", tables)
+            self.assertNotIn("combat_decisions", tables)
             self.assertIn("combat_knowledge", tables)
-            self.assertIn("combat_battle_analysis", tables)
+            self.assertNotIn("combat_battle_analysis", tables)
             self.assertIn("battle_currencies", tables)
             self.assertIn("telegram_activity_hourly", tables)
             self.assertNotIn("combat_strategy_stats", tables)
@@ -2525,7 +2512,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(days[0]["silent_stalls"], 1)
             await storage.close()
 
-    async def test_opening_database_removes_obsolete_combat_tables(self) -> None:
+    async def test_legacy_cleanup_preserves_unowned_obsolete_tables(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "test.sqlite3"
             connection = sqlite3.connect(path)
@@ -2538,6 +2525,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             connection.close()
 
             storage = Storage(path)
+            await LegacyCombatDiagnostics(storage).cleanup()
             tables = {
                 str(row["name"])
                 for row in storage.connection.execute(
@@ -2545,8 +2533,8 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchall()
             }
 
-            self.assertNotIn("combat_strategy_stats", tables)
-            self.assertNotIn("combat_policy_stats", tables)
+            self.assertIn("combat_strategy_stats", tables)
+            self.assertIn("combat_policy_stats", tables)
             await storage.close()
 
     async def test_cleanup_keeps_current_traces_and_compact_analysis(self) -> None:
@@ -2576,14 +2564,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
 
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=100,
                 session_id=session_id,
                 target_name="Пепельник",
                 result="VICTORY",
                 combat_decisions=(trace(COMBAT_MODEL_VERSION - 1, 101),),
             )
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=200,
                 session_id=session_id,
                 target_name="Пепельник",
@@ -2593,7 +2581,11 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await storage.add_event("LOW_HP_WAIT_STARTED", "noise")
             await storage.add_event("WATCHDOG_TRIGGERED", "keep")
 
-            cleanup = await storage.cleanup_old_data(retention_days=3650)
+            deleted_decisions = await LegacyCombatDiagnostics(storage).cleanup()
+            cleanup = await storage.cleanup_old_data(
+                retention_days=3650,
+                event_types_to_delete=("LOW_HP_WAIT_STARTED", "LOW_HP_WAIT_FINISHED"),
+            )
 
             versions = [
                 int(row[0])
@@ -2603,7 +2595,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchall()
             ]
             self.assertEqual(versions, [COMBAT_MODEL_VERSION])
-            self.assertEqual(cleanup["combat_decisions"], 1)
+            self.assertEqual(deleted_decisions, 1)
             self.assertEqual(cleanup["events"], 1)
             self.assertEqual(
                 storage.connection.execute(
@@ -2623,7 +2615,10 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     f"noise {index}",
                     payload=payload,
                 )
-            await storage.cleanup_old_data(retention_days=3650)
+            await storage.cleanup_old_data(
+                retention_days=3650,
+                event_types_to_delete=("LOW_HP_WAIT_STARTED", "LOW_HP_WAIT_FINISHED"),
+            )
             free_before = int(
                 storage.connection.execute("PRAGMA freelist_count").fetchone()[0]
             )
@@ -2653,11 +2648,15 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             knowledge.confirm_treatment_enemy("Фонарщик")
 
             storage = Storage(path)
-            await storage.save_combat_knowledge(780, knowledge.as_payload())
+            await storage.save_combat_knowledge(
+                780, knowledge.as_payload(), namespace=LEGACY_COMBAT_KNOWLEDGE_NAMESPACE
+            )
             await storage.close()
 
             reopened = Storage(path)
-            profiles = await reopened.load_combat_knowledge()
+            profiles = await reopened.load_combat_knowledge(
+                namespace=LEGACY_COMBAT_KNOWLEDGE_NAMESPACE
+            )
             restored = RecentCombatKnowledge.from_payload(profiles[780])
             memory = CombatMemory(target_name="Фонарщик", knowledge=restored)
             restored.load_into(memory)
@@ -2700,7 +2699,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await storage.get_map_obstacles("Мертвый лес"), set())
             await storage.close()
 
-    async def test_unknown_setting_is_ignored_without_extra_writes(self) -> None:
+    async def test_unknown_setting_is_preserved_without_extra_writes(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             await storage.set_setting("removed_setting", 610)
@@ -2713,7 +2712,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 settings.values.battle_start_hp_percent,
                 DEFAULT_BATTLE_START_HP_PERCENT,
             )
-            self.assertNotIn("removed_setting", await storage.get_settings())
+            self.assertEqual((await storage.get_settings())["removed_setting"], 610)
             changes_after_first_load = storage.connection.total_changes
             await settings.load()
             self.assertEqual(storage.connection.total_changes, changes_after_first_load)
@@ -2838,12 +2837,12 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await loaded.load()
             self.assertEqual(
                 loaded.values.treatment_enemy_targets,
-                ["Костяной заяц"],
+                ("Костяной заяц",),
             )
             self.assertTrue(
                 await loaded.remove_treatment_enemy_target("КОСТЯНОЙ ЗАЯЦ")
             )
-            self.assertEqual(loaded.values.treatment_enemy_targets, [])
+            self.assertEqual(loaded.values.treatment_enemy_targets, ())
             await reopened.close()
 
     async def test_activity_break_resumes_with_one_state_refresh(self) -> None:
@@ -2852,7 +2851,9 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             farmer = Farmer.__new__(Farmer)
             farmer.running = True
             farmer.state = BotState.ACTIVITY_BREAK
-            farmer.moves_in_cycle = 31
+            farmer.mechanisms = SimpleNamespace(
+                snapshot=lambda: SimpleNamespace(cycle_progress_units=31)
+            )
             farmer.activity_break_planner = ActivityBreakPlanner(random.Random(5))
             farmer.activity_break_task = None
             farmer.storage = storage
@@ -2895,7 +2896,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=1,
                 session_id=session_id,
                 target_name="Цель",
@@ -2912,7 +2913,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             session_id = await storage.start_session(cycles_count=1, moves_per_cycle=10)
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=2,
                 session_id=session_id,
                 target_name="Цель",
@@ -2944,7 +2945,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     "urgent": True,
                 },
             }
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=11,
                 session_id=session_id,
                 target_name="Фонарщик",
@@ -2952,7 +2953,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 combat_decisions=(trace,),
             )
 
-            decisions = await storage.get_combat_decisions("Фонарщик")
+            decisions = await LegacyCombatDiagnostics(storage).get_decisions("Фонарщик")
             self.assertEqual(len(decisions), 1)
             self.assertEqual(decisions[0]["result"], "VICTORY")
             self.assertEqual(decisions[0]["chosen_skill"], "Лечение")
@@ -2961,14 +2962,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             faster_trace = dict(trace)
             faster_trace["telegram_message_id"] = 12
             faster_trace["round_number"] = 6
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=13,
                 session_id=session_id,
                 target_name="Фонарщик",
                 result="VICTORY",
                 combat_decisions=(faster_trace,),
             )
-            learning = await storage.get_combat_learning_stats(
+            learning = await LegacyCombatDiagnostics(storage).learning_stats(
                 target_name="Фонарщик"
             )
             self.assertEqual([row["rounds"] for row in learning], [8, 6])
@@ -2997,7 +2998,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=21,
                 session_id=session_id,
                 target_name="Черная мушка",
@@ -3005,8 +3006,8 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 combat_decisions=(trace,),
             )
 
-            decisions = await storage.get_combat_decisions("Черная мушка")
-            policies = await storage.get_combat_learning_overview(
+            decisions = await LegacyCombatDiagnostics(storage).get_decisions("Черная мушка")
+            policies = await LegacyCombatDiagnostics(storage).learning_overview(
                 target_name="Черная мушка"
             )
             self.assertEqual(decisions[0]["chosen_target"], "self")
@@ -3071,7 +3072,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
             )
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=43,
                 session_id=session_id,
                 target_name="Фонарщик",
@@ -3079,7 +3080,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 combat_decisions=traces,
             )
 
-            rows = await storage.get_combat_learning_stats(
+            rows = await LegacyCombatDiagnostics(storage).learning_stats(
                 target_name="Фонарщик",
                 profile_max_hp=880,
             )
@@ -3093,7 +3094,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(analysis["dangerous_turns"], 1)
             self.assertEqual(analysis["shadow_confident"], 2)
             self.assertEqual(analysis["shadow_agreements"], 1)
-            overview = await storage.get_combat_learning_overview(
+            overview = await LegacyCombatDiagnostics(storage).learning_overview(
                 target_name="Фонарщик",
                 profile_max_hp=880,
             )
@@ -3102,8 +3103,8 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
 
             storage.connection.execute("DELETE FROM combat_battle_analysis")
             storage.connection.commit()
-            self.assertEqual(await storage.backfill_combat_battle_analysis(), 1)
-            self.assertEqual(await storage.backfill_combat_battle_analysis(), 0)
+            self.assertEqual(await LegacyCombatDiagnostics(storage).backfill(), 1)
+            self.assertEqual(await LegacyCombatDiagnostics(storage).backfill(), 0)
             storage.connection.execute(
                 "UPDATE battles SET happened_at='2020-01-01T00:00:00+00:00'"
             )
@@ -3115,16 +3116,16 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 len(
-                    await storage.get_combat_learning_stats(
+                    await LegacyCombatDiagnostics(storage).learning_stats(
                         target_name="Фонарщик",
                         profile_max_hp=880,
                     )
                 ),
-                1,
+                0,
             )
             await storage.close()
 
-    async def test_unknown_settings_are_removed_once(self) -> None:
+    async def test_unknown_settings_are_preserved_for_forward_compatibility(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             await storage.set_settings(
@@ -3135,9 +3136,9 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await settings.load()
 
             stored = await storage.get_settings()
-            self.assertNotIn("max_hp", stored)
-            self.assertNotIn("max_mana", stored)
-            self.assertNotIn("heal_amount", stored)
+            self.assertEqual(stored["max_hp"], 400)
+            self.assertEqual(stored["max_mana"], 11)
+            self.assertEqual(stored["heal_amount"], 141)
             await storage.close()
 
     async def test_different_sequences_share_semantic_policy_stats(self) -> None:
@@ -3166,14 +3167,14 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 trace(4, "Обновление", "self"),
             )
             second = (first[1], first[0], first[3], first[2])
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=100,
                 session_id=session_id,
                 target_name="Фонарщик",
                 result="VICTORY",
                 combat_decisions=first,
             )
-            await storage.record_battle(
+            await record_legacy_battle(storage,
                 telegram_message_id=101,
                 session_id=session_id,
                 target_name="Фонарщик",
@@ -3181,7 +3182,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 combat_decisions=second,
             )
 
-            policies = await storage.get_combat_learning_overview(
+            policies = await LegacyCombatDiagnostics(storage).learning_overview(
                 target_name="Фонарщик"
             )
             self.assertEqual(len(policies), 1)
@@ -3190,8 +3191,6 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             await storage.close()
 
     async def test_stop_persists_final_movement_snapshot(self) -> None:
-        from farm_statistics import FarmStatistics
-
         class DisconnectedClient:
             async def disconnect(self) -> None:
                 return None
@@ -3210,42 +3209,24 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             session_id = await storage.start_session(cycles_count=1, moves_per_cycle=80)
-            farmer = Farmer.__new__(Farmer)
-            farmer._shutdown_task = None
-            farmer._shutdown_complete = False
-            farmer._run_task = None
-            farmer._owned_tasks = set()
-            farmer._background_error = None
-            farmer.telegram_cooldown_task = None
-            farmer.telegram_metrics_flush_task = None
-            farmer.flush_telegram_metrics = AsyncMock()
-            farmer.running = True
+            farmer = make_offline_farmer(storage, DisconnectedClient())
             farmer.state = BotState.MAP
-            farmer.stop_reason = None
-            farmer.pending_progress_reason = None
-            farmer.progress_persist_task = None
-            farmer.context = RuntimeContext(
+            legacy = legacy_runtime(farmer)
+            legacy.context = RuntimeContext(
                 current_position=(4, 5),
                 current_hp=780,
                 max_hp=780,
                 move_count=89,
             )
-            farmer.moves_in_cycle = 80
-            farmer.cycle_move_target = 80
-            farmer.current_cycle = 1
+            legacy.moves_in_cycle = 80
+            legacy._cycle = CycleDescriptor(80, 80, 80, "перемещений")
+            await legacy.initialize()
+            farmer._mechanisms_initialized = True
             farmer.session_id = session_id
-            farmer.settings = SimpleNamespace(
-                values=SimpleNamespace(cycles_count=1)
+            farmer.worker_task = farmer._start_background(
+                background_worker(), name="test-final-snapshot-worker"
             )
-            farmer.statistics = FarmStatistics()
-            farmer.storage = storage
-            farmer.client = DisconnectedClient()
-            farmer.worker_task = asyncio.create_task(background_worker())
             await asyncio.sleep(0)
-            farmer.watchdog_task = None
-            farmer.recovery_task = None
-            farmer.rest_task = None
-            farmer.activity_break_task = None
 
             await farmer.stop("тестовая остановка")
 
@@ -3257,7 +3238,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(cancelled.is_set())
             await storage.close()
 
-    async def test_record_battle_rolls_back_all_rows_on_failure(self) -> None:
+    async def test_record_battle_preserves_outcome_when_optional_analysis_fails(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(Path(directory) / "test.sqlite3")
             decision = {
@@ -3272,13 +3253,12 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
 
-            with patch.object(
-                storage,
-                "_write_battle_analysis",
+            with patch(
+                "legacy_combat_diagnostics.LegacyCombatDiagnostics._write_analysis",
                 side_effect=RuntimeError("analysis failed"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "analysis failed"):
-                    await storage.record_battle(
+                with self.assertLogs("fog_farmer", level="ERROR"):
+                    inserted, _ = await record_legacy_battle(storage,
                         telegram_message_id=500,
                         session_id=None,
                         target_name="Пепельник",
@@ -3286,17 +3266,18 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
                         combat_decisions=(decision,),
                     )
 
+            self.assertTrue(inserted)
             self.assertEqual(
                 storage.connection.execute("SELECT COUNT(*) FROM battles").fetchone()[0],
-                0,
+                1,
             )
-            inserted, _ = await storage.record_battle(
+            inserted, _ = await record_legacy_battle(storage,
                 telegram_message_id=500,
                 session_id=None,
                 target_name="Пепельник",
                 result="VICTORY",
             )
-            self.assertTrue(inserted)
+            self.assertFalse(inserted)
             await storage.close()
 
     def test_runtime_statistics_count_stack_quantity(self) -> None:

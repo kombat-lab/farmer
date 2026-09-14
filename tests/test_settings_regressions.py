@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import unittest
@@ -22,6 +23,13 @@ from storage import Storage
 
 
 class SettingsRegressionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def stored_values(values: FarmerSettings) -> dict[str, object]:
+        result: dict[str, object] = asdict(values)
+        result["enabled_targets"] = list(values.enabled_targets)
+        result["treatment_enemy_targets"] = list(values.treatment_enemy_targets)
+        return result
+
     async def asyncSetUp(self) -> None:
         self.storage = Storage(Path(":memory:"))
         self.settings = SettingsService(self.storage)
@@ -45,7 +53,7 @@ class SettingsRegressionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(raw=raw):
                 await handler(SimpleNamespace(text=raw), state)
                 self.assertEqual(await self.storage.get_settings(), before)
-                self.assertEqual(asdict(self.settings.values), before)
+                self.assertEqual(self.stored_values(self.settings.values), before)
         self.assertEqual(control._retry_input.await_count, 6)
         control._finish_input.assert_not_awaited()
         await handler(SimpleNamespace(text="1,5 2"), state)
@@ -77,7 +85,7 @@ class SettingsRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await self.settings.set_value(key, invalid)
         self.assertEqual(await self.storage.get_settings(), before)
-        self.assertEqual(asdict(self.settings.values), before)
+        self.assertEqual(self.stored_values(self.settings.values), before)
 
     async def test_loading_repairs_invalid_persisted_ranges_and_numbers(self) -> None:
         invalid: dict[str, object] = {
@@ -94,12 +102,17 @@ class SettingsRegressionTests(unittest.IsolatedAsyncioTestCase):
             "long_pause_chance": math.nan,
             "farmer_stop_requested": True,
         }
-        await self.storage.set_settings(invalid)
+        self.storage.connection.executemany(
+            "INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            ((key, json.dumps(value)) for key, value in invalid.items()),
+        )
+        self.storage.connection.commit()
         await self.settings.load()
-        self.assertEqual(asdict(self.settings.values), asdict(FarmerSettings()))
+        self.assertEqual(self.settings.values, FarmerSettings())
         repaired = await self.storage.get_settings()
         self.assertTrue(repaired.pop("farmer_stop_requested"))
-        self.assertEqual(repaired, asdict(FarmerSettings()))
+        self.assertEqual(repaired, self.stored_values(FarmerSettings()))
         writes = self.storage.connection.total_changes
         await self.settings.load()
         self.assertEqual(self.storage.connection.total_changes, writes)

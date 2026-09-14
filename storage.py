@@ -1,25 +1,42 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Unpack, cast
+from typing import Unpack, cast
 
-from combat_learning import battle_learning_summary, resolved_decision
-from combat_strategy import COMBAT_MODEL_VERSION
-from rewards import MIST_CRYSTAL_CODE, parse_item_stack
-from storage_types import (
+from battle_outbox import BattleEvent, BattleOutboxEnvelope, InvalidBattleOutboxEntry
+from battle_records import (
+    MIST_CRYSTAL_CODE,
+    BattleOutcome,
     BattleResult,
+    IdempotencyConflict,
+    ItemDrop,
+    RecordBattleResult,
+    RewardBundle,
+    SourceEventId,
+)
+from bounded_values import INT64_MAX, require_int64
+from json_types import canonical_json_object, canonical_json_value
+from runtime_state import PROCESS_STATUS_NAMES, require_phase_name
+from storage_migrations import (
+    migrate_battle_source_identity,
+    migrate_combat_knowledge_namespace,
+    validate_battle_references,
+)
+from storage_types import (
     BattleTotals,
-    CombatDecisionRow,
     DropSummary,
     DropTotals,
     EventSummary,
     FarmerState,
+    FarmerStatePatch,
     JsonValue,
     SessionSummary,
     StatisticsDashboard,
@@ -27,7 +44,8 @@ from storage_types import (
     TelegramActivityDay,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
+CORRUPT_BARRIER_FALLBACK_SECONDS = 60
 
 
 def utc_now() -> str:
@@ -40,25 +58,18 @@ class Storage:
         self.lock = asyncio.Lock()
         self.connection = sqlite3.connect(path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA busy_timeout=5000")
         try:
             self._create_schema()
+            # journal_mode is persistent; change it only after accepting the schema.
+            self.connection.execute("PRAGMA journal_mode=WAL").fetchone()
         except Exception:
             self.connection.close()
             raise
 
     def _create_schema(self) -> None:
-        current_version = int(
-            self.connection.execute("PRAGMA user_version").fetchone()[0]
-        )
-        if current_version > SCHEMA_VERSION:
-            raise RuntimeError(
-                "Версия схемы SQLite новее поддерживаемой: "
-                f"{current_version} > {SCHEMA_VERSION}"
-            )
-        self.connection.executescript("""
+        schema = """
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             started_at TEXT NOT NULL,
@@ -74,7 +85,13 @@ class Storage:
 
         CREATE TABLE IF NOT EXISTS battles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_message_id INTEGER NOT NULL UNIQUE,
+            source_event_id TEXT NOT NULL UNIQUE
+                CHECK(typeof(source_event_id)='text'
+                      AND length(CAST(source_event_id AS BLOB)) BETWEEN 1 AND 255
+                      AND source_event_id=trim(source_event_id)),
+            source_message_id INTEGER
+                CHECK(source_message_id IS NULL
+                      OR (typeof(source_message_id)='integer' AND source_message_id > 0)),
             session_id INTEGER,
             happened_at TEXT NOT NULL,
             target_name TEXT NOT NULL,
@@ -111,61 +128,29 @@ class Storage:
         CREATE INDEX IF NOT EXISTS idx_battle_currencies_code
             ON battle_currencies(currency_code, battle_id);
 
-        CREATE TABLE IF NOT EXISTS combat_decisions (
+        CREATE TABLE IF NOT EXISTS battle_outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             battle_id INTEGER NOT NULL,
-            sequence_number INTEGER NOT NULL,
+            namespace TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+            payload_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            telegram_message_id INTEGER NOT NULL,
-            target_name TEXT NOT NULL,
-            round_number INTEGER,
-            chosen_skill TEXT NOT NULL,
-            chosen_target TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            urgent INTEGER NOT NULL DEFAULT 0,
-            trace_json TEXT NOT NULL,
-            UNIQUE(battle_id, sequence_number),
+            acknowledged_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            UNIQUE(battle_id, namespace, idempotency_key),
             FOREIGN KEY(battle_id) REFERENCES battles(id) ON DELETE CASCADE
         );
-        CREATE INDEX IF NOT EXISTS idx_combat_decisions_target
-            ON combat_decisions(target_name, chosen_skill);
+        CREATE INDEX IF NOT EXISTS idx_battle_outbox_pending
+            ON battle_outbox(namespace, acknowledged_at, id);
 
-        CREATE TABLE IF NOT EXISTS combat_knowledge (
-            profile_max_hp INTEGER PRIMARY KEY,
-            updated_at TEXT NOT NULL,
-            knowledge_json TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS battle_outbox_barriers (
+            namespace TEXT PRIMARY KEY,
+            blocked_until TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS combat_battle_analysis (
-            battle_id INTEGER PRIMARY KEY,
-            target_name TEXT NOT NULL,
-            result TEXT NOT NULL,
-            happened_at TEXT NOT NULL,
-            profile_max_hp INTEGER NOT NULL DEFAULT 0,
-            model_version INTEGER NOT NULL DEFAULT 0,
-            rounds INTEGER NOT NULL DEFAULT 0,
-            total_actions INTEGER NOT NULL DEFAULT 0,
-            offensive_actions INTEGER NOT NULL DEFAULT 0,
-            self_heals INTEGER NOT NULL DEFAULT 0,
-            renewals INTEGER NOT NULL DEFAULT 0,
-            minimum_hp INTEGER,
-            minimum_hp_percent REAL,
-            last_decision_hp INTEGER,
-            minimum_mana INTEGER,
-            last_decision_mana INTEGER,
-            effective_self_healing INTEGER NOT NULL DEFAULT 0,
-            lost_healing_potential INTEGER NOT NULL DEFAULT 0,
-            dangerous_turns INTEGER NOT NULL DEFAULT 0,
-            shadow_decisions INTEGER NOT NULL DEFAULT 0,
-            shadow_confident INTEGER NOT NULL DEFAULT 0,
-            shadow_agreements INTEGER NOT NULL DEFAULT 0,
-            policy_key TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_combat_analysis_profile_target
-            ON combat_battle_analysis(profile_max_hp, target_name);
-        CREATE INDEX IF NOT EXISTS idx_combat_analysis_happened_at
-            ON combat_battle_analysis(happened_at);
 
         CREATE TABLE IF NOT EXISTS farmer_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -238,21 +223,80 @@ class Storage:
             rpc_errors INTEGER NOT NULL DEFAULT 0
         );
 
-        """)
-        if current_version < 1:
-            self.connection.executescript("""
-            DROP TABLE IF EXISTS combat_policy_stats;
-            DROP TABLE IF EXISTS combat_strategy_stats;
-            """)
-        self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        self.connection.commit()
+        """
+        # Rebuilding a referenced parent requires FK enforcement to be disabled
+        # before BEGIN. The IMMEDIATE transaction protects version inspection,
+        # DDL, copied rows, integrity checks, and user_version publication.
+        self.connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
+                current_version = require_int64(
+                    self.connection.execute("PRAGMA user_version").fetchone()[0],
+                    "SQLite schema version",
+                    minimum=0,
+                )
+                if current_version > SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "Версия схемы SQLite новее поддерживаемой: "
+                        f"{current_version} > {SCHEMA_VERSION}"
+                    )
+                for statement in schema.split(";"):
+                    if statement.strip():
+                        self.connection.execute(statement)
+                if current_version < 4:
+                    # Existing deferrals predate the explicit namespace barrier. On
+                    # upgrade, conservatively preserve their longest valid deadline.
+                    rows = self.connection.execute(
+                        "SELECT namespace,next_attempt_at FROM battle_outbox "
+                        "WHERE acknowledged_at IS NULL AND next_attempt_at IS NOT NULL"
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            until = self._aware_utc(row["next_attempt_at"])
+                        except (TypeError, ValueError):
+                            continue  # Corrupt rows remain visible for quarantine.
+                        self._extend_battle_event_barrier_unlocked(row["namespace"], until)
+                migrate_combat_knowledge_namespace(self.connection)
+                if current_version < 5:
+                    migrate_battle_source_identity(self.connection)
+                for statement in (
+                    "CREATE INDEX IF NOT EXISTS idx_battles_happened_at "
+                    "ON battles(happened_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_battles_session_id "
+                    "ON battles(session_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_battles_source_message_id "
+                    "ON battles(source_message_id)",
+                ):
+                    self.connection.execute(statement)
+                if current_version < 5:
+                    validate_battle_references(self.connection)
+                self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        finally:
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            enabled = self.connection.execute("PRAGMA foreign_keys").fetchone()[0]
+            if enabled != 1:
+                raise RuntimeError("SQLite foreign-key enforcement could not be restored")
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[None]:
         """Serializes a write unit and rolls it back completely on failure."""
         async with self.lock:
             with self.connection:
+                self.connection.execute("BEGIN IMMEDIATE")
                 yield
+
+    @asynccontextmanager
+    async def diagnostics_reader(self) -> AsyncIterator[sqlite3.Connection]:
+        """Give an extension repository synchronized read access to its own tables."""
+        async with self.lock:
+            yield self.connection
+
+    @asynccontextmanager
+    async def diagnostics_transaction(self) -> AsyncIterator[sqlite3.Connection]:
+        """Give an extension repository an independent transaction, including DDL."""
+        async with self._transaction():
+            yield self.connection
 
     def _close_abandoned_sessions(self) -> int:
         """Closes sessions left RUNNING by a killed container or an old defect."""
@@ -298,30 +342,27 @@ class Storage:
             )
         return len(rows)
 
-    async def cleanup_old_data(self, retention_days: int = 7) -> dict[str, int]:
-        """Удаляет диагностические и статистические записи старше retention_days."""
+    async def cleanup_old_data(
+        self, retention_days: int = 7, *, event_types_to_delete: tuple[str, ...] = ()
+    ) -> dict[str, int]:
+        """Apply generic retention and an application-supplied event deletion policy."""
         cutoff = (datetime.now(UTC) - timedelta(days=max(1, retention_days))).isoformat()
         async with self._transaction():
+            event_filter = "created_at < ?"
+            if event_types_to_delete:
+                event_placeholders = ",".join("?" for _ in event_types_to_delete)
+                event_filter += f" OR event_type IN ({event_placeholders})"
             deleted_events = self.connection.execute(
-                """DELETE FROM events
-                   WHERE created_at < ?
-                      OR event_type IN ('LOW_HP_WAIT_STARTED', 'LOW_HP_WAIT_FINISHED')""",
-                (cutoff,),
-            ).rowcount
-            deleted_decisions = self.connection.execute(
-                """DELETE FROM combat_decisions
-                   WHERE battle_id IN (
-                       SELECT battle_id FROM combat_battle_analysis
-                   )
-                     AND CAST(COALESCE(
-                         json_extract(trace_json, '$.model_version'), 0
-                     ) AS INTEGER) < ?""",
-                (COMBAT_MODEL_VERSION,),
+                f"DELETE FROM events WHERE {event_filter}",
+                (cutoff, *event_types_to_delete),
             ).rowcount
             old_battle_ids = [
                 int(row["id"])
                 for row in self.connection.execute(
-                    "SELECT id FROM battles WHERE happened_at < ?", (cutoff,)
+                    """SELECT id FROM battles WHERE happened_at < ? AND NOT EXISTS (
+                        SELECT 1 FROM battle_outbox o
+                        WHERE o.battle_id=battles.id AND o.acknowledged_at IS NULL
+                    )""", (cutoff,)
                 ).fetchall()
             ]
             deleted_drops = 0
@@ -358,11 +399,8 @@ class Storage:
                 "DELETE FROM telegram_activity_hourly WHERE bucket_start < ?",
                 (telemetry_cutoff,),
             )
-            self.connection.commit()
-            self.connection.execute("PRAGMA optimize")
             return {
                 "events": max(0, deleted_events),
-                "combat_decisions": max(0, deleted_decisions),
                 "drops": max(0, deleted_drops),
                 "battles": max(0, deleted_battles),
                 "sessions": max(0, deleted_sessions),
@@ -393,9 +431,9 @@ class Storage:
             "rpc_errors",
         }
         values = {
-            key: max(0, int(value))
+            key: bounded
             for key, value in metrics.items()
-            if key in columns and int(value) > 0
+            if key in columns and (bounded := require_int64(value, key)) > 0
         }
         if not values:
             return
@@ -411,14 +449,21 @@ class Storage:
             )
             for name in names
         )
-        async with self.lock:
+        async with self._transaction():
+            previous = self.connection.execute(
+                "SELECT * FROM telegram_activity_hourly WHERE bucket_start=?", (bucket_start,),
+            ).fetchone()
+            if previous is not None:
+                for name, amount in values.items():
+                    old_amount = require_int64(previous[name], name, minimum=0)
+                    if name not in peak_columns:
+                        require_int64(old_amount + amount, name, minimum=0)
             self.connection.execute(
                 f"""INSERT INTO telegram_activity_hourly({insert_columns})
                     VALUES ({placeholders})
                     ON CONFLICT(bucket_start) DO UPDATE SET {updates}""",
                 (bucket_start, *(values[name] for name in names)),
             )
-            self.connection.commit()
 
     async def get_telegram_activity_daily(
         self,
@@ -488,17 +533,19 @@ class Storage:
         cycles_count: int,
         moves_per_cycle: int,
     ) -> int:
-        async with self.lock:
+        require_int64(cycles_count, "cycles_count", minimum=1)
+        require_int64(moves_per_cycle, "moves_per_cycle", minimum=1)
+        async with self._transaction():
             now = utc_now()
             self._close_abandoned_sessions()
             cursor = self.connection.execute(
                 "INSERT INTO sessions(started_at,status) VALUES (?, 'RUNNING')",
                 (now,),
             )
-            if cursor.lastrowid is None:
+            if cursor.rowcount != 1 or cursor.lastrowid is None:
                 raise RuntimeError("SQLite не вернул ID новой сессии")
             sid = int(cursor.lastrowid)
-            self.connection.execute(
+            state = self.connection.execute(
                 """
                 UPDATE farmer_state SET
                     process_status='RUNNING', game_state='STARTING',
@@ -510,22 +557,28 @@ class Storage:
             """,
                 (cycles_count, moves_per_cycle, sid, now),
             )
-            self.connection.commit()
+            if state.rowcount != 1:
+                raise RuntimeError("SQLite did not update the required session state")
             return sid
 
     async def finish_session(
         self, session_id: int | None, reason: str, runtime_seconds: int
     ) -> None:
-        async with self.lock:
+        require_int64(runtime_seconds, "runtime_seconds", minimum=0)
+        if session_id is not None:
+            require_int64(session_id, "session_id", minimum=1)
+        async with self._transaction():
             if session_id is not None:
-                self.connection.execute(
+                finished = self.connection.execute(
                     """
                     UPDATE sessions SET ended_at=?, status='STOPPED',
                     stop_reason=?, runtime_seconds=? WHERE id=?
                 """,
                     (utc_now(), reason, runtime_seconds, session_id),
                 )
-            self.connection.execute(
+                if finished.rowcount != 1:
+                    raise RuntimeError("SQLite did not finish the required session")
+            state = self.connection.execute(
                 """
                 UPDATE farmer_state SET process_status='STOPPED',
                 game_state='STOPPED', active_target=NULL,
@@ -534,7 +587,8 @@ class Storage:
             """,
                 (reason, utc_now()),
             )
-            self.connection.commit()
+            if state.rowcount != 1:
+                raise RuntimeError("SQLite did not update the required session state")
 
     async def checkpoint(self, *, truncate: bool = False) -> tuple[int, int, int]:
         """Copies committed WAL pages into the main database file."""
@@ -553,78 +607,204 @@ class Storage:
             finally:
                 self.connection.close()
 
-    async def update_state(self, **fields: Unpack[FarmerState]) -> None:
-        allowed = {
-            "process_status",
-            "game_state",
-            "position_x",
-            "position_y",
-            "current_hp",
-            "max_hp",
-            "active_target",
-            "moves",
-            "last_action",
-            "last_progress_at",
-            "last_error",
-            "session_id",
-            "current_cycle",
-            "cycles_count",
-            "moves_in_cycle",
-            "moves_per_cycle",
-            "rest_until",
-            "pause_requested",
-        }
-        clean = {k: v for k, v in fields.items() if k in allowed}
-        if not clean:
+    async def update_state(self, **fields: Unpack[FarmerStatePatch]) -> None:
+        unexpected = fields.keys() - FarmerStatePatch.__annotations__.keys()
+        if unexpected:
+            raise ValueError("Неизвестные поля состояния: " + ", ".join(sorted(unexpected)))
+        if not fields:
             return
-        sql = ", ".join(f"{k}=?" for k in clean)
-        async with self.lock:
-            self.connection.execute(
+        normalized: dict[str, object] = {}
+        positive = {"current_cycle", "cycles_count", "moves_per_cycle", "session_id"}
+        nonnegative = {"current_hp", "max_hp", "moves", "moves_in_cycle"}
+        nullable = {"position_x", "position_y", "current_hp", "max_hp", "active_target",
+                    "last_action", "last_progress_at", "last_error", "session_id", "rest_until"}
+        text = {"active_target", "last_action", "last_error"}
+        timestamps = {"last_progress_at", "rest_until"}
+        for key, value in fields.items():
+            if value is None:
+                if key not in nullable:
+                    raise ValueError(f"{key} cannot be None")
+            elif key in positive:
+                require_int64(value, key, minimum=1)
+            elif key in nonnegative:
+                require_int64(value, key, minimum=0)
+            elif key in {"position_x", "position_y"}:
+                require_int64(value, key)
+            elif key == "pause_requested":
+                if require_int64(value, key, minimum=0) not in (0, 1):
+                    raise ValueError("pause_requested must be 0 or 1")
+            elif key in text:
+                if not isinstance(value, str):
+                    raise ValueError(f"{key} must be a string or None")
+            elif key in timestamps:
+                if not isinstance(value, str):
+                    raise ValueError(f"{key} must be an aware ISO timestamp")
+                moment = datetime.fromisoformat(value)
+                if moment.tzinfo is None or moment.utcoffset() is None:
+                    raise ValueError(f"{key} must be an aware ISO timestamp")
+                value = moment.astimezone(UTC).isoformat()
+            elif key == "game_state":
+                value = require_phase_name(value, "game_state")
+            elif key == "process_status":
+                if not isinstance(value, str) or value not in PROCESS_STATUS_NAMES:
+                    raise ValueError("Unknown process_status")
+            normalized[key] = value
+        sql = ", ".join(f"{key}=?" for key in fields)
+        async with self._transaction():
+            cursor = self.connection.execute(
                 f"UPDATE farmer_state SET {sql} WHERE singleton=1",
-                list(clean.values()),
+                list(normalized.values()),
             )
-            self.connection.commit()
+            if cursor.rowcount != 1:
+                raise RuntimeError("Отсутствует обязательное состояние farmer_state(singleton=1)")
+
+    @staticmethod
+    def _decode_state_row(row: sqlite3.Row) -> FarmerState:
+        """Validate persisted state without guessing corrupted or future values.
+
+        Aware legacy timestamps are normalized to UTC. Unsupported enum values,
+        lossy numeric representations, and malformed rows fail closed so the
+        supervisor cannot act on a state that violates the public read contract.
+        """
+
+        def integer(field: str, *, minimum: int | None = None) -> int:
+            value = row[field]
+            if minimum is None:
+                return require_int64(value, f"Stored {field}")
+            return require_int64(value, f"Stored {field}", minimum=minimum)
+
+        def optional_integer(field: str, *, minimum: int | None = None) -> int | None:
+            if row[field] is None:
+                return None
+            return integer(field, minimum=minimum)
+
+        def optional_text(field: str) -> str | None:
+            value = row[field]
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Stored {field} must be a string or None")
+            return value
+
+        def timestamp(field: str) -> str | None:
+            value = row[field]
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f"Stored {field} must be an aware ISO timestamp")
+            try:
+                moment = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Stored {field} must be an aware ISO timestamp"
+                ) from exc
+            if moment.tzinfo is None or moment.utcoffset() is None:
+                raise ValueError(f"Stored {field} must be an aware ISO timestamp")
+            return moment.astimezone(UTC).isoformat()
+
+        process_status = row["process_status"]
+        if not isinstance(process_status, str) or process_status not in PROCESS_STATUS_NAMES:
+            raise ValueError("Stored process_status is unsupported")
+        game_state = row["game_state"]
+        game_state = require_phase_name(game_state, "Stored game_state")
+        pause_requested = integer("pause_requested", minimum=0)
+        if pause_requested not in (0, 1):
+            raise ValueError("Stored pause_requested must be 0 or 1")
+        singleton = integer("singleton", minimum=1)
+        if singleton != 1:
+            raise ValueError("Stored farmer_state singleton must be 1")
+
+        return FarmerState(
+            singleton=singleton,
+            process_status=process_status,
+            game_state=game_state,
+            position_x=optional_integer("position_x"),
+            position_y=optional_integer("position_y"),
+            current_hp=optional_integer("current_hp", minimum=0),
+            max_hp=optional_integer("max_hp", minimum=0),
+            active_target=optional_text("active_target"),
+            moves=integer("moves", minimum=0),
+            last_action=optional_text("last_action"),
+            last_progress_at=timestamp("last_progress_at"),
+            last_error=optional_text("last_error"),
+            session_id=optional_integer("session_id", minimum=1),
+            current_cycle=integer("current_cycle", minimum=1),
+            cycles_count=integer("cycles_count", minimum=1),
+            moves_in_cycle=integer("moves_in_cycle", minimum=0),
+            moves_per_cycle=integer("moves_per_cycle", minimum=1),
+            rest_until=timestamp("rest_until"),
+            pause_requested=pause_requested,
+        )
+
+    def _get_state_unlocked(self) -> FarmerState:
+        """Read the complete singleton while the caller owns the connection lock."""
+        row = self.connection.execute("SELECT * FROM farmer_state WHERE singleton=1").fetchone()
+        if row is None:
+            raise RuntimeError("Отсутствует обязательное состояние farmer_state(singleton=1)")
+        return self._decode_state_row(row)
 
     async def get_state(self) -> FarmerState:
         async with self.lock:
-            row = self.connection.execute("SELECT * FROM farmer_state WHERE singleton=1").fetchone()
-            return cast(FarmerState, dict(row)) if row else {}
+            return self._get_state_unlocked()
 
     async def set_setting(self, key: str, value: object) -> None:
         await self.set_settings({key: value})
 
+    @staticmethod
+    def _validated_setting_keys(keys: Iterable[str]) -> tuple[str, ...]:
+        result = tuple(keys)
+        if any(not isinstance(key, str) or not key.strip() for key in result):
+            raise ValueError("Setting keys must be nonblank strings")
+        return tuple(sorted(result))
+
     async def set_settings(self, values: Mapping[str, object]) -> None:
-        if not values:
-            return
+        await self.set_and_delete_settings(values, frozenset())
+
+    async def set_and_delete_settings(
+        self, values: Mapping[str, object], keys: set[str] | frozenset[str],
+    ) -> None:
+        """Atomically publish validated values and remove an explicit obsolete key set."""
+        names = self._validated_setting_keys(values)
+        deleted = self._validated_setting_keys(keys)
+        if set(names) & set(deleted):
+            raise ValueError("A setting cannot be updated and deleted in the same operation")
         updated_at = utc_now()
-        rows = [
-            (key, json.dumps(value, ensure_ascii=False), updated_at)
-            for key, value in values.items()
-        ]
+        rows = [(key, canonical_json_value(values[key]), updated_at) for key in names]
+        if not rows and not deleted:
+            return
         async with self._transaction():
             self.connection.executemany(
-                """
-                INSERT INTO settings(key,value_json,updated_at)
-                VALUES (?,?,?)
+                """INSERT INTO settings(key,value_json,updated_at) VALUES (?,?,?)
                 ON CONFLICT(key) DO UPDATE SET
-                    value_json=excluded.value_json,
-                    updated_at=excluded.updated_at
-                WHERE settings.value_json != excluded.value_json
-            """,
-                rows,
+                    value_json=excluded.value_json, updated_at=excluded.updated_at
+                WHERE settings.value_json != excluded.value_json""", rows,
             )
+            if rows:
+                placeholders = ",".join("?" for _ in names)
+                saved = dict(self.connection.execute(
+                    f"SELECT key,value_json FROM settings WHERE key IN ({placeholders})", names,
+                ).fetchall())
+                if any(saved.get(key) != value for key, value, _ in rows):
+                    raise RuntimeError("SQLite did not persist the requested settings")
+            self._delete_settings_unlocked(deleted)
 
-    async def delete_settings(self, keys: set[str] | frozenset[str]) -> int:
+    def _delete_settings_unlocked(self, keys: tuple[str, ...]) -> int:
         if not keys:
             return 0
         placeholders = ",".join("?" for _ in keys)
-        async with self.lock:
-            cursor = self.connection.execute(
-                f"DELETE FROM settings WHERE key IN ({placeholders})",
-                tuple(sorted(keys)),
-            )
-            self.connection.commit()
-            return max(0, cursor.rowcount)
+        cursor = self.connection.execute(
+            f"DELETE FROM settings WHERE key IN ({placeholders})", keys,
+        )
+        if self.connection.execute(
+            f"SELECT 1 FROM settings WHERE key IN ({placeholders}) LIMIT 1", keys,
+        ).fetchone():
+            raise RuntimeError("SQLite did not delete the requested settings")
+        return max(0, cursor.rowcount)
+
+    async def delete_settings(self, keys: set[str] | frozenset[str]) -> int:
+        validated = self._validated_setting_keys(keys)
+        if not validated:
+            return 0
+        async with self._transaction():
+            return self._delete_settings_unlocked(validated)
 
     async def get_settings(self) -> dict[str, JsonValue]:
         async with self.lock:
@@ -655,7 +835,9 @@ class Storage:
     ) -> bool:
         """Persist a blocked cell learned from an inbound map message."""
         x, y = position
-        async with self.lock:
+        require_int64(x, "position_x")
+        require_int64(y, "position_y")
+        async with self._transaction():
             cursor = self.connection.execute(
                 """
                 INSERT OR IGNORE INTO map_obstacles(
@@ -664,7 +846,6 @@ class Storage:
                 """,
                 (location_name, x, y, utc_now()),
             )
-            self.connection.commit()
             return cursor.rowcount > 0
 
     async def get_map_obstacles(self, location_name: str) -> set[tuple[int, int]]:
@@ -686,7 +867,10 @@ class Storage:
     ) -> int:
         if not positions:
             return 0
-        async with self.lock:
+        for x, y in positions:
+            require_int64(x, "position_x")
+            require_int64(y, "position_y")
+        async with self._transaction():
             deleted = self.connection.executemany(
                 """
                 DELETE FROM map_obstacles
@@ -694,14 +878,12 @@ class Storage:
                 """,
                 [(location_name, x, y) for x, y in positions],
             ).rowcount
-            self.connection.commit()
             return max(0, deleted)
 
     async def clear_map_obstacles(self) -> int:
         """Forget observations created by an incompatible navigation model."""
-        async with self.lock:
+        async with self._transaction():
             cursor = self.connection.execute("DELETE FROM map_obstacles")
-            self.connection.commit()
             return max(0, cursor.rowcount)
 
     async def add_event(
@@ -709,9 +891,14 @@ class Storage:
         event_type: str,
         message: str,
         level: str = "INFO",
-        payload: Mapping[str, object] | None = None,
+        payload: Mapping[str, JsonValue] | None = None,
     ) -> int:
-        async with self.lock:
+        serialized_payload = (
+            canonical_json_object(payload)
+            if payload is not None
+            else None
+        )
+        async with self._transaction():
             cur = self.connection.execute(
                 """
                 INSERT INTO events(created_at,level,event_type,message,payload_json)
@@ -722,365 +909,684 @@ class Storage:
                     level,
                     event_type,
                     message,
-                    json.dumps(payload, ensure_ascii=False) if payload else None,
+                    serialized_payload,
                 ),
             )
-            self.connection.commit()
-            if cur.lastrowid is None:
+            if cur.rowcount != 1 or cur.lastrowid is None:
                 raise RuntimeError("SQLite не вернул ID нового события")
             return int(cur.lastrowid)
 
-    def _write_battle_analysis(
+    async def record_battle_outcome(
         self,
+        outcome: BattleOutcome,
         *,
-        battle_id: int,
-        target_name: str,
-        result: str,
-        happened_at: str,
-        traces: list[dict[str, Any]],
-    ) -> None:
-        if not traces:
-            return
-        summary = battle_learning_summary(traces)
-        self.connection.execute(
-            """
-            INSERT INTO combat_battle_analysis(
-                battle_id,target_name,result,happened_at,profile_max_hp,
-                model_version,rounds,total_actions,offensive_actions,self_heals,
-                renewals,minimum_hp,minimum_hp_percent,last_decision_hp,
-                minimum_mana,last_decision_mana,effective_self_healing,
-                lost_healing_potential,dangerous_turns,shadow_decisions,
-                shadow_confident,shadow_agreements,policy_key,created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(battle_id) DO NOTHING
-            """,
-            (
-                battle_id,
-                target_name,
-                result,
-                happened_at,
-                summary.profile_max_hp,
-                summary.model_version,
-                summary.rounds,
-                summary.total_actions,
-                summary.offensive_actions,
-                summary.self_heals,
-                summary.renewals,
-                summary.minimum_hp,
-                summary.minimum_hp_percent,
-                summary.last_decision_hp,
-                summary.minimum_mana,
-                summary.last_decision_mana,
-                summary.effective_self_healing,
-                summary.lost_healing_potential,
-                summary.dangerous_turns,
-                summary.shadow_decisions,
-                summary.shadow_confident,
-                summary.shadow_agreements,
-                summary.policy_key,
-                utc_now(),
-            ),
-        )
-
-    async def backfill_combat_battle_analysis(self) -> int:
-        """Builds compact learning rows from retained decision traces."""
-        async with self.lock:
-            battles = self.connection.execute(
-                """
-                SELECT b.id,b.target_name,b.result,b.happened_at
-                FROM battles b
-                LEFT JOIN combat_battle_analysis a ON a.battle_id=b.id
-                WHERE a.battle_id IS NULL
-                  AND EXISTS(
-                      SELECT 1 FROM combat_decisions cd WHERE cd.battle_id=b.id
-                  )
-                ORDER BY b.id
-                """
-            ).fetchall()
-            written = 0
-            for battle in battles:
-                rows = self.connection.execute(
-                    """
-                    SELECT trace_json FROM combat_decisions
-                    WHERE battle_id=? ORDER BY sequence_number
-                    """,
-                    (int(battle["id"]),),
-                ).fetchall()
-                traces: list[dict[str, Any]] = []
-                for row in rows:
-                    try:
-                        trace = json.loads(str(row["trace_json"]))
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(trace, dict):
-                        traces.append(trace)
-                if not traces:
-                    continue
-                self._write_battle_analysis(
-                    battle_id=int(battle["id"]),
-                    target_name=str(battle["target_name"]),
-                    result=str(battle["result"]),
-                    happened_at=str(battle["happened_at"]),
-                    traces=traces,
-                )
-                written += 1
-            if written:
-                self.connection.commit()
-            return written
-
-    async def record_battle(
-        self,
-        *,
-        telegram_message_id: int,
-        session_id: int | None,
-        target_name: str,
-        result: BattleResult,
-        xp: int = 0,
-        dust: int = 0,
-        crystals: int = 0,
-        items: Iterable[str] = (),
-        position: tuple[int, int] | None = None,
-        combat_decisions: tuple[dict[str, Any], ...] = (),
-    ) -> tuple[bool, list[str]]:
-        cards: list[str] = []
+        events: tuple[BattleEvent, ...] = (),
+        legacy_source_event_ids: tuple[SourceEventId, ...] = (),
+    ) -> RecordBattleResult:
+        """Atomically record normalized mandatory facts without invoking game diagnostics."""
+        events = tuple(events)
+        if any(not isinstance(event, BattleEvent) for event in events):
+            raise ValueError("Expected immutable BattleEvent values")
+        legacy_source_event_ids = tuple(legacy_source_event_ids)
+        if any(
+            not isinstance(identifier, SourceEventId)
+            for identifier in legacy_source_event_ids
+        ):
+            raise ValueError("Expected immutable SourceEventId aliases")
+        if len(set(legacy_source_event_ids)) != len(legacy_source_event_ids):
+            raise ValueError("Legacy source event aliases must be unique")
+        if outcome.source_event_id in legacy_source_event_ids:
+            raise ValueError("Current source event id cannot also be a legacy alias")
+        happened_at = outcome.happened_at.astimezone(UTC).isoformat()
+        rewards = outcome.rewards
         async with self._transaction():
-            if self.connection.execute(
-                "SELECT 1 FROM battles WHERE telegram_message_id=?",
-                (telegram_message_id,),
-            ).fetchone():
-                return False, cards
-            px, py = position if position else (None, None)
-            happened_at = utc_now()
-            cur = self.connection.execute(
+            alias_matches = [
+                row
+                for identifier in legacy_source_event_ids
+                if (
+                    row := self.connection.execute(
+                        "SELECT id,source_event_id FROM battles WHERE source_event_id=?",
+                        (identifier.value,),
+                    ).fetchone()
+                )
+                is not None
+            ]
+            if len(alias_matches) > 1:
+                raise IdempotencyConflict(
+                    "Multiple legacy battle rows claim the same source event"
+                )
+            previous = self.connection.execute(
+                "SELECT id FROM battles WHERE source_event_id=?",
+                (outcome.source_event_id.value,),
+            ).fetchone()
+            if previous is None and alias_matches:
+                alias = alias_matches[0]
+                battle_id = require_int64(alias["id"], "battle_id", minimum=1)
+                if (
+                    self._stored_battle_fingerprint(battle_id)
+                    == self._outcome_fingerprint(outcome)
+                ):
+                    rekeyed = self.connection.execute(
+                        "UPDATE battles SET source_event_id=? "
+                        "WHERE id=? AND source_event_id=?",
+                        (
+                            outcome.source_event_id.value,
+                            battle_id,
+                            alias["source_event_id"],
+                        ),
+                    )
+                    if rekeyed.rowcount != 1:
+                        raise RuntimeError("SQLite did not rekey the legacy battle identity")
+                    previous = alias
+            if previous is not None:
+                battle_id = require_int64(previous["id"], "battle_id", minimum=1)
+                if self._stored_battle_fingerprint(battle_id) != self._outcome_fingerprint(outcome):
+                    raise IdempotencyConflict(
+                        f"Battle source event {outcome.source_event_id.value!r} "
+                        "has conflicting rewards/result"
+                    )
+                self._enqueue_battle_events_unlocked(battle_id, events)
+                return RecordBattleResult(inserted=False, battle_id=battle_id)
+            px, py = outcome.position if outcome.position is not None else (None, None)
+            cursor = self.connection.execute(
                 """
                 INSERT INTO battles(
-                    telegram_message_id,session_id,happened_at,target_name,
-                    result,xp,dust,position_x,position_y
-                ) VALUES (?,?,?,?,?,?,?,?,?)
-            """,
+                    source_event_id,source_message_id,session_id,happened_at,
+                    target_name,result,xp,dust,position_x,position_y
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
                 (
-                    telegram_message_id,
-                    session_id,
+                    outcome.source_event_id.value,
+                    outcome.source_message_id,
+                    outcome.session_id,
                     happened_at,
-                    target_name,
-                    result,
-                    xp,
-                    dust,
+                    outcome.target_name,
+                    outcome.result,
+                    rewards.xp,
+                    rewards.dust,
                     px,
                     py,
                 ),
             )
-            if cur.lastrowid is None:
-                raise RuntimeError("SQLite не вернул ID нового боя")
-            battle_id = int(cur.lastrowid)
-            for sequence_number, trace in enumerate(combat_decisions, start=1):
-                decision_data = resolved_decision(trace)
-                self.connection.execute(
-                    """
-                    INSERT INTO combat_decisions(
-                        battle_id,sequence_number,created_at,telegram_message_id,
-                        target_name,round_number,chosen_skill,chosen_target,
-                        reason,urgent,trace_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        battle_id,
-                        sequence_number,
-                        str(trace.get("created_at") or utc_now()),
-                        int(trace.get("telegram_message_id") or 0),
-                        str(trace.get("target_name") or target_name),
-                        trace.get("round_number"),
-                        str(decision_data.get("skill_name") or "неизвестно"),
-                        str(decision_data.get("target") or "unknown"),
-                        str(decision_data.get("reason") or ""),
-                        int(bool(decision_data.get("urgent"))),
-                        json.dumps(trace, ensure_ascii=False),
-                    ),
+            if cursor.rowcount != 1 or cursor.lastrowid is None:
+                raise RuntimeError("SQLite не сохранил обязательный исход боя")
+            battle_id = int(cursor.lastrowid)
+            if rewards.crystals > 0:
+                currency = self.connection.execute(
+                    "INSERT INTO battle_currencies(battle_id,currency_code,amount) VALUES (?,?,?)",
+                    (battle_id, MIST_CRYSTAL_CODE, rewards.crystals),
                 )
-            if combat_decisions:
-                trace_list = list(combat_decisions)
-                self._write_battle_analysis(
-                    battle_id=battle_id,
-                    target_name=target_name,
-                    result=result,
-                    happened_at=happened_at,
-                    traces=trace_list,
-                )
-            if crystals > 0:
-                self.connection.execute(
-                    """
-                    INSERT INTO battle_currencies(battle_id,currency_code,amount)
-                    VALUES (?,?,?)
-                    """,
-                    (battle_id, MIST_CRYSTAL_CODE, int(crystals)),
-                )
-            for item in items:
-                item_name, quantity = parse_item_stack(str(item))
-                n = item_name.casefold()
-                is_card = int(n.startswith(("карта ", "🃏карта ", "🃏 карта ")))
-                if is_card:
-                    cards.append(item_name)
-                self.connection.execute(
+                if currency.rowcount != 1:
+                    raise RuntimeError("SQLite не сохранил обязательную валюту боя")
+            for item in rewards.items:
+                drop = self.connection.execute(
                     "INSERT INTO drops(battle_id,item_name,quantity,is_card) VALUES (?,?,?,?)",
-                    (battle_id, item_name, quantity, is_card),
+                    (battle_id, item.name, item.quantity, int(item.is_card)),
                 )
-            if session_id is not None:
-                self.connection.execute(
+                if drop.rowcount != 1:
+                    raise RuntimeError("SQLite не сохранил обязательный предмет боя")
+            if outcome.session_id is not None:
+                current = self.connection.execute(
+                    "SELECT wins,defeats,xp,dust FROM sessions WHERE id=?", (outcome.session_id,),
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError("SQLite has no required battle session")
+                increments = (int(outcome.result == "VICTORY"), int(outcome.result == "DEFEAT"),
+                              rewards.xp, rewards.dust)
+                for field, increment in zip(
+                    ("wins", "defeats", "xp", "dust"), increments, strict=True
+                ):
+                    require_int64(
+                        require_int64(current[field], field) + increment, field, minimum=0
+                    )
+                session = self.connection.execute(
                     """
                     UPDATE sessions SET wins=wins+?, defeats=defeats+?,
                     xp=xp+?, dust=dust+? WHERE id=?
-                """,
+                    """,
                     (
-                        int(result == "VICTORY"),
-                        int(result == "DEFEAT"),
-                        xp,
-                        dust,
-                        session_id,
+                        int(outcome.result == "VICTORY"),
+                        int(outcome.result == "DEFEAT"),
+                        rewards.xp,
+                        rewards.dust,
+                        outcome.session_id,
                     ),
                 )
-            self.connection.commit()
-            return True, cards
+                if session.rowcount != 1:
+                    raise RuntimeError("SQLite не обновил обязательные итоги сессии")
+            self._enqueue_battle_events_unlocked(battle_id, events)
+        return RecordBattleResult(
+            inserted=True,
+            battle_id=battle_id,
+            cards=tuple(item.name for item in rewards.items if item.is_card),
+        )
 
-    async def get_combat_decisions(
-        self, target_name: str | None = None
-    ) -> list[CombatDecisionRow]:
-        query = """
-            SELECT cd.*, b.result
-            FROM combat_decisions cd
-            JOIN battles b ON b.id=cd.battle_id
-        """
-        params: tuple[str, ...] = ()
-        if target_name is not None:
-            query += " WHERE cd.target_name=?"
-            params = (target_name,)
-        query += " ORDER BY cd.id"
+    @staticmethod
+    def _content_fingerprint(
+        source_message_id: int | None,
+        target: str,
+        result: str,
+        xp: int,
+        dust: int,
+        crystals: int,
+        items: Iterable[tuple[str, int, bool]],
+    ) -> str:
+        content = (
+            source_message_id,
+            target.strip(),
+            result,
+            xp,
+            dust,
+            crystals,
+            sorted(items),
+        )
+        return hashlib.sha256(json.dumps(
+            content, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
 
-        async with self.lock:
-            rows = self.connection.execute(query, params).fetchall()
-            result: list[CombatDecisionRow] = []
-            for row in rows:
-                item = dict(row)
-                with suppress(json.JSONDecodeError):
-                    item["trace"] = json.loads(str(item.pop("trace_json")))
-                result.append(cast(CombatDecisionRow, item))
-            return result
+    @classmethod
+    def _outcome_fingerprint(cls, outcome: BattleOutcome) -> str:
+        reward = outcome.rewards
+        return cls._content_fingerprint(
+            outcome.source_message_id,
+            outcome.target_name,
+            outcome.result,
+            reward.xp,
+            reward.dust,
+            reward.crystals,
+            ((item.name, item.quantity, item.is_card) for item in reward.items),
+        )
 
-    async def get_combat_learning_stats(
-        self,
-        *,
-        target_name: str | None = None,
-        profile_max_hp: int | None = None,
-    ) -> list[dict[str, Any]]:
-        conditions: list[str] = []
-        params: list[Any] = []
-        if target_name is not None:
-            conditions.append("a.target_name=?")
-            params.append(target_name)
-        if profile_max_hp is not None:
-            conditions.append("a.profile_max_hp=?")
-            params.append(profile_max_hp)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"""
-            SELECT a.*
-            FROM combat_battle_analysis a
-            {where}
-            ORDER BY a.happened_at,a.battle_id
-        """
-        async with self.lock:
-            return [
-                dict(row)
-                for row in self.connection.execute(query, tuple(params)).fetchall()
-            ]
+    async def get_battle_outcome(self, battle_id: int) -> BattleOutcome | None:
+        """Read one consistent immutable ledger snapshot, including original context."""
+        require_int64(battle_id, "battle_id", minimum=1)
+        async with self._transaction():
+            return self._get_battle_outcome_unlocked(battle_id)
 
-    async def get_combat_learning_overview(
-        self,
-        *,
-        target_name: str | None = None,
-        profile_max_hp: int | None = None,
-    ) -> list[dict[str, Any]]:
-        conditions: list[str] = []
-        params: list[Any] = []
-        if target_name is not None:
-            conditions.append("a.target_name=?")
-            params.append(target_name)
-        if profile_max_hp is not None:
-            conditions.append("a.profile_max_hp=?")
-            params.append(profile_max_hp)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"""
-            SELECT a.profile_max_hp,a.target_name,a.policy_key,
-                   COUNT(*) AS battles,
-                   SUM(CASE WHEN a.result='VICTORY' THEN 1 ELSE 0 END) AS victories,
-                   SUM(CASE WHEN a.result='DEFEAT' THEN 1 ELSE 0 END) AS defeats,
-                   AVG(a.rounds) AS average_rounds,
-                   MIN(CASE WHEN a.result='VICTORY' THEN a.rounds END)
-                       AS best_victory_rounds,
-                   AVG(a.minimum_hp_percent) AS average_minimum_hp_percent,
-                   MIN(a.minimum_hp_percent) AS minimum_hp_percent,
-                   CASE WHEN SUM(a.total_actions)>0
-                       THEN CAST(SUM(a.offensive_actions) AS REAL)
-                            / SUM(a.total_actions)
-                       ELSE 0 END AS offensive_ratio,
-                   SUM(a.self_heals) AS self_heals,
-                   SUM(a.renewals) AS renewals,
-                   SUM(a.lost_healing_potential) AS lost_healing_potential,
-                   SUM(a.dangerous_turns) AS dangerous_turns,
-                   SUM(a.shadow_confident) AS shadow_confident,
-                   SUM(a.shadow_agreements) AS shadow_agreements,
-                   CASE WHEN SUM(a.shadow_confident)>0
-                       THEN CAST(SUM(a.shadow_agreements) AS REAL)
-                            / SUM(a.shadow_confident)
-                       ELSE NULL END AS shadow_agreement_rate
-            FROM combat_battle_analysis a
-            {where}
-            GROUP BY a.profile_max_hp,a.target_name,a.policy_key
-            ORDER BY victories DESC,average_rounds ASC,battles DESC
-        """
-        async with self.lock:
-            return [
-                dict(row)
-                for row in self.connection.execute(query, tuple(params)).fetchall()
-            ]
+    def _get_battle_outcome_unlocked(self, battle_id: int) -> BattleOutcome | None:
+        row = self.connection.execute("SELECT * FROM battles WHERE id=?", (battle_id,)).fetchone()
+        if row is None:
+            return None
+        currency = self.connection.execute(
+            "SELECT amount FROM battle_currencies WHERE battle_id=? AND currency_code=?",
+            (battle_id, MIST_CRYSTAL_CODE),
+        ).fetchone()
+        drop_rows = self.connection.execute(
+            "SELECT item_name,quantity,is_card FROM drops WHERE battle_id=? ORDER BY id",
+            (battle_id,),
+        ).fetchall()
+        items: list[ItemDrop] = []
+        for item in drop_rows:
+            card_flag = require_int64(item["is_card"], "is_card", minimum=0)
+            if card_flag not in (0, 1):
+                raise ValueError("Stored is_card must be 0 or 1")
+            items.append(ItemDrop(item["item_name"], item["quantity"], bool(card_flag)))
+        x, y = row["position_x"], row["position_y"]
+        if x is None and y is None:
+            position = None
+        elif x is None or y is None:
+            raise ValueError("Stored battle position must contain both coordinates")
+        else:
+            position = (require_int64(x, "position_x"), require_int64(y, "position_y"))
+        return BattleOutcome(
+            source_event_id=SourceEventId(row["source_event_id"]),
+            source_message_id=(
+                require_int64(row["source_message_id"], "source_message_id", minimum=1)
+                if row["source_message_id"] is not None
+                else None
+            ),
+            session_id=row["session_id"],
+            target_name=row["target_name"], result=cast(BattleResult, row["result"]),
+            rewards=RewardBundle(xp=row["xp"], dust=row["dust"],
+                                 crystals=currency["amount"] if currency is not None else 0,
+                                 items=tuple(items)),
+            position=position, happened_at=datetime.fromisoformat(str(row["happened_at"])),
+        )
 
-    async def load_combat_knowledge(self) -> dict[int, dict[str, Any]]:
+    def _stored_battle_fingerprint(self, battle_id: int) -> str:
+        outcome = self._get_battle_outcome_unlocked(battle_id)
+        if outcome is None:
+            raise RuntimeError("Expected an existing battle for idempotency comparison")
+        return self._outcome_fingerprint(outcome)
+
+    def _enqueue_battle_events_unlocked(
+        self, battle_id: int, events: tuple[BattleEvent, ...]
+    ) -> None:
+        for event in events:
+            cursor = self.connection.execute(
+                """INSERT INTO battle_outbox(
+                    battle_id,namespace,idempotency_key,event_type,schema_version,
+                    payload_json,created_at
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(battle_id,namespace,idempotency_key) DO NOTHING""",
+                (battle_id, event.namespace, event.idempotency_key, event.event_type,
+                 event.schema_version, event.payload_json, utc_now()),
+            )
+            if cursor.rowcount == 1:
+                continue
+            previous = self.connection.execute(
+                "SELECT event_type,schema_version,payload_json FROM battle_outbox "
+                "WHERE battle_id=? AND namespace=? AND idempotency_key=?",
+                (battle_id, event.namespace, event.idempotency_key),
+            ).fetchone()
+            if previous is None:
+                raise RuntimeError("SQLite did not save a required battle event")
+            if tuple(previous) != (event.event_type, event.schema_version, event.payload_json):
+                raise IdempotencyConflict("Conflicting event for the same battle/namespace/key")
+
+    @staticmethod
+    def _decode_battle_outbox_row(row: sqlite3.Row) -> BattleOutboxEnvelope:
+        """Reject malformed persisted envelopes instead of coercing their identity."""
+        return BattleOutboxEnvelope(
+            id=row["id"],
+            battle_id=row["battle_id"],
+            created_at=row["created_at"],
+            event=BattleEvent(
+                row["namespace"],
+                row["idempotency_key"],
+                row["event_type"],
+                row["schema_version"],
+                row["payload_json"],
+            ),
+            attempts=row["attempts"],
+            next_attempt_at=row["next_attempt_at"],
+            last_error=row["last_error"],
+        )
+
+    async def pending_battle_events(
+        self, *, namespace: str, limit: int = 100, after_id: int = 0,
+        include_deferred: bool = False,
+    ) -> tuple[BattleOutboxEnvelope, ...]:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        require_int64(limit, "limit", minimum=1)
+        require_int64(after_id, "after_id", minimum=0)
+        if type(include_deferred) is not bool:
+            raise ValueError("include_deferred must be bool")
+        retry_filter = "" if include_deferred else (
+            " AND (next_attempt_at IS NULL OR next_attempt_at <= ?)"
+        )
+        params: tuple[object, ...] = (namespace.strip(), after_id)
+        if not include_deferred:
+            params += (utc_now(),)
         async with self.lock:
             rows = self.connection.execute(
-                "SELECT profile_max_hp,knowledge_json FROM combat_knowledge"
+                "SELECT * FROM battle_outbox WHERE namespace=? AND acknowledged_at IS NULL "
+                f"AND id > ?{retry_filter} ORDER BY id LIMIT ?", (*params, limit),
+            ).fetchall()
+        return tuple(self._decode_battle_outbox_row(row) for row in rows)
+
+    async def pending_battle_event_entries(
+        self, *, namespace: str, limit: int = 100, after_id: int | None = None,
+        include_deferred: bool = False,
+    ) -> tuple[BattleOutboxEnvelope | InvalidBattleOutboxEntry, ...]:
+        """Isolate corrupt rows without hiding healthy rows behind deferred ones.
+
+        Unlike the strict envelope reader, this consumer boundary never coerces
+        corrupted metadata. Undecodable rows retain their exact identity and can
+        be deferred individually. Decode errors do not block the whole batch.
+        """
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        require_int64(limit, "limit", minimum=1)
+        if after_id is not None:
+            require_int64(after_id, "after_id")
+        if type(include_deferred) is not bool:
+            raise ValueError("include_deferred must be bool")
+        now = datetime.now(UTC)
+        entries: list[BattleOutboxEnvelope | InvalidBattleOutboxEntry] = []
+        cursor_filter = "" if after_id is None else " AND id>?"
+        params: tuple[object, ...] = (namespace.strip(),)
+        if after_id is not None:
+            params += (after_id,)
+        async with self.lock:
+            cursor = self.connection.execute(
+                "SELECT * FROM battle_outbox WHERE namespace=? AND acknowledged_at IS NULL"
+                f"{cursor_filter} ORDER BY id", params,
+            )
+            for row in cursor:
+                try:
+                    envelope = self._decode_battle_outbox_row(row)
+                except (TypeError, ValueError, OverflowError, RecursionError) as error:
+                    # A valid quarantine deadline still applies when some other
+                    # metadata is corrupt. Invalid deadlines are immediately due.
+                    try:
+                        deferred_until = self._aware_utc(row["next_attempt_at"])
+                    except (TypeError, ValueError):
+                        deferred_until = now
+                    if not include_deferred and deferred_until > now:
+                        continue
+                    entries.append(InvalidBattleOutboxEntry(
+                        row["id"], row["namespace"], f"{type(error).__name__}: {error}",
+                    ))
+                else:
+                    if (not include_deferred and envelope.next_attempt_at is not None
+                            and self._aware_utc(envelope.next_attempt_at) > now):
+                        continue
+                    entries.append(envelope)
+                if len(entries) == limit:
+                    break
+        return tuple(entries)
+
+    @staticmethod
+    def _aware_utc(value: object) -> datetime:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value)
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Expected an aware timestamp")
+        return value.astimezone(UTC)
+
+    @staticmethod
+    def _retry_at(delay: float) -> datetime:
+        try:
+            valid = (not isinstance(delay, bool) and isinstance(delay, (int, float))
+                     and math.isfinite(delay) and delay >= 0)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError("retry_after_seconds must be finite and nonnegative")
+        try:
+            return datetime.now(UTC) + timedelta(seconds=delay)
+        except OverflowError as error:
+            raise ValueError("retry_after_seconds exceeds supported timestamp range") from error
+
+    async def defer_invalid_battle_event(
+        self, entry: InvalidBattleOutboxEntry, *, retry_after_seconds: float = 60,
+    ) -> bool:
+        """Quarantine one still-invalid row; never repair/coerce its corrupt data."""
+        if not isinstance(entry, InvalidBattleOutboxEntry):
+            raise ValueError("entry must be InvalidBattleOutboxEntry")
+        next_attempt = self._retry_at(retry_after_seconds).isoformat()
+        async with self._transaction():
+            row = self.connection.execute(
+                "SELECT * FROM battle_outbox WHERE id=? AND namespace=? "
+                "AND acknowledged_at IS NULL", (entry.id, entry.namespace),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                self._decode_battle_outbox_row(row)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                cursor = self.connection.execute(
+                    "UPDATE battle_outbox SET attempts=CASE "
+                    "WHEN typeof(attempts)='integer' AND attempts>=0 AND attempts<? "
+                    "THEN attempts+1 ELSE attempts END,next_attempt_at=?,last_error=? "
+                    "WHERE id=? AND namespace=? AND acknowledged_at IS NULL",
+                    (INT64_MAX, next_attempt, entry.decode_error[:2000], entry.id, entry.namespace),
+                )
+                return cursor.rowcount == 1
+            return False
+
+    @staticmethod
+    def _barrier_value_preview(value: object) -> str:
+        preview = repr(value)
+        return preview if len(preview) <= 500 else preview[:497] + "..."
+
+    def _repair_battle_event_barrier_unlocked(
+        self,
+        *,
+        namespace: str,
+        corrupt_value: object,
+        repaired_until: datetime,
+    ) -> datetime:
+        repaired_until = self._aware_utc(repaired_until)
+        updated = self.connection.execute(
+            "UPDATE battle_outbox_barriers SET blocked_until=? WHERE namespace=?",
+            (repaired_until.isoformat(), namespace),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("SQLite did not repair the corrupt outbox barrier")
+        audit_payload: dict[str, JsonValue] = {
+            "namespace": namespace,
+            "previous_value_type": type(corrupt_value).__name__,
+            "previous_value_preview": self._barrier_value_preview(corrupt_value),
+            "repaired_until": repaired_until.isoformat(),
+        }
+        audit = self.connection.execute(
+            """
+            INSERT INTO events(created_at,level,event_type,message,payload_json)
+            VALUES (?,?,?,?,?)
+            """,
+            (
+                utc_now(),
+                "WARNING",
+                "BATTLE_OUTBOX_BARRIER_REPAIRED",
+                "Повреждённый барьер очереди боя восстановлен",
+                canonical_json_object(audit_payload),
+            ),
+        )
+        if audit.rowcount != 1 or audit.lastrowid is None:
+            raise RuntimeError("SQLite did not audit the corrupt outbox barrier repair")
+        actual = self.connection.execute(
+            "SELECT blocked_until FROM battle_outbox_barriers WHERE namespace=?",
+            (namespace,),
+        ).fetchone()
+        if actual is None or self._aware_utc(actual[0]) != repaired_until:
+            raise RuntimeError("SQLite did not persist the repaired outbox barrier")
+        return repaired_until
+
+    def _extend_battle_event_barrier_unlocked(
+        self, namespace: str, until: datetime
+    ) -> datetime:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        namespace = namespace.strip()
+        until = self._aware_utc(until)
+        row = self.connection.execute(
+            "SELECT blocked_until FROM battle_outbox_barriers WHERE namespace=?",
+            (namespace,),
+        ).fetchone()
+        if row is not None:
+            try:
+                previous_until = self._aware_utc(row[0])
+            except (TypeError, ValueError, OverflowError):
+                return self._repair_battle_event_barrier_unlocked(
+                    namespace=namespace,
+                    corrupt_value=row[0],
+                    repaired_until=until,
+                )
+            until = max(until, previous_until)
+        self.connection.execute(
+            "INSERT INTO battle_outbox_barriers(namespace,blocked_until) VALUES (?,?) "
+            "ON CONFLICT(namespace) DO UPDATE SET blocked_until=excluded.blocked_until",
+            (namespace, until.isoformat()),
+        )
+        actual = self.connection.execute(
+            "SELECT blocked_until FROM battle_outbox_barriers WHERE namespace=?",
+            (namespace,),
+        ).fetchone()
+        if actual is None or self._aware_utc(actual[0]) < until:
+            raise RuntimeError("SQLite did not persist the outbox barrier")
+        return self._aware_utc(actual[0])
+
+    async def extend_battle_event_barrier(
+        self, *, namespace: str, blocked_until: datetime,
+    ) -> datetime:
+        """Monotonically extend a durable namespace-wide delivery deadline.
+
+        This is a retry barrier, not a lease. A single external side-effect
+        consumer is still required. The barrier survives ACK and retention.
+        """
+        until = self._aware_utc(blocked_until)
+        async with self._transaction():
+            return self._extend_battle_event_barrier_unlocked(namespace, until)
+
+    async def get_battle_event_barrier(self, *, namespace: str) -> datetime | None:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        namespace = namespace.strip()
+        async with self._transaction():
+            row = self.connection.execute(
+                "SELECT blocked_until FROM battle_outbox_barriers WHERE namespace=?",
+                (namespace,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                return self._aware_utc(row[0])
+            except (TypeError, ValueError, OverflowError):
+                fallback = datetime.now(UTC) + timedelta(
+                    seconds=CORRUPT_BARRIER_FALLBACK_SECONDS
+                )
+                return self._repair_battle_event_barrier_unlocked(
+                    namespace=namespace,
+                    corrupt_value=row[0],
+                    repaired_until=fallback,
+                )
+
+    async def ack_battle_event(self, event_id: int, *, namespace: str) -> bool:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        require_int64(event_id, "event_id", minimum=1)
+        async with self._transaction():
+            cursor = self.connection.execute(
+                "UPDATE battle_outbox SET acknowledged_at=?,next_attempt_at=NULL,last_error=NULL "
+                "WHERE id=? AND namespace=? AND acknowledged_at IS NULL",
+                (utc_now(), event_id, namespace.strip()),
+            )
+            return cursor.rowcount == 1
+
+    async def fail_battle_event(
+        self, event_id: int, *, namespace: str, error: str, retry_after_seconds: float = 60,
+    ) -> bool:
+        """Keep a failed intent durable while scheduling a later idempotent retry."""
+        require_int64(event_id, "event_id", minimum=1)
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("namespace must be nonblank")
+        next_attempt = self._retry_at(retry_after_seconds).isoformat()
+        async with self._transaction():
+            cursor = self.connection.execute(
+                "UPDATE battle_outbox SET attempts=CASE WHEN attempts<? "
+                "THEN attempts+1 ELSE attempts END, "
+                "next_attempt_at=?,last_error=? "
+                "WHERE id=? AND namespace=? AND acknowledged_at IS NULL",
+                (INT64_MAX, next_attempt, str(error)[:2000], event_id, namespace.strip()),
+            )
+            return cursor.rowcount == 1
+
+    async def load_combat_knowledge(
+        self, *, namespace: str
+    ) -> dict[int, dict[str, JsonValue]]:
+        """Load valid optional profiles and durably quarantine corrupt rows.
+
+        A combat-knowledge row is an optimization, so one corrupt profile must not
+        prevent the farmer from starting. Quarantine is an atomic delete plus audit
+        event; a database failure still propagates and rolls the delete back.
+        """
+        namespace = self._validate_combat_knowledge_namespace(namespace)
+        async with self.lock:
+            rows = self.connection.execute(
+                "SELECT rowid AS storage_rowid,profile_max_hp,knowledge_json "
+                "FROM combat_knowledge WHERE namespace=?",
+                (namespace,),
             ).fetchall()
 
-        result: dict[int, dict[str, Any]] = {}
+        result: dict[int, dict[str, JsonValue]] = {}
+        corrupt_rows: list[tuple[int, object, object, str, str]] = []
         for row in rows:
+            storage_rowid = require_int64(
+                row["storage_rowid"], "Stored combat knowledge rowid", minimum=1
+            )
+            stored_profile = row["profile_max_hp"]
+            raw_json = row["knowledge_json"]
             try:
-                payload = json.loads(str(row["knowledge_json"]))
-            except json.JSONDecodeError:
+                profile_max_hp = require_int64(
+                    stored_profile, "Stored profile_max_hp", minimum=1
+                )
+                if not isinstance(raw_json, str):
+                    raise ValueError("Stored combat knowledge must be JSON text")
+                payload: object = json.loads(raw_json)
+                if not isinstance(payload, dict):
+                    raise ValueError("Stored combat knowledge must be a JSON object")
+                canonical = canonical_json_object(
+                    cast(Mapping[str, JsonValue], payload)
+                )
+            except (TypeError, ValueError, OverflowError, RecursionError) as error:
+                corrupt_rows.append(
+                    (
+                        storage_rowid,
+                        stored_profile,
+                        raw_json,
+                        type(error).__name__,
+                        str(error)[:500],
+                    )
+                )
                 continue
-            if isinstance(payload, dict):
-                result[int(row["profile_max_hp"])] = payload
+            result[profile_max_hp] = cast(
+                dict[str, JsonValue], json.loads(canonical)
+            )
+
+        if not corrupt_rows:
+            return result
+
+        async with self._transaction():
+            for storage_rowid, stored_profile, raw_json, error_type, reason in corrupt_rows:
+                deleted = self.connection.execute(
+                    "DELETE FROM combat_knowledge "
+                    "WHERE rowid=? AND namespace=? "
+                    "AND profile_max_hp IS ? AND knowledge_json IS ?",
+                    (storage_rowid, namespace, stored_profile, raw_json),
+                )
+                # Another caller may have repaired or quarantined the row after
+                # our read. The exact predicate prevents deleting that newer value.
+                if deleted.rowcount != 1:
+                    continue
+                audit_payload: dict[str, JsonValue] = {
+                    "namespace": namespace,
+                    "storage_rowid": storage_rowid,
+                    "profile_key_type": type(stored_profile).__name__,
+                    "error_type": error_type,
+                    "reason": reason,
+                }
+                event = self.connection.execute(
+                    """
+                    INSERT INTO events(created_at,level,event_type,message,payload_json)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (
+                        utc_now(),
+                        "WARNING",
+                        "COMBAT_KNOWLEDGE_QUARANTINED",
+                        "Повреждённый необязательный профиль боевой памяти удалён",
+                        canonical_json_object(audit_payload),
+                    ),
+                )
+                if event.rowcount != 1 or event.lastrowid is None:
+                    raise RuntimeError("SQLite не подтвердил журналирование карантина")
         return result
+
+    @staticmethod
+    def _validate_combat_knowledge_namespace(namespace: str) -> str:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("Namespace боевой памяти не должен быть пустым")
+        return namespace.strip()
 
     async def save_combat_knowledge(
         self,
         profile_max_hp: int,
-        payload: dict[str, Any],
+        payload: Mapping[str, JsonValue],
+        *,
+        namespace: str,
     ) -> None:
-        if profile_max_hp <= 0:
-            return
-        async with self.lock:
+        namespace = self._validate_combat_knowledge_namespace(namespace)
+        require_int64(profile_max_hp, "profile_max_hp", minimum=1)
+        serialized = canonical_json_object(payload)
+        async with self._transaction():
             self.connection.execute(
                 """
-                INSERT INTO combat_knowledge(profile_max_hp,updated_at,knowledge_json)
-                VALUES (?,?,?)
-                ON CONFLICT(profile_max_hp) DO UPDATE SET
+                INSERT INTO combat_knowledge(namespace,profile_max_hp,updated_at,knowledge_json)
+                VALUES (?,?,?,?)
+                ON CONFLICT(namespace,profile_max_hp) DO UPDATE SET
                     updated_at=excluded.updated_at,
                     knowledge_json=excluded.knowledge_json
                 """,
                 (
+                    namespace,
                     profile_max_hp,
                     utc_now(),
-                    json.dumps(payload, ensure_ascii=False),
+                    serialized,
                 ),
             )
-            self.connection.commit()
 
     async def get_current_session(self) -> SessionSummary:
         async with self.lock:
@@ -1182,10 +1688,7 @@ class Storage:
                         (MIST_CRYSTAL_CODE, sid),
                     ).fetchall()
                 ]
-            state = self.connection.execute(
-                "SELECT moves,current_cycle,cycles_count,moves_in_cycle,"
-                "moves_per_cycle FROM farmer_state WHERE singleton=1"
-            ).fetchone()
+            state = self._get_state_unlocked()
         runtime = session.runtime_seconds
         if session.started_at and session.status == "RUNNING":
             with suppress(ValueError):
@@ -1202,7 +1705,7 @@ class Storage:
             "battle": battle,
             "drops": drops,
             "targets": targets,
-            "state": cast(FarmerState, dict(state)) if state else {},
+            "state": state,
             "runtime_seconds": runtime,
         }
 

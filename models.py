@@ -3,22 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+from runtime_state import BotState as BotState
+
 Position = tuple[int, int]
 ButtonPosition = tuple[int, int]
-
-
-class BotState(Enum):
-    STARTING = auto()
-    MAP = auto()
-    MOVING = auto()
-    TARGET_SELECTION = auto()
-    COMBAT = auto()
-    RECOVERY = auto()
-    PAUSED = auto()
-    RESTING = auto()
-    ACTIVITY_BREAK = auto()
-    WAITING_FOR_HEALTH = auto()
-    STOPPED = auto()
 
 
 class ActionType(Enum):

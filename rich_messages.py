@@ -356,7 +356,7 @@ def events_rich(events: Sequence[EventSummary], *, notice: str | None = None) ->
 
 
 def _enabled_targets_summary(settings: SettingsService) -> str:
-    selected = settings.values.enabled_targets or []
+    selected = settings.values.enabled_targets
     if not selected:
         return "<p>Не выбрано ни одной цели.</p>"
     return "<ul>" + "".join(f"<li>{_e(target)}</li>" for target in selected) + "</ul>"
@@ -372,7 +372,7 @@ def settings_rich(settings: SettingsService, *, notice: str | None = None) -> st
                 f"{s.cycles_count} цикл(а) · "
                 f"{s.moves_per_cycle_min}–{s.moves_per_cycle_max} ходов",
             ),
-            ("Цели", len(s.enabled_targets or [])),
+            ("Цели", len(s.enabled_targets)),
             ("Порог лечения", f"{s.heal_threshold} HP"),
             ("Перед боем", f"{s.battle_start_hp_percent}% HP"),
             (
@@ -411,7 +411,7 @@ def farm_settings_rich(settings: SettingsService, *, notice: str | None = None) 
         [
             ("Количество циклов", s.cycles_count),
             ("Ходов в цикле", f"{s.moves_per_cycle_min}–{s.moves_per_cycle_max}"),
-            ("Активных целей", len(s.enabled_targets or [])),
+            ("Активных целей", len(s.enabled_targets)),
         ],
         headers=None,
     )
@@ -682,8 +682,9 @@ async def send_rich_with_fallback(
     reply_markup: ReplyMarkup | None = None,
     fallback_reply_markup: ReplyMarkup | None = None,
     disable_notification: bool | None = None,
+    fallback_on_network_error: bool = True,
 ) -> Message:
-    """Отправляет RichMessage и откатывается на обычное сообщение при отказе API."""
+    """Fall back on API rejection, optionally also on uncertain network delivery."""
     try:
         return await bot.send_rich_message(
             chat_id=chat_id,
@@ -692,6 +693,8 @@ async def send_rich_with_fallback(
             disable_notification=disable_notification,
         )
     except (TelegramBadRequest, TelegramNetworkError) as error:
+        if isinstance(error, TelegramNetworkError) and not fallback_on_network_error:
+            raise
         logger.warning("RichMessage недоступен, использован fallback: %s", error)
         return await bot.send_message(
             chat_id=chat_id,

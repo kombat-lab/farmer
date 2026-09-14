@@ -367,7 +367,7 @@ class ControlBot:
         if screen.startswith("targets:location:"):
             category_index = self._parse_index(screen.rsplit(":", 1)[-1], len(LOCATION_NAMES))
             category = LOCATION_NAMES[category_index]
-            selected = set(self.settings.values.enabled_targets or [])
+            selected = set(self.settings.values.enabled_targets)
             targets = [(name, name in selected) for name in get_monster_names(category)]
             all_enabled = bool(targets) and all(enabled for _, enabled in targets)
             target_button_rows: list[list[tuple[str, str, str | None, bool]]] = [[
@@ -867,7 +867,11 @@ class ControlBot:
         @r.message()
         async def fallback_handler(message: Message, state: FSMContext) -> None:
             await state.clear()
-            logger.info("Получено сообщение вне режима ввода: %r", message.text)
+            logger.info(
+                "Получено сообщение вне режима ввода: chat_id=%s, message_id=%s",
+                message.chat.id,
+                message.message_id,
+            )
             await self._send_panel(message, notice="Используйте кнопки внутри панели.")
 
     async def start(self) -> None:

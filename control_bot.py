@@ -188,20 +188,9 @@ class ControlBot:
             dashboard = await self.storage.get_statistics_dashboard()
             session = await self.storage.get_current_session()
             drops = await self.storage.get_drops(session.session_id)
-            telegram_days = await self.storage.get_telegram_activity_daily()
-            telegram_fallback = "\n".join(
-                f"{row['day']}: ↑{row['outgoing_total']} · "
-                f"↓{int(row['incoming_new_messages']) + int(row['incoming_message_edits'])} · "
-                f"пик {row['peak_actions_1m']}/мин. · "
-                f"ручн.{row['manual_restriction_marks']} · "
-                f"авто{row['silent_stalls']} · FW{row['flood_waits']}"
-                for row in telegram_days
-            ) or "Наблюдения пока не накоплены."
             return PanelView(
-                stats_rich(dashboard, drops, telegram_days, notice=notice),
-                self.storage.format_statistics_text(dashboard)
-                + "\n\n📡 Telegram по дням (Москва)\n"
-                + telegram_fallback,
+                stats_rich(dashboard, drops, notice=notice),
+                self.storage.format_statistics_text(dashboard),
                 _inline_keyboard([
                     [
                         ("↻ Обновить", "ui:stats", "primary", False),

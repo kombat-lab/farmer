@@ -23,7 +23,6 @@ if TYPE_CHECKING:
         EventSummary,
         RuntimeStatus,
         StatisticsDashboard,
-        TelegramActivityDay,
     )
 
 logger = logging.getLogger("fog_farmer")
@@ -240,7 +239,6 @@ def _duration(seconds: int) -> str:
 def stats_rich(
     data: StatisticsDashboard,
     drop_items: Sequence[DropSummary] | None = None,
-    telegram_days: Sequence[TelegramActivityDay] | None = None,
     *,
     notice: str | None = None,
 ) -> str:
@@ -301,37 +299,6 @@ def stats_rich(
         )
     else:
         body += "<details><summary>🎁 Полученный дроп</summary><p>Предметов пока нет.</p></details>"
-    if telegram_days:
-        telegram_rows = []
-        for day in telegram_days:
-            incoming = int(day.get("incoming_new_messages", 0)) + int(
-                day.get("incoming_message_edits", 0)
-            )
-            manual_marks = int(day.get("manual_restriction_marks", 0))
-            silent_stalls = int(day.get("silent_stalls", 0))
-            flood_waits = int(day.get("flood_waits", 0))
-            telegram_rows.append(
-                (
-                    str(day.get("day", "—")),
-                    f"↑ {day.get('outgoing_total', 0)} · ↓ {incoming} · "
-                    f"пик {day.get('peak_actions_1m', 0)}/мин., "
-                    f"{day.get('peak_actions_10m', 0)}/10 мин. · "
-                    f"карта {day.get('map_requests', 0)} · "
-                    f"восст. {day.get('recovery_attempts', 0)} · "
-                    f"ручн. {manual_marks} / авто {silent_stalls} / "
-                    f"FLOOD_WAIT {flood_waits}",
-                )
-            )
-        body += (
-            "<details open><summary>📡 Telegram по дням (Москва)</summary>"
-            + rich_table(telegram_rows, headers=("День", "Нагрузка и признаки"))
-            + "</details>"
-        )
-    else:
-        body += (
-            "<details open><summary>📡 Telegram по дням (Москва)</summary>"
-            "<p>Наблюдения начнут накапливаться после обновления.</p></details>"
-        )
     body += rich_button_row(
         rich_button("↻ Обновить", "ui:stats", style="primary"),
         rich_button("⛔ Отметить ограничение", "telegram:mark", style="danger"),

@@ -1567,6 +1567,29 @@ class RichMessagePanelTests(unittest.TestCase):
         self.assertIn("<blockquote expandable>", html)
         self.assertIn("Мертвый лес", html)
 
+    def test_stats_omits_daily_telegram_history_but_keeps_restriction_control(self) -> None:
+        from rich_messages import stats_rich
+
+        html = stats_rich(
+            {
+                "battle": {
+                    "battles": 0,
+                    "wins": 0,
+                    "defeats": 0,
+                    "xp": 0,
+                    "dust": 0,
+                    "crystals": 0,
+                },
+                "drops": {"items": 0, "cards": 0},
+                "state": {"moves": 0, "current_cycle": 1, "cycles_count": 1},
+                "targets": [],
+                "runtime_seconds": 0,
+            }
+        )
+
+        self.assertNotIn("Telegram по дням", html)
+        self.assertIn("Отметить ограничение", html)
+
     def test_active_targets_are_collapsed_and_selected_values_are_disabled(self) -> None:
         from rich_messages import combat_settings_rich, settings_rich
 

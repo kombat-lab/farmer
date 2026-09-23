@@ -8,10 +8,22 @@ from html import escape
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from rich_messages import notification_rich, send_rich_with_fallback
+from rich_messages import (
+    notification_rich,
+    rich_button,
+    rich_button_row,
+    send_rich_with_fallback,
+)
 
 logger = logging.getLogger("fog_farmer")
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationAction:
+    label: str
+    callback_data: str
 
 
 class NotificationStatus(Enum):
@@ -103,13 +115,26 @@ class Notifier:
         rows: list[tuple[object, object]] | None = None,
         text: str | None = None,
         silent: bool = False,
+        action: NotificationAction | None = None,
     ) -> NotificationDelivery:
+        html = notification_rich(title, rows=rows, text=text)
+        markup = None
+        if action is not None:
+            html += rich_button_row(
+                rich_button(action.label, action.callback_data, style="success")
+            )
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text=action.label, callback_data=action.callback_data, style="success"
+                )
+            ]])
         try:
             await send_rich_with_fallback(
                 self.bot,
                 chat_id=self.admin_id,
-                html=notification_rich(title, rows=rows, text=text),
+                html=html,
                 fallback_text=_fallback_message(title, rows=rows, text=text),
+                fallback_reply_markup=markup,
                 disable_notification=silent,
                 fallback_on_network_error=False,
             )

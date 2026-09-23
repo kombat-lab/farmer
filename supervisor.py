@@ -290,6 +290,12 @@ class FarmerSupervisor:
             return False, "Фармер не запущен."
         return await farmer.resume()
 
+    async def skip_rest(self, token: str) -> tuple[bool, str]:
+        farmer = self.farmer
+        if not self.is_running() or farmer is None:
+            return False, "Фармер не запущен."
+        return await farmer.skip_rest(token)
+
     async def _stop_once(self) -> tuple[bool, str]:
         async with self.lock:
             farmer = self.farmer or self._unstarted_farmer
@@ -457,6 +463,7 @@ class FarmerSupervisor:
             **await self.storage.get_state(),
             **safety,
             "task_running": self.is_running(),
+            "rest_token": farmer.rest_token if farmer is not None and farmer.running else None,
             "location_name": (
                 farmer.mechanism_view().snapshot.location_name
                 if farmer is not None

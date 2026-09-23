@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 
-from notifications import NotificationDelivery, NotificationStatus, Notifier
+from notifications import NotificationAction, NotificationDelivery, NotificationStatus, Notifier
 from rich_messages import send_rich_with_fallback
 
 
@@ -76,6 +76,26 @@ class NotifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result.status, NotificationStatus.SENT)
         self.bot.send_rich_message.assert_awaited_once()
         self.bot.send_message.assert_not_awaited()
+
+    async def test_action_is_delivered_in_rich_and_fallback_formats(self) -> None:
+        action = NotificationAction("⏭ Пропустить передышку", "rest:skip:" + "a" * 32)
+        result = await self.notifier.send_event("Передышка", action=action)
+        self.assertIs(result.status, NotificationStatus.SENT)
+        html = self.bot.send_rich_message.await_args.kwargs["rich_message"].html
+        self.assertIn(f'data="{action.callback_data}"', html)
+        self.assertIn(action.label, html)
+
+        self.bot.send_rich_message.side_effect = TelegramBadRequest(
+            method=SendMessage(chat_id=1, text="n"), message="unsupported format"
+        )
+        with self.assertLogs("fog_farmer", level="WARNING"):
+            result = await self.notifier.send_event("Передышка", action=action)
+        self.assertIs(result.status, NotificationStatus.SENT)
+        markup = self.bot.send_message.await_args.kwargs["reply_markup"]
+        button = markup.inline_keyboard[0][0]
+        self.assertEqual(button.text, action.label)
+        self.assertEqual(button.callback_data, action.callback_data)
+        self.assertLessEqual(len(button.callback_data.encode("utf-8")), 64)
 
     async def test_card_drop_propagates_typed_result_and_position(self) -> None:
         failed = NotificationDelivery(

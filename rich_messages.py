@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 from typing import TYPE_CHECKING
 
@@ -144,46 +145,72 @@ def _state_icon(running: bool, game_state: str) -> str:
     return "🟢" if running else "⚫️"
 
 
-def _control_buttons(running: bool, game_state: str) -> str:
-    if not running:
-        return rich_button_row(
-            rich_button("▶️ Запустить", "ctl:start", style="success"),
-            rich_button("↻ Обновить", "ui:home", style="primary"),
-        )
-    if game_state in {"PAUSED", "RESTING", "ACTIVITY_BREAK"}:
-        return rich_button_row(
-            rich_button("▶️ Продолжить", "ctl:resume", style="success"),
-            rich_button("⏹ Стоп", "ctl:stop", style="danger"),
-            rich_button("↻", "ui:home", style="primary"),
-        )
-    return rich_button_row(
-        rich_button("⏸ Пауза", "ctl:pause", style="primary"),
-        rich_button("⏹ Стоп", "ctl:stop", style="danger"),
-        rich_button("↻", "ui:home"),
-    )
-
-
-def dashboard_rich(
+def dashboard_controls(
     state: RuntimeStatus,
-    data: StatisticsDashboard,
-    *,
-    notice: str | None = None,
-) -> str:
+) -> list[list[tuple[str, str, str | None, bool]]]:
     running = bool(state.get("task_running"))
+    game_state = state.get("game_state")
+    controls: list[list[tuple[str, str, str | None, bool]]]
+    if not running:
+        controls = [[("▶️ Начать фарм", "ctl:start", "success", False)]]
+    elif game_state == "RESTING":
+        token = state.get("rest_token")
+        controls = [[(
+            "⏭ Пропустить передышку",
+            f"rest:skip:{token}" if token else "ui:home",
+            "success",
+            not bool(token),
+        )], [
+            ("⏸ Поставить на паузу", "ctl:pause", None, False),
+            ("⏹ Остановить", "ctl:stop", "danger", False),
+        ]]
+    elif game_state in {"PAUSED", "ACTIVITY_BREAK"}:
+        label = "▶️ Продолжить фарм" if game_state == "PAUSED" else "⏭ Пропустить перерыв"
+        controls = [[
+            (label, "ctl:resume", "success", False),
+            ("⏹ Остановить", "ctl:stop", "danger", False),
+        ]]
+    else:
+        pending = bool(state.get("pause_requested"))
+        controls = [[
+            ("⏳ Пауза запрошена" if pending else "⏸ Поставить на паузу",
+             "ctl:pause", "primary", pending),
+            ("⏹ Остановить", "ctl:stop", "danger", False),
+        ]]
+    controls.append([("↻ Обновить", "ui:home", None, False)])
+    return controls
+
+
+def dashboard_hint(state: RuntimeStatus) -> str:
+    if not state.get("task_running"):
+        return "Проверьте план и выбранных мобов в настройках, затем начните фарм."
+    if state.get("pause_requested"):
+        return "Пауза запрошена: фармер остановится на карте после текущего действия или боя."
+    game_state = state.get("game_state")
+    if game_state == "RESTING":
+        return "Следующий цикл начнётся автоматически. Кнопка ниже позволяет начать его сейчас."
+    if game_state == "PAUSED":
+        return "Фарм на ручной паузе. Для продолжения нажмите «Продолжить фарм»."
+    if game_state == "ACTIVITY_BREAK":
+        return "Фарм продолжится автоматически после перерыва."
+    return "Пауза дождётся окончания текущего действия или боя. «Остановить» завершит фарм."
+
+
+def dashboard_state_rows(state: RuntimeStatus) -> list[tuple[object, object]]:
     game_state = str(state.get("game_state") or "STOPPED")
-    icon = _state_icon(running, game_state)
     position = (
         f"({state.get('position_x')}, {state.get('position_y')})"
         if state.get("position_x") is not None
         else "неизвестна"
     )
-    current_hp = state.get("current_hp") or "—"
-    max_hp = state.get("max_hp") or "—"
+    current_hp = state.get("current_hp")
+    max_hp = state.get("max_hp")
     state_rows: list[tuple[object, object]] = [
         ("Состояние", _state_name(game_state)),
         ("Локация", state.get("location_name") or "не определена"),
         ("Позиция", position),
-        ("Здоровье", f"{current_hp}/{max_hp}"),
+        ("Здоровье", f"{current_hp if current_hp is not None else '—'}/"
+         f"{max_hp if max_hp is not None else '—'}"),
         ("Цель", state.get("active_target") or "нет"),
         (
             "Прогресс",
@@ -191,10 +218,35 @@ def dashboard_rich(
             f"ход {state.get('moves_in_cycle', 0)}/{state.get('moves_per_cycle', 0)}",
         ),
     ]
+    rest_until = state.get("rest_until")
+    if state.get("task_running") and game_state in {"RESTING", "ACTIVITY_BREAK"} and rest_until:
+        try:
+            deadline = datetime.fromisoformat(rest_until)
+        except ValueError:
+            deadline = None
+        if deadline is not None and deadline.tzinfo is not None:
+            remaining = max(0, int((deadline - datetime.now(UTC)).total_seconds()))
+            moscow = deadline.astimezone(timezone(timedelta(hours=3)))
+            state_rows.append((
+                "Автопродолжение",
+                f"{moscow:%H:%M:%S} МСК · осталось {remaining // 60} мин. {remaining % 60} сек.",
+            ))
     cooldown_remaining = int(state.get("telegram_cooldown_remaining") or 0)
     if cooldown_remaining > 0:
-        state_rows.append(("Telegram-пауза", f"ещё {cooldown_remaining} сек."))
+        state_rows.append(("Ожидание Telegram", f"ещё {cooldown_remaining} сек."))
+    return state_rows
 
+
+def dashboard_rich(
+    state: RuntimeStatus,
+    data: StatisticsDashboard,
+    *,
+    notice: str | None = None,
+    notice_error: bool = False,
+) -> str:
+    running = bool(state.get("task_running"))
+    game_state = str(state.get("game_state") or "STOPPED")
+    icon = _state_icon(running, game_state)
     battle = data["battle"]
     drops = data["drops"]
     summary_rows = [
@@ -219,9 +271,14 @@ def dashboard_rich(
             f"Последняя ошибка: {_e(state.get('last_error') or 'нет')}",
         )
     )
-    body = rich_notice(notice)
-    body += rich_table(state_rows, headers=None)
-    body += _control_buttons(running, game_state)
+    body = rich_notice(notice, error=notice_error)
+    body += rich_table(dashboard_state_rows(state), headers=None)
+    body += f"<p>{_e(dashboard_hint(state))}</p>"
+    for row in dashboard_controls(state):
+        body += rich_button_row(*(
+            rich_button(label, callback, style=style, disabled=disabled)
+            for label, callback, style, disabled in row
+        ))
     body += "<hr/>"
     body += rich_table(summary_rows, headers=None, caption="Текущая сессия")
     body += f"<blockquote expandable>{diagnostics}</blockquote>"
@@ -360,8 +417,8 @@ def settings_rich(settings: SettingsService, *, notice: str | None = None) -> st
         rich_button("❤️ Бой", "settings:combat", style="primary"),
     )
     body += rich_button_row(
-        rich_button("🎯 Цели", "targets:locations"),
-        rich_button("⏱ Задержки", "settings:delays"),
+        rich_button("🎯 Выбор мобов", "targets:locations"),
+        rich_button("⏱ Темп и передышки", "settings:delays"),
     )
     body += (
         "<details><summary>🎯 Активные цели</summary>"
@@ -381,6 +438,10 @@ def farm_settings_rich(settings: SettingsService, *, notice: str | None = None) 
             ("Активных целей", len(s.enabled_targets)),
         ],
         headers=None,
+    )
+    body += (
+        "<p>Цикл — заданное число ходов. Между циклами фармер делает передышку; "
+        "после последнего цикла останавливается.</p>"
     )
     body += rich_button_row(
         rich_button("Изменить циклы", "input:cycles", style="primary"),
@@ -410,9 +471,9 @@ def combat_settings_rich(settings: SettingsService, *, notice: str | None = None
         headers=None,
     )
     body += rich_button_row(
-        rich_button("❤️ Изменить порог", "input:heal", style="primary"),
+        rich_button("❤️ Порог лечения", "input:heal", style="primary"),
         rich_button(
-            "✨ Благословение: ВКЛ" if s.blessing_enabled else "✨ Благословение: ВЫКЛ",
+            "✨ Выключить благословение" if s.blessing_enabled else "✨ Включить благословение",
             "settings:blessing",
             style="success" if s.blessing_enabled else None,
         ),
@@ -424,6 +485,7 @@ def combat_settings_rich(settings: SettingsService, *, notice: str | None = None
             style="success" if s.combat_planner_mode == "active" else "primary",
         )
     )
+    body += "<p><b>Здоровье для входа в новый бой</b></p>"
     body += rich_button_row(
         rich_button(
             "50%",
@@ -472,20 +534,20 @@ def delay_settings_rich(settings: SettingsService, *, notice: str | None = None)
         rich_button("Нападение", "input:delay:attack_delay"),
     )
     body += rich_button_row(
-        rich_button("Цель", "input:delay:target_delay"),
-        rich_button("Навык", "input:delay:skill_delay"),
+        rich_button("Выбор моба", "input:delay:target_delay"),
+        rich_button("Применение навыка", "input:delay:skill_delay"),
     )
     body += rich_button_row(
         rich_button("Короткая пауза", "input:delay:long_pause"),
         rich_button("Шанс паузы", "input:chance"),
     )
-    body += rich_button_row(rich_button("Между циклами", "input:delay:cycle_rest"))
+    body += rich_button_row(rich_button("Передышка между циклами", "input:delay:cycle_rest"))
     body += (
         "<footer>Фактический темп следует указанным диапазонам; Telegram-нагрузка "
         "только записывается и не меняет задержки автоматически.</footer>"
     )
     body += rich_button_row(rich_button("← Настройки", "ui:settings", style="link"))
-    return rich_document("⏱ Задержки и темп", body)
+    return rich_document("⏱ Темп и передышки", body)
 
 
 def locations_rich(

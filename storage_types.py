@@ -79,6 +79,7 @@ class RuntimeStatus(FarmerState, TelegramSafetyStatus):
     """Complete control-panel state augmented with process-local observations."""
 
     task_running: bool
+    rest_token: str | None
     location_name: str | None
 
 

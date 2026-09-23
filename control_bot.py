@@ -5,6 +5,7 @@ import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -28,7 +29,10 @@ from game_catalog import LOCATION_NAMES, get_monster_names
 from middlewares import AdminOnlyMiddleware
 from rich_messages import (
     combat_settings_rich,
+    dashboard_controls,
+    dashboard_hint,
     dashboard_rich,
+    dashboard_state_rows,
     delay_settings_rich,
     edit_rich_with_fallback,
     events_rich,
@@ -151,35 +155,24 @@ class ControlBot:
         screen: str,
         *,
         notice: str | None = None,
+        notice_error: bool = False,
     ) -> PanelView:
         if screen == "home":
             state = await self.supervisor.status()
             dashboard = await self.storage.get_statistics_dashboard()
-            running = bool(state.get("task_running"))
-            game_state = str(state.get("game_state") or "STOPPED")
-            controls: list[list[tuple[str, str, str | None, bool]]]
-            if not running:
-                controls = [[("▶️ Запустить", "ctl:start", "success", False)]]
-            elif game_state in {"PAUSED", "RESTING", "ACTIVITY_BREAK"}:
-                controls = [[
-                    ("▶️ Продолжить", "ctl:resume", "success", False),
-                    ("⏹ Стоп", "ctl:stop", "danger", False),
-                ]]
-            else:
-                controls = [[
-                    ("⏸ Пауза", "ctl:pause", "primary", False),
-                    ("⏹ Стоп", "ctl:stop", "danger", False),
-                ]]
+            controls = dashboard_controls(state)
             controls.append(_main_navigation("home"))
-            fallback = (
-                "FoG Farmer\n\n"
-                f"Состояние: {game_state}\n"
-                f"HP: {state.get('current_hp') or '—'}/{state.get('max_hp') or '—'}\n"
-                f"Цель: {state.get('active_target') or 'нет'}\n\n"
-                + self.storage.format_statistics_text(dashboard)
+            fallback = "FoG Farmer\n\n"
+            if notice:
+                fallback += f"{'⚠️' if notice_error else '✅'} {escape(notice)}\n\n"
+            fallback += "\n".join(
+                f"{escape(str(label))}: {escape(str(value))}"
+                for label, value in dashboard_state_rows(state)
             )
+            fallback += f"\n\n{escape(dashboard_hint(state))}\n\n"
+            fallback += self.storage.format_statistics_text(dashboard)
             return PanelView(
-                dashboard_rich(state, dashboard, notice=notice),
+                dashboard_rich(state, dashboard, notice=notice, notice_error=notice_error),
                 fallback,
                 _inline_keyboard(controls),
             )
@@ -229,8 +222,8 @@ class ControlBot:
                         ("❤️ Бой", "settings:combat", "primary", False),
                     ],
                     [
-                        ("🎯 Цели", "targets:locations", None, False),
-                        ("⏱ Задержки", "settings:delays", None, False),
+                        ("🎯 Выбор мобов", "targets:locations", None, False),
+                        ("⏱ Темп и передышки", "settings:delays", None, False),
                     ],
                     _main_navigation("settings"),
                 ]),
@@ -254,11 +247,19 @@ class ControlBot:
             selected_hp = self.settings.values.battle_start_hp_percent
             return PanelView(
                 combat_settings_rich(self.settings, notice=notice),
-                "❤️ Персонаж и бой\n\nИзмените лечебные параметры.",
+                "❤️ Персонаж и бой\n\n"
+                f"Лечиться при {self.settings.values.heal_threshold} HP и ниже.\n"
+                f"Входить в новый бой при {selected_hp}% HP.\n"
+                "Кнопки 50% и 100% меняют здоровье для входа в бой.",
                 _inline_keyboard([
                     [
-                        ("❤️ Порог", "input:heal", "primary", False),
-                        ("✨ Благословение", "settings:blessing", None, False),
+                        ("❤️ Порог лечения", "input:heal", "primary", False),
+                        (
+                            "✨ Выключить благословение"
+                            if self.settings.values.blessing_enabled
+                            else "✨ Включить благословение",
+                            "settings:blessing", None, False,
+                        ),
                     ],
                     [("🧠 Боевой движок", "settings:planner", "primary", False)],
                     [
@@ -282,21 +283,22 @@ class ControlBot:
         if screen == "settings:delays":
             return PanelView(
                 delay_settings_rich(self.settings, notice=notice),
-                "⏱ Задержки и автоматический темп\n\nВыберите параметр.",
+                "⏱ Темп и передышки\n\nВыберите параметр. "
+                "Передышка между циклами задаётся в минутах, остальные задержки — в секундах.",
                 _inline_keyboard([
                     [
                         ("Перемещение", "input:delay:move_delay", None, False),
                         ("Нападение", "input:delay:attack_delay", None, False),
                     ],
                     [
-                        ("Цель", "input:delay:target_delay", None, False),
-                        ("Навык", "input:delay:skill_delay", None, False),
+                        ("Выбор моба", "input:delay:target_delay", None, False),
+                        ("Применение навыка", "input:delay:skill_delay", None, False),
                     ],
                     [
                         ("Короткая пауза", "input:delay:long_pause", None, False),
                         ("Шанс паузы", "input:chance", None, False),
                     ],
-                    [("Между циклами", "input:delay:cycle_rest", None, False)],
+                    [("Передышка между циклами", "input:delay:cycle_rest", None, False)],
                     [("← Настройки", "ui:settings", None, False)],
                 ]),
             )
@@ -425,11 +427,12 @@ class ControlBot:
         screen: str,
         *,
         notice: str | None = None,
+        notice_error: bool = False,
     ) -> None:
         message = query.message
         if message is None:
             return
-        view = await self._panel_view(screen, notice=notice)
+        view = await self._panel_view(screen, notice=notice, notice_error=notice_error)
         await edit_rich_with_fallback(
             self.bot,
             chat_id=message.chat.id,
@@ -663,20 +666,28 @@ class ControlBot:
                 notice="Ограничение отмечено в текущем часовом интервале.",
             )
 
+        @r.callback_query(F.data.startswith("rest:skip:"))
+        async def skip_rest_handler(query: CallbackQuery, state: FSMContext) -> None:
+            await query.answer()
+            await state.clear()
+            token = str(query.data).removeprefix("rest:skip:")
+            success, result = await self.supervisor.skip_rest(token)
+            await self._edit_panel(query, "home", notice=result, notice_error=not success)
+
         @r.callback_query(F.data.in_({"ctl:start", "ctl:pause", "ctl:resume", "ctl:stop"}))
         async def control_handler(query: CallbackQuery, state: FSMContext) -> None:
             await query.answer()
             await state.clear()
             action = str(query.data).removeprefix("ctl:")
             if action == "start":
-                _, result = await self.supervisor.start()
+                success, result = await self.supervisor.start()
             elif action == "pause":
-                _, result = await self.supervisor.pause()
+                success, result = await self.supervisor.pause()
             elif action == "resume":
-                _, result = await self.supervisor.resume()
+                success, result = await self.supervisor.resume()
             else:
-                _, result = await self.supervisor.stop()
-            await self._edit_panel(query, "home", notice=result)
+                success, result = await self.supervisor.stop()
+            await self._edit_panel(query, "home", notice=result, notice_error=not success)
 
         @r.callback_query(F.data.startswith("settings:hp:"))
         async def battle_hp_handler(query: CallbackQuery) -> None:

@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from telethon import events
 from telethon.errors import FloodWaitError, RPCError
@@ -60,7 +61,7 @@ from inbound_message import InboundMessage
 from json_types import JsonValue
 from liveness import LivenessPhase, LivenessPolicy, ProgressMonitor
 from message_snapshot import MessageSnapshot
-from notifications import Notifier
+from notifications import NotificationAction, Notifier
 from runtime_state import BotState, require_phase_name
 from settings_service import SettingsService
 from storage import Storage, utc_now
@@ -210,6 +211,8 @@ class Farmer:
         self.pause_requested = False
         self.current_cycle = 1
         self.rest_task: asyncio.Task[None] | None = None
+        self.rest_token: str | None = None
+        self._cycle_restart_pending = False
         self.activity_break_task: asyncio.Task[None] | None = None
         self.progress_persist_task: asyncio.Task[None] | None = None
         self.pending_progress_reason: str | None = None
@@ -1122,9 +1125,7 @@ class Farmer:
             last_action="запрошена безопасная пауза",
         )
         if self.state in {BotState.RESTING, BotState.ACTIVITY_BREAK}:
-            if self.rest_task:
-                self.rest_task.cancel()
-                self.rest_task = None
+            self._cancel_cycle_rest()
             if self.activity_break_task:
                 self.activity_break_task.cancel()
                 self.activity_break_task = None
@@ -1135,6 +1136,7 @@ class Farmer:
     async def enter_paused(self) -> None:
         if not self.running:
             return
+        self._cancel_cycle_rest()
         self.pause_requested = False
         self.activity_break_planner.reset()
         self.state = BotState.PAUSED
@@ -1153,17 +1155,8 @@ class Farmer:
             return False, "Фармер не запущен."
 
         if self.state is BotState.RESTING:
-            if self.rest_task:
-                self.rest_task.cancel()
-                self.rest_task = None
-            self.current_cycle += 1
-            cycle = self.start_cycle()
-            self.activity_break_planner.reset()
-            action = (
-                f"передышка пропущена, начат цикл {self.current_cycle}; "
-                f"цель — {cycle.target} {cycle.unit_label}"
-            )
-        elif self.state is BotState.ACTIVITY_BREAK:
+            return False, "Используйте кнопку пропуска в сообщении текущей передышки."
+        if self.state is BotState.ACTIVITY_BREAK:
             if self.activity_break_task:
                 self.activity_break_task.cancel()
                 self.activity_break_task = None
@@ -1177,6 +1170,10 @@ class Farmer:
             )
             action = "длительный перерыв пропущен"
         elif self.state is BotState.PAUSED:
+            if self._cycle_restart_pending:
+                self.current_cycle += 1
+                self.start_cycle()
+                self._cycle_restart_pending = False
             action = "продолжение после паузы"
         else:
             return False, "Продолжение доступно только на паузе или во время передышки."
@@ -1200,8 +1197,85 @@ class Farmer:
         await self.process_latest_state()
         return True, "Фарм продолжен с фактической текущей позиции."
 
+    def _cancel_cycle_rest(self) -> None:
+        self.rest_token = None
+        task, self.rest_task = self.rest_task, None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    def _rest_is_current(self, token: str) -> bool:
+        return (
+            self.running
+            and self.state is BotState.RESTING
+            and not self.pause_requested
+            and self.rest_token == token
+        )
+
+    async def skip_rest(self, token: str) -> tuple[bool, str]:
+        return await self._complete_rest(token, skipped=True)
+
+    async def _complete_rest(self, token: str, *, skipped: bool) -> tuple[bool, str]:
+        if not self._rest_is_current(token):
+            return False, "Эта передышка уже завершена или фармер поставлен на паузу."
+        # Claim this rest before yielding: duplicate clicks and an expiring timer
+        # cannot advance the cycle twice or act on a later rest.
+        self._cancel_cycle_rest()
+        self._cycle_restart_pending = False
+        self.current_cycle += 1
+        cycle = self.start_cycle()
+        self.activity_break_planner.reset()
+        self.state = BotState.STARTING
+        action = (
+            ("передышка пропущена, " if skipped else "")
+            + f"начат цикл {self.current_cycle}; цель — {cycle.target} {cycle.unit_label}"
+        )
+        self.mark_progress(action)
+        # The transition belongs to the runtime, so a cancelled control request
+        # cannot strand it, and Stop joins it before writing terminal state.
+        transition = self._start_background(
+            self._finish_cycle_start(cycle, action), name="cycle-start"
+        )
+        try:
+            await asyncio.shield(transition)
+        except asyncio.CancelledError:
+            if transition.cancelled() and not self.running:
+                return False, "Фармер остановлен."
+            raise
+        return True, f"Передышка пропущена. Начат цикл {self.current_cycle}."
+
+    async def _finish_cycle_start(self, cycle: CycleDescriptor, action: str) -> None:
+        if not bool(self.running):
+            return
+        await self.storage.update_state(
+            process_status="RUNNING",
+            game_state="STARTING",
+            current_cycle=self.current_cycle,
+            moves_in_cycle=self.mechanisms.snapshot().cycle_progress_units,
+            moves_per_cycle=cycle.target,
+            rest_until=None,
+            last_action=action,
+        )
+        cycles_count = self.settings.run_policy().cycles_count
+        await self.storage.add_event("CYCLE_STARTED", action)
+        if not bool(self.running):
+            return
+        if bool(self.pause_requested):
+            await self.enter_paused()
+            return
+        if self.state in {BotState.PAUSED}:
+            return
+        await self.notifier.send_event(
+            f"▶️ Начат цикл {self.current_cycle} из {cycles_count}",
+            rows=[("Цель цикла", f"{cycle.target} {cycle.unit_label}")],
+        )
+        if bool(self.running) and self.state not in {BotState.PAUSED}:
+            if bool(self.pause_requested):
+                await self.enter_paused()
+            else:
+                await self.process_latest_state()
+
     async def complete_cycle(self) -> None:
-        if not self.running:
+        if not self.running or self.state in {BotState.RESTING, BotState.PAUSED}:
             return
         run_policy = self.settings.run_policy()
         runtime_timing = self.settings.runtime_timing_policy()
@@ -1214,8 +1288,16 @@ class Farmer:
             runtime_timing.cycle_rest.minimum,
             runtime_timing.cycle_rest.maximum,
         )
+        token = uuid4().hex
+        deadline = time.monotonic() + rest_seconds
+        rest_until = datetime.now(UTC) + timedelta(seconds=rest_seconds)
+        self.rest_token = token
+        self._cycle_restart_pending = True
         self.state = BotState.RESTING
         self.mark_progress(f"передышка после цикла {self.current_cycle}: {int(rest_seconds)} сек.")
+        await self.storage.update_state(game_state="RESTING", rest_until=rest_until.isoformat())
+        if not self._rest_is_current(token):
+            return
         cycle = self._require_cycle()
         progress = self.mechanisms.snapshot().cycle_progress_units
         await self.storage.add_event(
@@ -1224,14 +1306,22 @@ class Farmer:
             f"{progress} {cycle.unit_label} при цели {cycle.target}; "
             f"передышка {int(rest_seconds)} сек.",
         )
-        await self.notifier.send(
-            f"😴 Завершён цикл {self.current_cycle} из {total}\n"
-            f"Прогресс: {progress} {cycle.unit_label}\n"
-            f"Передышка: {int(rest_seconds // 60)} мин. {int(rest_seconds % 60)} сек."
+        if not self._rest_is_current(token):
+            return
+        await self.notifier.send_event(
+            f"😴 Передышка после цикла {self.current_cycle} из {total}",
+            rows=[
+                ("Прогресс", f"{progress} {cycle.unit_label}"),
+                ("Длительность", f"{int(rest_seconds // 60)} мин. {int(rest_seconds % 60)} сек."),
+            ],
+            text="Следующий цикл начнётся автоматически. Можно продолжить раньше.",
+            action=NotificationAction("⏭ Пропустить передышку", f"rest:skip:{token}"),
         )
-        self.rest_task = self._start_background(
-            self.rest_between_cycles(rest_seconds), name="cycle-rest"
-        )
+        if self._rest_is_current(token):
+            self.rest_task = self._start_background(
+                self.rest_between_cycles(max(0.0, deadline - time.monotonic()), token),
+                name="cycle-rest",
+            )
 
     async def start_activity_break(self) -> None:
         if not self.running:
@@ -1285,32 +1375,12 @@ class Farmer:
         self.log("Длительный перерыв завершён. Обновляю состояние один раз.")
         await self.process_latest_state()
 
-    async def rest_between_cycles(self, seconds: float) -> None:
+    async def rest_between_cycles(self, seconds: float, token: str) -> None:
         try:
             await asyncio.sleep(seconds)
         except asyncio.CancelledError:
             return
-        if not self.running or self.state is BotState.PAUSED:
-            return
-        self.current_cycle += 1
-        cycle = self.start_cycle()
-        self.activity_break_planner.reset()
-        self.state = BotState.STARTING
-        self.mark_progress(
-            f"начат цикл {self.current_cycle}; цель — {cycle.target} {cycle.unit_label}"
-        )
-        cycles_count = self.settings.run_policy().cycles_count
-        await self.storage.add_event(
-            "CYCLE_STARTED",
-            f"Начат цикл {self.current_cycle} из {cycles_count}; "
-            f"цель — {cycle.target} {cycle.unit_label}",
-        )
-        await self.notifier.send(
-            f"▶️ <b>Начат цикл {self.current_cycle} "
-            f"из {cycles_count}</b>\n"
-            f"Цель цикла: {cycle.target} {cycle.unit_label}"
-        )
-        await self.process_latest_state()
+        await self._complete_rest(token, skipped=False)
 
     def cleanup_old_log_files(self) -> int:
         cutoff = time.time() - max(1, LOG_RETENTION_DAYS) * 86400
@@ -1536,13 +1606,13 @@ class Farmer:
         if final is None:
             raise RuntimeError("Final mechanism view was not captured before persistence")
         if not self._stop_state_saved:
-            await self.storage.update_state(
-                **self._state_snapshot(
-                    reason,
-                    pause_requested=False,
-                    mechanism_view=final.status,
-                )
+            patch = self._state_snapshot(
+                reason,
+                pause_requested=False,
+                mechanism_view=final.status,
             )
+            patch["rest_until"] = None
+            await self.storage.update_state(**patch)
             self._stop_state_saved = True
             logger.info("\n%s", final.session_report)
             logger.info("Причина остановки: %s", reason)
@@ -1632,6 +1702,7 @@ class Farmer:
         if self.stop_reason is None:
             self.stop_reason = reason
         self.running = False
+        self._cancel_cycle_rest()
         self.ingress.close()
         self.task_scope.close()
         self._stop_requested.set()

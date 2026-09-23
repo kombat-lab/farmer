@@ -760,7 +760,9 @@ class DiscoveryBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     await farmer.enqueue_message(source)
                     object.__setattr__(source, "raw_text", "mutated transport")
                     await asyncio.wait_for(farmer.ingress.join(), timeout=1)
-                    await farmer.rest_between_cycles(0)
+                    farmer.state = BotState.RESTING
+                    farmer.rest_token = "test-rest"
+                    await farmer.rest_between_cycles(0, "test-rest")
                     self.assertEqual(runtime.cycle_numbers, [1, 2])
                     client.disconnected.set_result(None)
                     await asyncio.wait_for(session, timeout=1)

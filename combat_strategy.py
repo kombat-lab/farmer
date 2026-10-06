@@ -427,6 +427,14 @@ class RecentCombatKnowledge:
         return bool(target and target in self.treatment_enemy_targets)
 
     def load_into(self, memory: CombatMemory) -> None:
+        # Loading a profile replaces learned estimates while retaining the
+        # encounter, effects and pending action. Repeated loads are idempotent.
+        memory.incoming_damage = ObservedRange()
+        memory.critical_incoming_damage = ObservedRange()
+        memory.outgoing_damage.clear()
+        memory.direct_healing = ObservedRange()
+        memory.renewal_healing = ObservedRange()
+        memory.skill_cooldowns.clear()
         target = normalize(memory.target_name or "")
         for value in self.incoming.get(target, []):
             memory.incoming_damage.add(value)
@@ -508,23 +516,70 @@ class CombatMemory:
         previous_enemy_hp = self.enemy_current_hp
         self.latest_round = parsed
         self.round_history.append(parsed)
-        used_skills = [
-            normalize(skill.skill)
+        player_skill_uses = [
+            skill
             for skill in parsed.skill_uses
             if same_combatant_name(character_name, skill.actor)
-            and normalize(skill.skill) in KNOWN_SKILLS
+        ]
+        used_skills = [
+            normalize(skill.skill)
+            for skill in player_skill_uses
+            if normalize(skill.skill) in KNOWN_SKILLS
         ]
         failed_player_skills = [
             normalize(skill.skill)
             for skill in parsed.failed_skill_uses
             if same_combatant_name(character_name, skill.actor)
         ]
+        player_attack_reported = any(
+            same_combatant_name(character_name, attack.actor)
+            for attack in parsed.attacks
+        )
+        action_actors = (
+            *(skill.actor for skill in parsed.skill_uses),
+            *(skill.actor for skill in parsed.failed_skill_uses),
+            *(attack.actor for attack in parsed.attacks),
+        )
+        enemy_action_actors = {
+            normalize(actor)
+            for actor in action_actors
+            if not same_combatant_name(character_name, actor)
+        }
         player_skill = (
             used_skills[-1]
             if used_skills
             else None
-            if failed_player_skills
+            if player_skill_uses
+            or failed_player_skills
+            or (enemy_action_actors and not player_attack_reported)
             else self.pending_skill
+        )
+
+        incoming_attackers = {
+            normalize(attack.actor)
+            for attack in parsed.attacks
+            if same_combatant_name(character_name, attack.target)
+            and not same_combatant_name(character_name, attack.actor)
+        }
+        visible_enemies = {
+            normalize(name)
+            for name in (
+                *(combatant.name for combatant in parsed.combatants),
+                *action_actors,
+                *(attack.target for attack in parsed.attacks),
+                *(event.target for event in parsed.damage),
+            )
+            if not same_combatant_name(character_name, name)
+        }
+        # Damage events do not identify an attacker. Learn only an unambiguous
+        # source; keep every incoming hit in this encounter's risk estimates.
+        incoming_target = (
+            next(iter(incoming_attackers))
+            if len(incoming_attackers) == 1 and enemy_action_actors <= incoming_attackers
+            else self.target_name
+            if not incoming_attackers
+            and visible_enemies <= {normalize(self.target_name or "")}
+            else None
         )
 
         for skill in parsed.available_skills:
@@ -543,15 +598,16 @@ class CombatMemory:
                 elif damage_event.critical:
                     self.critical_incoming_damage.add(damage_event.amount)
                     self.knowledge.add_incoming(
-                        self.target_name,
+                        incoming_target,
                         damage_event.amount,
                         critical=True,
                     )
                 else:
                     self.incoming_damage.add(damage_event.amount)
-                    self.knowledge.add_incoming(self.target_name, damage_event.amount)
+                    self.knowledge.add_incoming(incoming_target, damage_event.amount)
             elif (
                 player_skill is not None
+                and same_combatant_name(self.target_name, damage_event.target)
                 and not is_periodic_effect(effect)
                 and not damage_event.critical
             ):
@@ -579,11 +635,23 @@ class CombatMemory:
                 )
 
         player = parsed.combatant(character_name)
-        for healing_event in parsed.healing:
-            if not same_combatant_name(character_name, healing_event.target):
-                continue
+        player_healing = [
+            event
+            for event in parsed.healing
+            if same_combatant_name(character_name, event.target)
+        ]
+        for healing_event in player_healing:
             effect = normalize(healing_event.effect or "")
             if effect in {"обновление", "renew"}:
+                if (
+                    len(player_healing) == 1
+                    and player is not None
+                    and player.current_hp >= player.max_hp
+                ):
+                    # A lone tick ending at full HP may be capped. Multiple
+                    # heals retain the existing behavior because a later direct
+                    # heal can fill HP after a fully effective renewal tick.
+                    continue
                 self.renewal_healing.add(healing_event.amount)
                 self.knowledge.add_renewal_healing(healing_event.amount)
             elif player_skill == "лечение" and not (

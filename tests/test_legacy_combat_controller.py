@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import sys
 import unittest
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, dataclass, field, replace
 from datetime import timedelta
@@ -18,6 +19,7 @@ from combat_knowledge_namespace import LEGACY_COMBAT_KNOWLEDGE_NAMESPACE
 from combat_rules import CombatTurnInput, CombatTurnPlan, LegacyCombatRuleset
 from combat_strategy import ObservedRange, RecentCombatKnowledge, SkillTarget
 from game_input import ActionOutcome
+from json_types import JsonValue
 from legacy_combat_controller import LegacyCombatController, LegacyCombatRuntime
 from message_snapshot import MessageSnapshot
 from tests.combat_runtime_harness import Button, Message, Runtime
@@ -78,6 +80,56 @@ class LegacyCombatControllerTests(unittest.IsolatedAsyncioTestCase):
         self.controller.memory.knowledge.add_incoming("Фонарщик", 99)
         self.port.reset()
         self.assertEqual(payload, expected)
+
+    async def test_failed_knowledge_save_is_retried_after_profile_switch(self) -> None:
+        self.controller.activate_combat_profile(400)
+        self.controller.memory.knowledge.add_incoming("Фонарщик", 55)
+        with patch.object(
+            self.runtime, "save_combat_knowledge", new=AsyncMock(side_effect=OSError("disk"))
+        ):
+            with self.assertRaises(OSError):
+                await self.controller.persist()
+
+        self.controller.activate_combat_profile(800)
+        self.controller.memory.knowledge.add_incoming("Фонарщик", 99)
+        await self.controller.persist()
+        reopened = LegacyCombatController(self.runtime, character_name="Игрок")
+        await reopened.initialize()
+
+        self.assertEqual(set(reopened.combat_knowledge_profiles), {400, 800})
+        self.assertEqual(reopened.combat_knowledge_profiles[400].incoming, {"фонарщик": [55]})
+        self.assertEqual(reopened.combat_knowledge_profiles[800].incoming, {"фонарщик": [99]})
+
+    async def test_switch_during_save_preserves_newer_knowledge_for_retry(self) -> None:
+        self.controller.activate_combat_profile(400)
+        self.controller.memory.knowledge.add_incoming("Фонарщик", 31)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_save = self.runtime.save_combat_knowledge
+
+        async def delayed_save(
+            profile_max_hp: int, payload: Mapping[str, JsonValue], *, namespace: str
+        ) -> None:
+            entered.set()
+            await release.wait()
+            await original_save(profile_max_hp, payload, namespace=namespace)
+
+        with patch.object(self.runtime, "save_combat_knowledge", side_effect=delayed_save):
+            save = asyncio.create_task(self.controller.persist())
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                self.controller.memory.knowledge.add_incoming("Фонарщик", 55)
+                self.controller.activate_combat_profile(800)
+                self.controller.memory.knowledge.add_incoming("Фонарщик", 99)
+            finally:
+                release.set()
+                await save
+        await self.controller.persist()
+        reopened = LegacyCombatController(self.runtime, character_name="Игрок")
+        await reopened.initialize()
+
+        self.assertEqual(reopened.combat_knowledge_profiles[400].incoming, {"фонарщик": [31, 55]})
+        self.assertEqual(reopened.combat_knowledge_profiles[800].incoming, {"фонарщик": [99]})
 
     async def test_turn_modes_choose_the_same_legacy_actions(self) -> None:
         cases: tuple[tuple[CombatPlannerMode, int, str], ...] = (

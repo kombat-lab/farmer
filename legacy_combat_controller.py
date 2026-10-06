@@ -166,6 +166,8 @@ class LegacyCombatController:
         self.pending_combat_decision: CombatDecisionTrace | None = None
         self.combat_knowledge_profiles: dict[int, RecentCombatKnowledge] = {}
         self.active_combat_profile_max_hp: int | None = None
+        self._pending_knowledge_profiles: dict[int, dict[str, JsonValue]] = {}
+        self._knowledge_persist_lock = asyncio.Lock()
         self._observed_facts: BoundedKeyCache[Hashable] = BoundedKeyCache(cache_size)
         self._completed_battles: BoundedKeyCache[tuple[int, SourceEventId]] = BoundedKeyCache(
             cache_size
@@ -226,13 +228,20 @@ class LegacyCombatController:
                 knowledge.confirm_treatment_enemy(target)
 
     async def persist(self) -> None:
-        max_hp = self.active_combat_profile_max_hp
-        if max_hp is None:
-            return
-        payload: dict[str, JsonValue] = deepcopy(self.memory.knowledge.as_payload())
-        await self.runtime.save_combat_knowledge(
-            max_hp, payload, namespace=self._rules.knowledge_namespace
-        )
+        async with self._knowledge_persist_lock:
+            pending = dict(self._pending_knowledge_profiles)
+            profiles = dict(pending)
+            max_hp = self.active_combat_profile_max_hp
+            if max_hp is not None:
+                profiles[max_hp] = deepcopy(self.memory.knowledge.as_payload())
+            for profile_hp, payload in profiles.items():
+                await self.runtime.save_combat_knowledge(
+                    profile_hp, payload, namespace=self._rules.knowledge_namespace
+                )
+                # A switch during the write may queue a newer snapshot. Only
+                # acknowledge the exact pending snapshot this pass captured.
+                if self._pending_knowledge_profiles.get(profile_hp) is pending.get(profile_hp):
+                    self._pending_knowledge_profiles.pop(profile_hp, None)
 
     def reset(self) -> None:
         self.runtime.context.clear_combat()
@@ -474,6 +483,11 @@ class LegacyCombatController:
         if self.active_combat_profile_max_hp == max_hp:
             return
 
+        previous_hp = self.active_combat_profile_max_hp
+        if previous_hp is not None:
+            self._pending_knowledge_profiles[previous_hp] = deepcopy(
+                self.memory.knowledge.as_payload()
+            )
         knowledge = self.combat_knowledge_profiles.setdefault(
             max_hp,
             self._new_combat_knowledge(),

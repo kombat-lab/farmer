@@ -59,6 +59,196 @@ def prepare_player_turn(
 
 
 class CombatKnowledgeHardeningTests(unittest.TestCase):
+    def test_loading_knowledge_twice_does_not_duplicate_samples(self) -> None:
+        knowledge = RecentCombatKnowledge.from_payload({
+            "incoming": {"Фонарщик": [40, 42]},
+            "critical_incoming": {"Фонарщик": [80]},
+            "outgoing": {"Фонарщик": {"Атака аколита": [60, 62]}},
+            "direct_healing": [140],
+            "renewal_healing": [40],
+            "skill_cooldowns": {"Лечение": 3},
+        })
+        memory = CombatMemory(target_name="Фонарщик")
+
+        knowledge.load_into(memory)
+        knowledge.load_into(memory)
+
+        self.assertEqual((memory.incoming_damage.samples, memory.incoming_damage.total), (2, 82))
+        self.assertEqual(memory.critical_incoming_damage.samples, 1)
+        self.assertEqual(memory.outgoing_damage["атака аколита"].samples, 2)
+        self.assertEqual(memory.direct_healing.samples, 1)
+        self.assertEqual(memory.renewal_healing.samples, 1)
+        self.assertEqual(memory.skill_cooldowns, {"лечение": 3})
+
+    def test_switching_hp_profile_replaces_estimates_and_preserves_encounter(self) -> None:
+        runtime = Runtime()
+        controller = LegacyCombatController(runtime, character_name="Kombat")
+        old = RecentCombatKnowledge.from_payload({
+            "incoming": {"Фонарщик": [40]},
+            "critical_incoming": {"Фонарщик": [80]},
+            "outgoing": {"Фонарщик": {"Атака аколита": [10]}},
+            "direct_healing": [140],
+            "renewal_healing": [40],
+            "skill_cooldowns": {"Лечение": 3},
+        })
+        new = RecentCombatKnowledge.from_payload({
+            "outgoing": {"Фонарщик": {"Атака аколита": [100]}},
+        })
+        controller.combat_knowledge_profiles.update({400: old, 800: new})
+        controller.activate_combat_profile(400)
+        memory = controller.memory
+        memory.begin("Фонарщик")
+        memory.enemy_current_hp = 123
+        memory.enemy_max_hp = 300
+        memory.renewal_turns = 2
+        memory.periodic_damage = 17
+        memory.periodic_damage_turns = 1
+        memory.pending_skill = "лечение"
+        memory.pending_target = SkillTarget.SELF
+        memory.pending_urgent = True
+        round_state = parse_combat_round("⚔️ Раунд 2\nKombat получает 17 урона")
+        assert round_state is not None
+        memory.latest_round = round_state
+        memory.round_history.append(round_state)
+        memory.last_battle_rounds = (round_state,)
+
+        controller.activate_combat_profile(800)
+
+        self.assertIs(memory.knowledge, new)
+        self.assertEqual(memory.outgoing_damage["атака аколита"], ObservedRange(100, 100, 1, 100))
+        self.assertEqual(memory.incoming_damage.samples, 0)
+        self.assertEqual(memory.critical_incoming_damage.samples, 0)
+        self.assertEqual(memory.direct_healing.samples, 0)
+        self.assertEqual(memory.renewal_healing.samples, 0)
+        self.assertEqual(memory.skill_cooldowns, {})
+        self.assertEqual((memory.target_name, memory.enemy_current_hp, memory.enemy_max_hp), (
+            "Фонарщик", 123, 300,
+        ))
+        self.assertEqual(
+            (memory.renewal_turns, memory.periodic_damage, memory.periodic_damage_turns),
+            (2, 17, 1),
+        )
+        self.assertEqual((memory.pending_skill, memory.pending_target, memory.pending_urgent), (
+            "лечение", SkillTarget.SELF, True,
+        ))
+        self.assertIs(memory.latest_round, round_state)
+        self.assertEqual(memory.round_history, [round_state])
+        self.assertEqual(memory.last_battle_rounds, (round_state,))
+
+    def test_lone_capped_renewal_tick_does_not_lower_learned_healing(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.renewal_healing.add(40)
+        memory.knowledge.add_renewal_healing(40)
+
+        memory.observe(
+            "⚔️ Раунд 2\n"
+            "Kombat восстанавливает 5 HP · Обновление\n"
+            "\nKombat\n❤️ 400/400\n✦ Обновление · 2 ход",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.renewal_tick(), 40)
+        self.assertEqual(memory.knowledge.renewal_healing, [40])
+        self.assertEqual(memory.renewal_turns, 2)
+
+    def test_uncapped_renewal_tick_still_updates_learned_healing(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            "⚔️ Раунд 2\nKombat восстанавливает 40 HP · Обновление\n"
+            "\nKombat\n❤️ 300/400",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.renewal_tick(), 40)
+        self.assertEqual(memory.knowledge.renewal_healing, [40])
+
+    def test_damage_to_another_enemy_does_not_train_current_target(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            "⚔️ Раунд 2\nKombat использует Атака аколита\n"
+            "Kombat атакует Черная мушка\nЧерная мушка получает 80 урона",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.outgoing_damage, {})
+        self.assertEqual(memory.knowledge.outgoing, {})
+
+    def test_incoming_hit_trains_explicit_attacker_instead_of_current_target(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            "⚔️ Раунд 2\nЧерная мушка атакует Kombat\nKombat получает 99 урона",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.incoming_damage.maximum, 99)
+        self.assertEqual(memory.knowledge.incoming, {"черная мушка": [99]})
+
+    def test_multiple_attackers_retain_risk_without_polluting_persistent_knowledge(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            "⚔️ Раунд 2\nФонарщик атакует Kombat\nKombat получает 40 урона\n"
+            "Черная мушка атакует Kombat\nKombat получает 99 урона 💢 крит",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.incoming_damage.maximum, 40)
+        self.assertEqual(memory.critical_incoming_damage.maximum, 99)
+        self.assertGreater(memory.predicted_incoming() or 0, 99)
+        self.assertEqual(memory.knowledge.incoming, {})
+        self.assertEqual(memory.knowledge.critical_incoming, {})
+
+    def test_attack_and_another_enemys_skill_do_not_share_incoming_knowledge(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик")
+        memory.observe(
+            "⚔️ Раунд 2\nФонарщик атакует Kombat\nKombat получает 40 урона\n"
+            "Черная мушка использует Святое свечение\nKombat получает 99 урона",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.incoming_damage.maximum, 99)
+        self.assertEqual(memory.incoming_damage.samples, 2)
+        self.assertEqual(memory.knowledge.incoming, {})
+
+    def test_ambiguous_incoming_without_attacks_does_not_train_current_target(self) -> None:
+        for enemy_evidence in (
+            "Черная мушка использует Лечение",
+            "Фонарщик\n❤️ 200/300\n\nЧерная мушка\n❤️ 100/200",
+        ):
+            with self.subTest(enemy_evidence=enemy_evidence):
+                memory = CombatMemory(target_name="Фонарщик")
+                memory.observe(
+                    f"⚔️ Раунд 2\nKombat получает 40 урона\n{enemy_evidence}",
+                    "Kombat",
+                )
+                self.assertEqual(memory.incoming_damage.maximum, 40)
+                self.assertEqual(memory.knowledge.incoming, {})
+
+    def test_enemy_only_action_does_not_confirm_pending_player_damage(self) -> None:
+        for enemy_action in (
+            "Черная мушка использует Атака аколита",
+            "Черная мушка атакует Фонарщик",
+        ):
+            with self.subTest(enemy_action=enemy_action):
+                memory = CombatMemory(target_name="Фонарщик", pending_skill="атака аколита")
+                memory.observe(
+                    f"⚔️ Раунд 2\n{enemy_action}\nФонарщик получает 40 урона",
+                    "Kombat",
+                )
+                self.assertEqual(memory.outgoing_damage, {})
+                self.assertEqual(memory.knowledge.outgoing, {})
+                self.assertEqual(memory.pending_skill, "атака аколита")
+
+    def test_explicit_player_attack_can_resolve_pending_skill_with_enemy_action(self) -> None:
+        memory = CombatMemory(target_name="Фонарщик", pending_skill="атака аколита")
+        memory.observe(
+            "⚔️ Раунд 2\nKombat атакует Фонарщик\nФонарщик получает 60 урона\n"
+            "Фонарщик атакует Kombat\nKombat получает 40 урона",
+            "Kombat",
+        )
+
+        self.assertEqual(memory.knowledge.outgoing, {"фонарщик": {"атака аколита": [60]}})
+        self.assertEqual(memory.knowledge.incoming, {"фонарщик": [40]})
+
     def test_payload_drops_unbounded_non_integer_and_negative_values(self) -> None:
         too_large = INT64_MAX + 1
         payload: dict[object, object] = {
